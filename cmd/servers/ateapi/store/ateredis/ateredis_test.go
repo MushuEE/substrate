@@ -738,7 +738,7 @@ func TestEnsureWorkerIdle(t *testing.T) {
 	}
 
 	// Manually remove from idle set to simulate leak/crash before SAdd.
-	setKey := "pool:default:pool-1:idle_workers"
+	setKey := getShardKey("default", "pool-1", "pod-1")
 	_, err = s.rdb.SRem(ctx, setKey, "pod-1").Result()
 	if err != nil {
 		t.Fatalf("SRem failed: %v", err)

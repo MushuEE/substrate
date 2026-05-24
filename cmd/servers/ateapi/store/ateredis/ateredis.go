@@ -43,6 +43,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +82,15 @@ func actorDBKey(id string) string {
 
 func workerDBKey(namespace, poolName, podName string) string {
 	return "worker:" + namespace + ":" + poolName + ":" + podName
+}
+
+const IdleWorkerQueueShards = 16
+
+func getShardKey(namespace, pool, pod string) string {
+	h := fnv.New32a()
+	h.Write([]byte(pod))
+	shardIndex := h.Sum32() % IdleWorkerQueueShards
+	return fmt.Sprintf("pool:%s:%s:idle_workers_%d", namespace, pool, shardIndex)
 }
 
 // DebugClearAll flushes all data from Redis.
@@ -165,8 +176,8 @@ func (s *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker)
 	}
 
 	// Add to the idle set.
-	setKey := fmt.Sprintf("pool:%s:%s:idle_workers", worker.GetWorkerNamespace(), worker.GetWorkerPool())
-	err = s.rdb.SAdd(ctx, setKey, worker.GetWorkerPod()).Err()
+	shardKey := getShardKey(worker.GetWorkerNamespace(), worker.GetWorkerPool(), worker.GetWorkerPod())
+	err = s.rdb.SAdd(ctx, shardKey, worker.GetWorkerPod()).Err()
 	if err != nil {
 		return fmt.Errorf("while registering worker in idle set: %w", err)
 	}
@@ -260,8 +271,8 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 
 	// Run SAdd sequentially outside the transaction to avoid cluster slot restrictions.
 	if shouldAddToIdle {
-		setKey := fmt.Sprintf("pool:%s:%s:idle_workers", worker.GetWorkerNamespace(), worker.GetWorkerPool())
-		err = s.rdb.SAdd(ctx, setKey, worker.GetWorkerPod()).Err()
+		shardKey := getShardKey(worker.GetWorkerNamespace(), worker.GetWorkerPool(), worker.GetWorkerPod())
+		err = s.rdb.SAdd(ctx, shardKey, worker.GetWorkerPod()).Err()
 		if err != nil {
 			return fmt.Errorf("while returning worker to idle set: %w", err)
 		}
@@ -272,14 +283,14 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 
 func (s *Persistence) DeleteWorker(ctx context.Context, namespace, pool, pod string) error {
 	dbKey := workerDBKey(namespace, pool, pod)
-	setKey := fmt.Sprintf("pool:%s:%s:idle_workers", namespace, pool)
+	shardKey := getShardKey(namespace, pool, pod)
 
 	err := s.rdb.Del(ctx, dbKey).Err()
 	if err != nil {
 		return fmt.Errorf("while deleting worker key %q: %w", dbKey, err)
 	}
 
-	err = s.rdb.SRem(ctx, setKey, pod).Err()
+	err = s.rdb.SRem(ctx, shardKey, pod).Err()
 	if err != nil {
 		return fmt.Errorf("while removing worker from idle set: %w", err)
 	}
@@ -483,50 +494,58 @@ func (s *Persistence) ReleaseLock(ctx context.Context, key string, value string)
 }
 
 func (s *Persistence) ClaimIdleWorker(ctx context.Context, namespace, pool string, actorID string, actorNamespace string, actorTemplate string) (*ateapipb.Worker, error) {
-	setKey := fmt.Sprintf("pool:%s:%s:idle_workers", namespace, pool)
+	startShard := rand.Intn(IdleWorkerQueueShards)
 
-	for {
-		// Pop a random idle worker name.
-		podName, err := s.rdb.SPop(ctx, setKey).Result()
-		if err != nil {
-			if errors.Is(err, redis.Nil) {
-				return nil, store.ErrNotFound
+	for i := 0; i < IdleWorkerQueueShards; i++ {
+		shardIndex := (startShard + i) % IdleWorkerQueueShards
+		shardKey := fmt.Sprintf("pool:%s:%s:idle_workers_%d", namespace, pool, shardIndex)
+
+		for {
+			// Pop a random idle worker name from this shard.
+			podName, err := s.rdb.SPop(ctx, shardKey).Result()
+			if err != nil {
+				if errors.Is(err, redis.Nil) {
+					// Shard is empty, try next shard
+					break
+				}
+				return nil, fmt.Errorf("while popping idle worker from set on shard %d: %w", shardIndex, err)
 			}
-			return nil, fmt.Errorf("while popping idle worker from set: %w", err)
-		}
 
-		worker, err := s.GetWorker(ctx, namespace, pool, podName)
-		if err != nil {
-			// If the worker was deleted, skip and pop the next one.
-			if errors.Is(err, store.ErrNotFound) {
+			worker, err := s.GetWorker(ctx, namespace, pool, podName)
+			if err != nil {
+				// If the worker was deleted, skip and pop the next one.
+				if errors.Is(err, store.ErrNotFound) {
+					continue
+				}
+				_ = s.rdb.SAdd(ctx, shardKey, podName).Err()
+				return nil, fmt.Errorf("while loading popped worker metadata: %w", err)
+			}
+
+			if worker.GetActorId() != "" {
+				// Skip busy workers.
 				continue
 			}
-			_ = s.rdb.SAdd(ctx, setKey, podName).Err()
-			return nil, fmt.Errorf("while loading popped worker metadata: %w", err)
-		}
 
-		if worker.GetActorId() != "" {
-			// Skip busy workers.
-			continue
-		}
+			worker.ActorId = actorID
+			worker.ActorNamespace = actorNamespace
+			worker.ActorTemplate = actorTemplate
 
-		worker.ActorId = actorID
-		worker.ActorNamespace = actorNamespace
-		worker.ActorTemplate = actorTemplate
-
-		err = s.UpdateWorker(ctx, worker, worker.Version)
-		if err != nil {
-			if errors.Is(err, store.ErrPersistenceRetry) {
-				// Return to the idle set and retry on locking conflict.
-				_ = s.rdb.SAdd(ctx, setKey, podName).Err()
-				continue
+			err = s.UpdateWorker(ctx, worker, worker.Version)
+			if err != nil {
+				if errors.Is(err, store.ErrPersistenceRetry) {
+					// Return to the specific shard set and retry on locking conflict.
+					_ = s.rdb.SAdd(ctx, shardKey, podName).Err()
+					continue
+				}
+				_ = s.rdb.SAdd(ctx, shardKey, podName).Err()
+				return nil, fmt.Errorf("while claiming popped worker: %w", err)
 			}
-			_ = s.rdb.SAdd(ctx, setKey, podName).Err()
-			return nil, fmt.Errorf("while claiming popped worker: %w", err)
-		}
 
-		return worker, nil
+			return worker, nil
+		}
 	}
+
+	return nil, store.ErrNotFound
 }
 
 func (s *Persistence) EnsureWorkerIdle(ctx context.Context, namespace, pool, pod string) error {
@@ -539,8 +558,8 @@ func (s *Persistence) EnsureWorkerIdle(ctx context.Context, namespace, pool, pod
 	}
 
 	if worker.GetActorId() == "" {
-		setKey := fmt.Sprintf("pool:%s:%s:idle_workers", namespace, pool)
-		err = s.rdb.SAdd(ctx, setKey, pod).Err()
+		shardKey := getShardKey(namespace, pool, pod)
+		err = s.rdb.SAdd(ctx, shardKey, pod).Err()
 		if err != nil {
 			return fmt.Errorf("while ensuring worker in idle set: %w", err)
 		}
