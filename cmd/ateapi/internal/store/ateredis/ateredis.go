@@ -421,6 +421,11 @@ func decodePageToken(tokenStr string) (listActorsPageToken, error) {
 	return token, err
 }
 
+func hashShardAddr(addr string) string {
+	h := sha256.Sum256([]byte(addr))
+	return hex.EncodeToString(h[:])
+}
+
 func (s *Persistence) ListActors(ctx context.Context, pageSize int32, pageTokenStr string) ([]*ateapipb.Actor, string, error) {
 	token, err := decodePageToken(pageTokenStr)
 	if err != nil {
@@ -453,16 +458,13 @@ func (s *Persistence) ListActors(ctx context.Context, pageSize int32, pageTokenS
 			remaining := int(pageSize) - len(result)
 			if remaining <= 0 {
 				if cursor != 0 {
-					h := sha256.Sum256([]byte(shardAddr))
 					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hex.EncodeToString(h[:]),
+						ShardHash: hashShardAddr(shardAddr),
 						Cursor:    cursor,
 					})
 				} else if i+1 < len(masters) {
-					nextShardAddr := masters[i+1].Options().Addr
-					h := sha256.Sum256([]byte(nextShardAddr))
 					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hex.EncodeToString(h[:]),
+						ShardHash: hashShardAddr(masters[i+1].Options().Addr),
 						Cursor:    0,
 					})
 				} else {
@@ -488,10 +490,8 @@ func (s *Persistence) ListActors(ctx context.Context, pageSize int32, pageTokenS
 
 			if cursor == 0 {
 				if i+1 < len(masters) {
-					nextShardAddr := masters[i+1].Options().Addr
-					h := sha256.Sum256([]byte(nextShardAddr))
 					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hex.EncodeToString(h[:]),
+						ShardHash: hashShardAddr(masters[i+1].Options().Addr),
 						Cursor:    0,
 					})
 				} else {
@@ -526,9 +526,7 @@ func findStartingShard(masters []*redis.Client, shardHash string) (int, error) {
 		return 0, nil
 	}
 	for i, m := range masters {
-		h := sha256.Sum256([]byte(m.Options().Addr))
-		hashStr := hex.EncodeToString(h[:])
-		if hashStr == shardHash {
+		if hashShardAddr(m.Options().Addr) == shardHash {
 			return i, nil
 		}
 	}
