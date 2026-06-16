@@ -1,16 +1,16 @@
-//  Copyright 2026 Google LLC
+// Copyright 2026 Google LLC
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Command counter is a simple server that will be used as a worker pod. It listens on ports 80
 // and returns a greeting with the IP of the pod where it is running.
@@ -21,7 +21,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,12 +29,14 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 var requestCount uint64
 
 func main() {
-	flag.Parse()
+	pflag.Parse()
 	ctx := context.Background()
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -52,8 +53,7 @@ func main() {
 	})
 
 	go func() {
-		//time.Sleep(60 * time.Second)
-		slog.InfoContext(ctx, "Starting server on port 80")
+		slog.InfoContext(ctx, "Starting counter server on port 80")
 		if err := http.ListenAndServe(":80", defaultMux); err != nil {
 			slog.ErrorContext(ctx, "Error starting server", slog.Any("err", err))
 			os.Exit(1)
@@ -64,19 +64,16 @@ func main() {
 	// filesystem checkpoint/restore.
 	if err := writeRandomFile(); err != nil {
 		slog.InfoContext(ctx, "Error writing random file", slog.Any("err", err))
+	} else {
+		slog.InfoContext(ctx, "Wrote content to random file", slog.String("fshash", hashRandomFile()))
 	}
 
 	count := 0
-	if err := pingGoogle(ctx); err != nil {
-		slog.ErrorContext(ctx, "Error pinging Google", slog.Any("err", err))
-	}
 	slog.InfoContext(ctx, "Count", slog.Int("count", count), slog.String("fshash", hashRandomFile()))
 	count++
 
 	for range time.Tick(10 * time.Second) {
-		if err := pingGoogle(ctx); err != nil {
-			slog.ErrorContext(ctx, "Error pinging Google", slog.Any("err", err))
-		}
+		// TODO: Test outbound connectivity by pinging google.com
 		slog.InfoContext(ctx, "Count", slog.Int("count", count), slog.String("fshash", hashRandomFile()))
 		count++
 	}
@@ -105,25 +102,6 @@ func hashRandomFile() string {
 
 	hash := sha256.Sum256(rfBytes)
 	return base64.RawStdEncoding.EncodeToString(hash[:])
-}
-
-// Test outbound connectivity
-func pingGoogle(ctx context.Context) error {
-	// resp, err := http.Get("https://www.google.com")
-	// if err != nil {
-	// 	return fmt.Errorf("while requesting https://www.google.com: %w", err)
-	// }
-	// defer resp.Body.Close()
-	// bodyBytes, err := io.ReadAll(resp.Body)
-	// if err != nil {
-	// 	return fmt.Errorf("while reading body: %w", err)
-	// }
-
-	// if resp.StatusCode != 200 {
-	// 	return fmt.Errorf("bad response code=%d body=%s", resp.StatusCode, string(bodyBytes))
-	// }
-
-	return nil
 }
 
 func getCurrentIP() string {

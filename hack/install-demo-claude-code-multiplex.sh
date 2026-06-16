@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +35,7 @@ demo-claude-code-multiplex_cmdline() {
 # binary), so it uses docker buildx rather than ko.
 demo-claude-code-multiplex_build_workload() {
   local repo="${KO_DOCKER_REPO}/claude-multiplex-demo-workload"
+  # shellcheck disable=SC2155 # safe initialization
   local stage_tag="${repo}:build-$(date +%s)"
   docker buildx build \
     --platform=linux/amd64 \
@@ -74,7 +77,7 @@ demo-claude-code-multiplex_deploy() {
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
       -e "s|\${ANTHROPIC_API_KEY}|${ANTHROPIC_API_KEY}|g" \
       -e "s|\${WORKLOAD_IMAGE}|${workload_image}|g" \
-      manifests/claude-code-multiplex/claude-code-multiplex.yaml.tmpl \
+      demos/claude-code-multiplex/claude-code-multiplex.yaml.tmpl \
     | run_kubectl apply -f -
 }
 
@@ -86,7 +89,7 @@ demo-claude-code-multiplex_delete() {
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME:-placeholder}|g" \
       -e "s|\${ANTHROPIC_API_KEY}|${ANTHROPIC_API_KEY:-placeholder}|g" \
       -e "s|\${WORKLOAD_IMAGE}|placeholder|g" \
-      manifests/claude-code-multiplex/claude-code-multiplex.yaml.tmpl \
+      demos/claude-code-multiplex/claude-code-multiplex.yaml.tmpl \
     | run_kubectl delete --ignore-not-found -f -
 }
 

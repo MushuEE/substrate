@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,23 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
-set -u
-set -o pipefail
+set -o errexit -o nounset -o pipefail
 
-ROOT=$(git rev-parse --show-toplevel)
+ROOT="$(git rev-parse --show-toplevel)"
+cd "${ROOT}"
+
+# shellcheck disable=SC2155 # safe initialization
+goarch=$(go env GOARCH)
 
 # override reading dev env
-export NO_DEV_ENV=true
+export NO_DEV_ENV="true"
 # we will push images to the local registry
-export KO_DOCKER_REPO=localhost:5001
+export KO_DOCKER_REPO="${KO_DOCKER_REPO:-localhost:5001}"
 # we want to build for the host architecture
-export KO_DEFAULTPLATFORMS=linux/$(go env GOARCH)
+export KO_DEFAULTPLATFORMS="linux/${goarch}"
 # install resolved manifests using Kustomize overlay for local Kind cluster
-export ATE_INSTALL_KIND=true
+export ATE_INSTALL_KIND="true"
 # use default bucket name for local deployment
-export BUCKET_NAME=ate-snapshots
+export BUCKET_NAME="ate-snapshots"
 # unset other env from ate-dev-env.sh in case the developer already sourced them
 unset GCE_REGION CLUSTER_LOCATION NETWORK SUBNETWORK MEMORYSTORE_INSTANCE PROJECT_ID
 
-"${ROOT}"/hack/install-ate.sh "$@"
+hack/install-ate.sh "$@"

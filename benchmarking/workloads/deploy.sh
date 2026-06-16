@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -eo pipefail
-set -u
+set -o errexit -o nounset -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "${ROOT}"
@@ -49,7 +48,7 @@ usage() {
 deploy() {
   echo "Deploying workloads..."
   sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" "${MANIFEST_TEMPLATE}" \
-    | hack/ko.sh apply -f -
+    | hack/run-tool.sh ko apply -f -
 }
 
 delete() {

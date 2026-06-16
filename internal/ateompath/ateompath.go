@@ -1,16 +1,16 @@
-//  Copyright 2026 Google LLC
+// Copyright 2026 Google LLC
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Ateom and atelet need to agree on many filesystem paths.  They are defined in this package.
 package ateompath
@@ -22,7 +22,7 @@ import (
 const (
 	// The base path.  This is both the path of the root shared folder on the
 	// host filesystem, and when it is mounted into ateom and atelet containers.
-	BasePath = "/run/ateom-gvisor"
+	BasePath = "/var/lib/ateom-gvisor"
 )
 
 var (
@@ -34,29 +34,29 @@ func RunSCBinaryPath(sha256 string) string {
 	return filepath.Join(StaticFilesDir, "runsc-"+sha256)
 }
 
-func AteomPath(ateomNamespace, ateomName string) string {
+func AteomPath(podUID string) string {
 	return filepath.Join(
 		BasePath,
 		"ateoms",
-		ateomNamespace+":"+ateomName,
+		podUID,
 	)
 }
 
-func AteomSocketPath(ateomNamespace, ateomName string) string {
+func AteomSocketPath(podUID string) string {
 	return filepath.Join(
-		AteomPath(ateomNamespace, ateomName),
+		AteomPath(podUID),
 		"ateom.sock",
 	)
 }
 
-func AteomNetNSName(ateomNamespace, ateomName string) string {
-	return "ateom:" + ateomNamespace + ":" + ateomName
+func AteomNetNSName(podUID string) string {
+	return "ateom:" + podUID
 }
 
-func AteomNetNSPath(ateomNamespace, ateomName string) string {
+func AteomNetNSPath(podUID string) string {
 	return filepath.Join(
 		"/run/netns",
-		AteomNetNSName(ateomNamespace, ateomName),
+		AteomNetNSName(podUID),
 	)
 }
 
@@ -97,31 +97,28 @@ func RunscDebugLogDir(actorTemplateNamespace, actorTemplateName, actorID, contai
 	)
 }
 
-func CheckpointDir(actorTemplateNamespace, actorTemplateName, actorID string) string {
+func CheckpointStateDir(actorTemplateNamespace, actorTemplateName, actorID string) string {
 	return filepath.Join(
 		ActorPath(actorTemplateNamespace, actorTemplateName, actorID),
-		"checkpoint",
+		"checkpoint-state",
 	)
 }
 
-func CheckpointImgPath(actorTemplateNamespace, actorTemplateName, actorID string) string {
+// RestoreStateDir is the local directory to use to restore an actor from a
+// checkpoint downloaded from GCS.
+//
+// We need to use a different path from CheckpointStateDir, because using `runsc
+// restore -direct -background` means that runsc starts executing first, then
+// demand-pages in parts of the checkpoint file as they are needed.  To know
+// when the background reading is finished, we would need to run `runsc wait
+// -checkpoint`, which will block until the read is done.  Alternatively, we can
+// make sure we write the suspension checkpoint to a different location.  This
+// will work properly, with `runsc checkpoint` paging in any data that hasn't
+// yet been loaded.
+func RestoreStateDir(actorTemplateNamespace, actorTemplateName, actorID string) string {
 	return filepath.Join(
-		CheckpointDir(actorTemplateNamespace, actorTemplateName, actorID),
-		"checkpoint.img", // gvisor implementation detail, technically.
-	)
-}
-
-func PagesImgPath(actorTemplateNamespace, actorTemplateName, actorID string) string {
-	return filepath.Join(
-		CheckpointDir(actorTemplateNamespace, actorTemplateName, actorID),
-		"pages.img", // gvisor implementation detail, technically.
-	)
-}
-
-func PagesMetaImgPath(actorTemplateNamespace, actorTemplateName, actorID string) string {
-	return filepath.Join(
-		CheckpointDir(actorTemplateNamespace, actorTemplateName, actorID),
-		"pages_meta.img", // gvisor implementation detail, technically.
+		ActorPath(actorTemplateNamespace, actorTemplateName, actorID),
+		"restore-state",
 	)
 }
 

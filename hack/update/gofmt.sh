@@ -14,22 +14,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -o errexit
-set -o nounset
-set -o pipefail
+set -o errexit -o nounset -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "${ROOT}"
 
+# GOTOOLCHAIN has no effect on the version of gofmt.
+# We need to find right gofmt, otherwise the one in PATH will be used.
+gofmt="$(go env GOROOT)/bin/gofmt"
+if [[ ! -x "${gofmt}" ]]; then
+  echo "Failed to find $gofmt" >&2
+  exit 1
+fi
+
 # Find all top-level directories containing Go files, and run gofmt on them.
+# shellcheck disable=SC2207 # reading array
 dirs=(
-    $(git ls-files -cmo --exclude-standard ':(glob)**/*.go' \
-        `# Omit LICENSES/, which can contain bundled source code. ` \
-        | grep -v '^LICENSES' \
-        | cut -f1 -d/ \
+    $(git ls-files \
+        -cmo \
+        --exclude-standard \
+        -- \
+        ':(glob)**/*.go' \
+        ':!:vendor/*' \
+        ':!:**/vendor/*' \
+        ':!:LICENSES/*' \
+        | while read -r FILE; do dirname "${FILE}"; done \
+        | sort \
         | uniq)
 )
 
-for dir in ${dirs[@]}; do
-    gofmt -s -w ${dir}
+for dir in "${dirs[@]}"; do
+  "${gofmt}" -s -w "${dir}"
 done

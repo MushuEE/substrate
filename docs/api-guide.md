@@ -11,7 +11,7 @@ The `WorkerPool` defines the pool of physical "warm" compute capacity. It manage
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `replicas` | `int32` | **Required.** Number of physical standby pods to maintain in the cluster. |
-| `ateomImage` | `string` | **Required.** The container image for the `ateom` herder process (e.g. `ko://github.com/agent-substrate/substrate/cmd/servers/ateom-gvisor`). |
+| `ateomImage` | `string` | **Required.** The container image for the `ateom` herder process (e.g. `ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor`). |
 
 ### Example
 
@@ -23,7 +23,7 @@ metadata:
   namespace: ate-demo
 spec:
   replicas: 10
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/servers/ateom-gvisor
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
 ```
 
 ---
@@ -42,6 +42,8 @@ The `ActorTemplate` defines the code, environment, and state-management policies
 | `pauseImage` | `string` | **Required.** The image used for the sandbox root (e.g. `gcr.io/gke-release/pause`). |
 | `runsc` | `RunscConfig` | **Required.** Multi-platform configuration for fetching the gVisor binary. |
 
+Container environment variables support literal `value` entries and `valueFrom.secretKeyRef`. Secret references are resolved by `ate-api-server` from the `ActorTemplate` namespace when a workload spec is materialized. For the golden actor, the resolved values are captured in the golden snapshot and future actors inherit those values until the golden snapshot is recreated. For an actor that bypasses the golden snapshot and boots from the current template spec, the resolved values are sent to atelet but are not serialized into the public Actor API. Other Kubernetes `valueFrom` sources are not supported yet. Secret changes do not automatically restart actors or invalidate snapshots; rotating a Secret requires an explicit actor or template lifecycle action.
+
 ### Workload Connectivity (Uniform DNS)
 Substrate has standardized on a **Uniform DNS Mesh**. You no longer need to define `SessionDiscovery` rules. Every actor created from a template is automatically reachable through the **Substrate Router** via its unique ID:
 
@@ -58,8 +60,8 @@ metadata:
 spec:
   runsc:
     amd64:
-      # Note: These values are from the 2026-05-19 nightly. 
-      # For the latest verified versions, see: manifests/counter/counter.yaml.tmpl
+      # Note: These values are from the 2026-05-19 nightly.
+      # For the latest verified versions, see: demos/counter/counter.yaml.tmpl
       url: "gs://gvisor/releases/nightly/2026-05-19/x86_64/runsc"
       sha256Hash: "a397be1abc2420d26bce6c70e6e2ff96c73aaaab929756c56f5e2089ea842b63"
     arm64:
@@ -159,7 +161,7 @@ Workloads can exchange their ephemeral Kubernetes credentials for stable **Sessi
 
 ## 7. Framework & Ecosystem Integration
 
-Agent Substrate is designed to be the foundational execution layer for any agentic framework. 
+Agent Substrate is designed to be the foundational execution layer for any agentic framework.
 
 ### Agent Development Kit (ADK)
 Substrate provides native support for ADK-compatible identities. Workloads can use the `SessionIdentity` service to mint JWTs that align with ADK's security model, ensuring seamless integration with ADK-managed tools and memory.

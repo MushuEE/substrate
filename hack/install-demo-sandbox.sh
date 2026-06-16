@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,12 +32,12 @@ demo-sandbox_cmdline() {
 demo-sandbox_deploy() {
   log_step "demo-sandbox_deploy"
   ensure_crds
-  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" manifests/sandbox/sandbox.yaml.tmpl \
+  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/sandbox/sandbox.yaml.tmpl \
     | run_ko apply -f -
 }
 
 demo-sandbox_delete() {
   log_step "demo-sandbox_delete"
-  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" manifests/sandbox/sandbox.yaml.tmpl \
+  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/sandbox/sandbox.yaml.tmpl \
     | run_kubectl delete --ignore-not-found -f -
 }

@@ -14,14 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -o errexit
-set -o nounset
-set -o pipefail
+set -o errexit -o nounset -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-
 cd "${ROOT}"
-for F in $(find ./hack/update -name '*.sh'); do
+
+export LC_ALL=C # for sorting to be consistent across locales
+
+# shellcheck disable=2044 # for-loop over find output is intentional
+for F in $(find ./hack/update -name '*.sh' | sort); do
   echo "Running ${F}"
   "${F}" "$@"
 done
