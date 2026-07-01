@@ -25,41 +25,36 @@ Rules:
 
 AIP-122 identifies resources by a single opaque path string (e.g., `publishers/123/books/les-miserables`). Substrate uses a **two-field identity** instead: an `atespace` (namespace) and a `name`. This is analogous to how Kubernetes identifies objects and avoids the ambiguity of parsing hierarchical path strings.
 
-Resources are either **atespace-scoped** or **global-scoped**. Scope is a fixed property of the resource type, not of individual instances.
+Resources are either **atespace-scoped** or **global-scoped**. Scope is a fixed property of the resource type, not of individual instances. For example, `Actor` resources
+are **atespace-scoped**, whereas `Atespace` resources are naturally **global-scoped**.
 
 ### 2.1 Atespace-scoped resources
 
-Atespace-scoped resources belong to an atespace. Their identity is `(atespace, name)`, unique within the resource type. The first two fields **must** be:
+* Atespace-scoped resources belong to an atespace. Their identity is `(atespace, name)`, unique within the resource type.
+* Global-scoped resources are global across the entire deployment and do not belong to any atespace. For these, the identity is `name` alone.
+
+In both cases, a `meta` field contains both `atespace` and `name`. For global resources, the `atespace` must always be empty.
 
 ```proto
 message Actor {
   // The atespace this actor belongs to.
+  ResourceMetadata meta = 1;
+
+  // ... other fields
+}
+
+
+message ResourceMetadata {
+  // The atespace this resource belongs to.
   string atespace = 1;
-  // The name of this actor, unique within its atespace.
+  // The name of this resource, unique within its atespace.
   string name = 2;
 
-  // ... other fields
+  // ... other common resource fields
 }
 ```
 
-- `atespace` is the Substrate namespace for the resource.
-- `name` is the resource name within the atespace. It is not a path; it is a short identifier.
-
-### 2.2 Global-scoped resources
-
-Some resources are global across the entire deployment and do not belong to any atespace. For these, the identity is `name` alone. The first field **must** be:
-
-```proto
-message Worker {
-  // The name of this worker, globally unique (e.g. the node name).
-  string name = 1;
-
-  // ... other fields
-}
-```
-
-- There is no `atespace` field as the resource is global-scoped.
-- `name` must be globally unique within the resource type, across all atespaces.
+- All resources in Substrate must have a `ResourceMetadata meta = 1` field to hold common fields, which includes both `atespace` and `name`.
 
 ### 2.3 Character constraints
 
@@ -74,28 +69,28 @@ A valid resource name must comply the following rules:
 
 Resource names are valid RFC-1123 DNS labels.
 
-### 2.4 `{Resource}Ref` — compound identity type
+### 2.4 `ObjectRef` — reference type
 
-Every atespace-scoped resource type **must** have a corresponding `{Resource}Ref` message that bundles `atespace` + `name` as a single, typed unit:
+The `ObjectRef` message represents a *pointer* to a Substrate resource.
 
 ```proto
-message ActorRef {
+message ObjectRef {
   string atespace = 1;
   string name     = 2;
 }
 ```
 
-Use `{Resource}Ref` in places where you need to reference a resource. For example:
+Use `ObjectRef` in places where you need to reference a resource. For example:
 
 **1. Request messages** — to identify which specific resource to act on:
 
 ```proto
 message GetActorRequest {
-  ActorRef actor = 1;
+  ObjectRef actor = 1;
 }
 
 message DeleteActorRequest {
-  ActorRef actor   = 1;
+  ObjectRef actor   = 1;
   int64     version = 2;
 }
 ```
@@ -108,7 +103,7 @@ message Actor {
   string name     = 2;
 
   // The ActorTemplate this actor was derived from.
-  ActorTemplateRef actor_template = 3;
+  ObjectRef actor_template = 3;
 
   // ... other fields
 }
@@ -117,23 +112,15 @@ message Actor {
 The field name is the logical name of the reference (e.g., `actor_template`), not `actor_template_name` or `actor_template_ref`.
 Note that this assumes that ActorTemplates are also resources in the substrate gRPC API (not in KRM).
 
-**Global-scoped resources** have no atespace, so no wrapper type is needed — use a plain `string {resource}_name` field:
-
-```proto
-message Actor {
-  // worker_name references the global-scoped Worker assigned to this actor.
-  string worker_name = 10;
-}
-```
-
-* Do not embed the full resource message as a reference field.
+- Do not embed the full resource message as a reference field.
 - Do not use a single combined string like `"atespace/name"`. Callers would have to parse it.
+- Do not use a plain `string {resource}_name` field for global-scoped references — use `ObjectRef` for consistency and type safety.
 
 ---
 
 ## 3. Standard Methods
 
-The following sections cover each standard method. The primary adaptation from AIP-13x is how resources are identified in requests: two fields (`atespace` + `name`) instead of a single `name` path string.
+The following sections cover each standard method. The primary adaptation from AIP-13x is how resources are identified in requests: an `ObjectRef` field instead of a `name` path string.
 
 ### 3.1 Get
 
@@ -143,7 +130,7 @@ The following sections cover each standard method. The primary adaptation from A
 rpc GetActor(GetActorRequest) returns (Actor) {}
 
 message GetActorRequest {
-  ActorRef actor = 1;
+  ObjectRef actor = 1;
 }
 ```
 
@@ -151,7 +138,7 @@ Rules:
 - RPC name **must** begin with `Get` followed by the singular resource name.
 - Request message name **must** match the RPC name with a `Request` suffix.
 - Response **must** be the resource itself — not a `GetActorResponse` wrapper.
-- Request **must** identify the resource with a single `{Resource}Ref` field (atespace-scoped) or `string name` (global-scoped).
+- Request **must** identify the resource with a single `ObjectRef` field (for both atespace-scoped and global-scoped resources).
 - If the resource does not exist: return `NOT_FOUND`.
 
 ### 3.2 List
@@ -187,11 +174,11 @@ message ListActorsResponse {
 Rules:
 - RPC name **must** begin with `List` followed by the **plural** resource name.
 - Both the request and response message names **must** match the RPC name with `Request`/`Response` suffixes. (Unlike Get/Create/Update, List responses are not the resource itself.)
-- The `page_size` and `page_token` fields **must be defined** on every List request message (even though the token will be empty on the first call).
 - `next_page_token` **must** be present on every List response message. It **must** be empty when there are no further pages.
 - The repeated resource field **must** use the plural form of the resource name (e.g., `actors`, not `actor`).
 - If a user provides a `page_size` above the maximum, coerce it silently. If a user provides a negative value, return `INVALID_ARGUMENT`.
 - Sorting and filtering as specified in AIP-132 are not supported.
+- Clients must iterate over all pages until an empty `next_page_token` is returned. Clients should assume that an empty result means the end of the page stream.
 
 ### 3.3 Create
 
@@ -202,7 +189,7 @@ rpc CreateActor(CreateActorRequest) returns (Actor) {}
 
 message CreateActorRequest {
   // The actor to create.
-  // actor.atespace and actor.name together specify the resource's identity
+  // actor.meta.atespace and actor.meta.name together specify the resource's identity
   // and must both be set by the caller.
   Actor actor = 1;
 }
@@ -211,8 +198,10 @@ message CreateActorRequest {
 Rules:
 - RPC name **must** begin with `Create` followed by the singular resource name.
 - Response **must** be the resource itself — not a `CreateActorResponse` wrapper.
-- `actor.atespace` and `actor.name` are **required** and caller-specified. The server does not generate them.
+- `actor.meta.atespace` and `actor.meta.name` are **required** and caller-specified. The server does not generate them.
+- Other meta fields such as `uid`, timestamps, `version`, etc, are server side generated.
 - If a resource already exists with the same `(atespace, name)`: return `ALREADY_EXISTS`.
+- `actor.meta.atespace` must be specified iff the resource type is atespace-scoped, otherwise the service must return `INVALID_ARGUMENT`.
 
 **Divergence from AIP-133:** AIP-133 separates `parent` + `{resource}_id` from the resource body because AIP-122 makes the resource `name` field output-only (constructed by the server from the parent path). In Substrate's model, `atespace` and `name` are directly caller-specified identity fields on the resource, so duplicating them at the top level of the request adds no information and creates ambiguity about which one wins. The embedded resource is the single source of truth for identity on create.
 
@@ -245,27 +234,33 @@ Rules:
 - The special value `*` is **not supported**. Clients must enumerate the exact fields to update.
 - The resource's `atespace` and `name` identify the resource to update; they are not themselves updatable.
 - If the resource does not exist: return `NOT_FOUND`.
+- Additional "control" fields can be added to the request message to control the semantics of the operation (e.g. dry-run, or UID precondition check).
 
 **Divergence from AIP-134:** AIP-134 makes `update_mask` optional (omission implies updating all populated fields) and requires support for `*`. Substrate requires an explicit mask.
 
 ### 3.5 Delete
 
-*Follows [AIP-135](https://google.aip.dev/135).*
+*Follows [AIP-135](https://google.aip.dev/135). Diverges on return type.*
 
 ```proto
-rpc DeleteActor(DeleteActorRequest) returns (google.protobuf.Empty) {}
+rpc DeleteActor(DeleteActorRequest) returns (Actor) {}
 
 message DeleteActorRequest {
-  ActorRef actor   = 1;
+  ObjectRef actor   = 1;
   int64     version = 2; // optional freshness guard; 0 = skip check
 }
 ```
 
 Rules:
 - RPC name **must** begin with `Delete` followed by the singular resource name.
-- Response **must** be `google.protobuf.Empty` (no `DeleteActorResponse` wrapper).
-- Request **must** identify the resource with a `{Resource}Ref` field (atespace-scoped) or `string name` (global-scoped).
+- Response **must** be the deleted resource.
+- Request **must** identify the resource with an `ObjectRef` field (for both atespace-scoped and global-scoped resources).
 - If the resource does not exist: return `NOT_FOUND`.
+- Additional "control" fields can be added to the request message to control the semantics of the operation (e.g. dry-run, or UID precondition check).
+
+
+TODO: Delete operations are synchronous, but might revisit this and introduce the concept of soft-deletion to 
+allow external controllers and upstream systems / automations to react to resource deletion (e.g. via some mechanism like k8s finalizers).
 
 ---
 
@@ -279,15 +274,15 @@ Custom methods are for operations that don't map cleanly to CRUD: lifecycle tran
 rpc SuspendActor(SuspendActorRequest) returns (Actor) {}
 
 message SuspendActorRequest {
-  ActorRef actor = 1;
+  ObjectRef actor = 1;
 }
 ```
 
 Rules:
 - RPC name **must** be a verb phrase: `{Verb}{Resource}` (e.g., `SuspendActor`, `ResumeActor`).
 - Request message name **must** match the RPC name with a `Request` suffix.
-- The request **must** identify the target resource using a `{Resource}Ref` field (atespace-scoped) or `string name` (global-scoped).
-- The response **should** return the updated resource when the operation mutates it (e.g., all Actor lifecycle methods return the updated `Actor`).
+- The request **must** identify the target resource using an `ObjectRef` field (for both atespace-scoped and global-scoped resources).
+- Custom methods should return a response message matching the RPC name, with a Response suffix. When operating on a specific resource, a custom method may return the resource itself.
 
 ---
 
@@ -303,11 +298,10 @@ Rules:
 - Use standard abbreviations where well-established: `config`, `spec`, `id`, `info`, `stats`.
 - Adjectives come before the noun: `suspended_actors`, not `actors_suspended`.
 - Avoid prepositions in field names: `error_reason`, not `reason_for_error`.
-- Do not use `name` for any purpose other than a resource's own name field (see section 2.1). Use specific names: `display_name`, `actor_template_name`, etc.
 
 ### 5.1 Field presence (`optional`)
 
-Use the `optional` keyword on a scalar field **only** when null and the zero value (`false`, `0`, `""`) are semantically distinct for that field's meaning. Do not use `optional` universally or as a workaround for update semantics — the required `update_mask` (§3.4) handles that.
+Use the `optional` keyword on a scalar field **only** when null and the zero value (`false`, `0`, `""`) are semantically distinct for that field's meaning. Do not use `optional` universally or as a workaround for update semantics — the required `update_mask` handles that.
 
 ```proto
 // Only if "unrated" is meaningfully different from "rated 0":
@@ -323,35 +317,27 @@ Because `update_mask` is required, the server always knows which fields the clie
 
 ## 6. Standard Fields
 
-*Follows [AIP-148](https://google.aip.dev/148) and [AIP-142](https://google.aip.dev/142).*
+*Follows [AIP-148](https://google.aip.dev/148) and [AIP-142](https://google.aip.dev/142). Diverges in that a shared message contains all standard fields.*
 
-Certain fields appear on nearly every resource and must use the exact names and types below. All standard fields are **output-only**: the server sets them and the client must not send them on create or update (the server ignores any value provided).
-
-The recommended field ordering within a resource message is: identity fields (`atespace`, `name`), then `uid`, then timestamps, then `version`, then resource-specific fields.
+All resources in Substrate must have a `ResourceMetadata meta = 1` field to hold common fields.
 
 ```proto
-message Actor {
+message ResourceMetadata {
   string atespace = 1;
   string name     = 2;
 
   // uid is a server-assigned, globally unique identifier for this resource.
-  // It is stable across renames and updates. Distinct from name.
+  // Immutable throughout the lifecycle of the resource.
   string uid = 3;
 
+  // version is incremented on every mutation.
+  int64 version = 4;
+
   // create_time is the time the resource was created.
-  google.protobuf.Timestamp create_time = 4;
+  google.protobuf.Timestamp create_time = 5;
 
   // update_time is the time the resource was last updated by a user action.
-  google.protobuf.Timestamp update_time = 5;
-
-  // delete_time is set when the resource is soft-deleted.
-  // Only present on resources that support soft delete.
-  google.protobuf.Timestamp delete_time = 6;
-
-  // version is incremented on every mutation. See §7.
-  int64 version = 7;
-
-  // ... resource-specific fields
+  google.protobuf.Timestamp update_time = 6;
 }
 ```
 
@@ -360,29 +346,25 @@ message Actor {
 - Type: `string`.
 - A server-assigned [UUID4](https://en.wikipedia.org/wiki/Universally_unique_identifier#Version_4_(random)).
 - Useful for correlation across logs, events, and audit trails where the resource `name` may not be available. Also useful
-for controllers that need to do bookeeping and track state associated with the resource.
+for controllers that need to do bookkeeping and track state associated with a resource.
 
-### 6.2 `create_time`
+### 6.2 `version`
+
+- Type: `int64`.
+- Monotonically increasing number which increments on every resource update. Allows clients to do opportunistic locking
+on resource updates. Also establishes a total order on "snapshots" of a given resource. See section #7.
+
+### 6.3 `create_time`
 
 - Type: `google.protobuf.Timestamp`.
 - Records when the resource was created.
 - Set once at creation; never updated.
-- All public resources **must** include `create_time`.
 
-### 6.3 `update_time`
+### 6.4 `update_time`
 
 - Type: `google.protobuf.Timestamp`.
 - Records when the resource was last modified by a user action (Create, Update, or a custom mutating method).
 - Updated on every mutation. Internal state changes made by the system (e.g., a scheduler assigning a worker) **may** also update this field, but are not required to.
-- All public resources **must** include `update_time`.
-
-### 6.4 `delete_time`
-
-- Type: `google.protobuf.Timestamp`.
-- Only relevant for resources that support **soft delete** (marking as deleted without immediately purging).
-- Set when the resource is soft-deleted; absent (zero value) when the resource is live.
-- Resources that do not support soft delete **must not** include this field.
-- Substrate's current resources use hard delete; add `delete_time` only if soft delete is introduced for a specific resource type.
 
 ---
 
@@ -401,24 +383,19 @@ The name `version` is intentional: it increments on every write (like Kubernetes
 `version` is a standard output-only field on every resource:
 
 ```proto
-message Actor {
-  string atespace = 1;
-  string name     = 2;
-  string uid      = 3;
-  google.protobuf.Timestamp create_time = 4;
-  google.protobuf.Timestamp update_time = 5;
-  int64 version = 6;
+message ResourceMetadata {
 
-  // ... resource-specific fields
+  // ... other fields
+
+  // version is incremented on every mutation.
+  int64 version = 4;
 }
 ```
 
 - Type: `int64`.
 - Output-only: the server sets it. Starts at `1` on creation, incremented by `1` on every mutation.
-- **Monotonically increasing:** safe to compare numerically. A higher value is always newer.
+- Monotonically increasing. A higher value is always newer.
 - Updated on every mutation — both user-visible changes and system-internal ones (e.g. the scheduler binding a worker).
-- The field **must** be named `version`.
-- All public resources **must** include `version`.
 
 ### 7.2 Using `version` to guard writes
 
@@ -430,9 +407,11 @@ A client that wants to guard against concurrent modification echoes back the `ve
 // Client read actor at version 5, now updating:
 UpdateActorRequest {
   actor: Actor {
-    atespace: "my-space"
-    name:     "my-actor"
-    version:  5            // guard: fail if server is not at 5
+    meta: ResourceMetadata {
+      atespace: "my-space"
+      name:     "my-actor"
+      version:  5            // guard: fail if server is not at 5
+    }
     worker_selector: ...
   }
   update_mask: "worker_selector"
@@ -443,7 +422,7 @@ UpdateActorRequest {
 
 ```proto
 message DeleteActorRequest {
-  ActorRef actor  = 1;
+  ObjectRef actor  = 1;
   // Optional. If non-zero, the deletion is rejected with ABORTED if the
   // server's current version does not match.
   int64 version   = 2;
