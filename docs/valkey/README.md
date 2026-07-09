@@ -12,16 +12,22 @@ own documentation.
 
 ## Pages
 
-- [`topology.md`](./topology.md) — what's deployed, how the pieces fit
-  together, sizing math for MVP and target scale, identity / TLS wiring,
-  and the configuration knobs we have not set yet.
-- [`lifecycle.md`](./lifecycle.md) — the actor state machine, the four
-  lifecycle workflows (Create, Resume, Suspend, Pause), the
-  worker-cache subscription model, and the per-actor scheduling
-  eligibility rules.
+- [`topology.md`](./topology.md) — what's deployed, how the pieces
+  fit together, and identity / TLS wiring.
+- [`lifecycle.md`](./lifecycle.md) — the actor state machine
+  (including the CRASHED parking state), the lifecycle workflows
+  (Create, Resume, Suspend, Pause, Delete), the worker-cache
+  subscription model, and the per-worker scheduling eligibility
+  rules.
 - [`operations.md`](./operations.md) — failure modes with inline
-  recovery for each, common admin operations, and the short list of
+  recovery for each, common admin operations (including coordinated
+  maintenance failovers and backup/restore), and the short list of
   open operational risks.
+- [`scaling_to_10m.md`](./scaling_to_10m.md) — the growth path from
+  a 10-actor pilot to the supported envelope of 10 million actors:
+  tiered requirements with graduation triggers, capacity math, the
+  durability contract, and the deployed-today vs. target
+  configuration ladder.
 
 ## Conventions
 

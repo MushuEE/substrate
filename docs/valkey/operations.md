@@ -45,8 +45,9 @@ kubectl -n ate-system exec valkey-cluster-0 -- vcli cluster nodes > /tmp/inciden
 > shard whose slot range is briefly uncovered — including a normal
 > primary failover — flips `cluster_state` to `fail` and pauses
 > **all** writes cluster-wide until coverage is restored. Flipping
-> to `no` would localize each failure to its own slot range. See
-> [`topology.md`](./topology.md).
+> to `no` would localize each failure to its own slot range. See the
+> configuration ladder in
+> [`scaling_to_10m.md`](./scaling_to_10m.md).
 
 ### Single replica loss
 <details>
@@ -90,6 +91,11 @@ election + slot-map refresh), not per-slot.
 **Data loss window:** any writes the old primary acked but had not
 yet shipped to its replica are lost. Sub-millisecond under light
 load; can be hundreds of milliseconds to seconds under burst load.
+**This window applies to every *unplanned* failover.** Planned
+maintenance (upgrades, node drains) should never pay it — use the
+coordinated-failover procedure under
+[Common admin operations](#planned-maintenance-coordinated-failover),
+which hands off with zero tail loss.
 
 **Recovery:** automatic — verify and sweep for stranded actors.
 
@@ -101,9 +107,11 @@ kubectl -n ate-system exec valkey-cluster-1 -- vcli cluster info
 # Verify the recreated pod rejoined as replica
 kubectl -n ate-system exec <recreated-pod> -- vcli info replication
 
-# Sweep for stranded actors (RESUMING/SUSPENDING/PAUSING past lock TTL)
+# Sweep for stranded actors: RESUMING/SUSPENDING/PAUSING past the
+# lock TTL, plus CRASHED actors parked by crash detection (these are
+# deliberate, but each one represents a workload that died mid-op).
 # This requires an admin command or direct query; if none exists yet,
-# log into ateapi and check actor status counts via the API.
+# check actor status counts via `kubectl ate get actors`.
 ```
 
 **Postmortem:** failover trigger; measured cluster-pause duration
@@ -141,8 +149,12 @@ kubectl -n ate-system get pvc
 #    serves; lost pod's new PVC will full-resync from the surviving
 #    pod. No additional data loss beyond (2).
 
-# 4. Both PVCs lost → permanent data loss for that shard's slot
-#    range. No off-cluster backups today. Escalate; do not attempt
+# 4. Both PVCs lost, backups configured (10M target) → restore the
+#    shard's most recent RDB from object storage; loss is bounded by
+#    the backup interval. See "Backups and restore" below.
+
+# 5. Both PVCs lost, no backups (deployed today) → permanent data
+#    loss for that shard's slot range. Escalate; do not attempt
 #    re-bootstrap without senior on-call involvement.
 ```
 
@@ -159,22 +171,24 @@ before next deployment.
 <summary><em>Expand</em></summary>
 
 **Symptom:** ResumeActor calls return errors mentioning "worker
-cache not ready"; happens at API-server pod startup and during
-post-pub/sub-disconnect resync windows.
+cache not ready".
 
-**What's happening:** the cache is mid-`ListWorkers` initial sync.
-At 10k workers this is seconds; at 100k workers it's tens of
-seconds. During this window the pod accepts connections but
-`Workers()` refuses with a clear error.
+**What's happening:** the cache is mid-`ListWorkers` sync after its
+pub/sub subscription dropped. At 10k workers a sync is seconds; at
+100k workers it's tens of seconds. Note this error is only reachable
+in the post-disconnect **resync** window: at pod *startup* the
+initial sync runs before the gRPC listener opens (a failed startup
+sync is fatal), so clients see the pod as not-ready/refusing
+connections rather than this error.
 
 **Recovery:** wait. The cache will become ready when sync completes.
 If the window is longer than expected, it means `ListWorkers` is
-slow (Valkey cluster pressure, network issues) or the initial
-worker count is unexpectedly large.
+slow (Valkey cluster pressure, network issues) or the worker count
+is unexpectedly large.
 
 ```bash
 # Watch the API server logs for "worker cache synced" message
-kubectl -n ate-system logs deployment/ate-api-server -f | grep -i "cache"
+kubectl -n ate-system logs deployment/ate-api-server-deployment -f | grep -i "cache"
 ```
 
 **Mitigation to consider:** stagger API-server pod restarts so the
@@ -223,22 +237,27 @@ for the workload sensitivity.
 <details>
 <summary><em>Expand</em></summary>
 
-**Symptom:** Worker state observed in `ate actor list` (or via
-`vcli`) doesn't match what the cache returns. Typically: a worker
+**Symptom:** Worker state observed via `kubectl ate get workers` (or
+direct `vcli` queries) doesn't match what the cache returns. Typically: a worker
 visible via direct Valkey query but not in the cache, or vice versa.
 
 **What's happening:** Redis pub/sub is fire-and-forget. Events can be
 dropped when the subscriber's connection blips, when the subscriber
-buffer (128 events deep) fills under burst, or during a primary
-failover. The periodic relist is the durability backstop but only
-catches up at its scheduled interval.
+buffer (128 events deep) fills under burst (note: editing a
+WorkerPool's labels fans out one `UpdateWorker` event **per worker
+in the pool**), or during a primary failover. Two backstop caveats:
+the periodic relist only catches up on its schedule (**5 minutes**),
+and while Created/Updated events are guarded by the worker `version`
+(a stale event cannot overwrite a fresher entry), **Deleted events
+carry no version** and are applied unconditionally — a late delete
+can briefly remove a fresher entry until the next relist.
 
 **Recovery:** the periodic relist will fix it. If the discrepancy
 needs to be resolved immediately, restart the affected API-server
 pod — the new pod will run a fresh initial sync.
 
 ```bash
-kubectl -n ate-system rollout restart deployment ate-api-server
+kubectl -n ate-system rollout restart deployment ate-api-server-deployment
 # Wait for new pod to become ready (initial-sync cost applies)
 ```
 
@@ -290,12 +309,16 @@ pod then comes up as the new replica in crash-loop until repaired.
 **Recovery:**
 
 ```bash
-# Copy the AOF off for postmortem before fixing
-kubectl -n ate-system cp <affected-pod>:/data/appendonly.aof /tmp/incident-aof-$(date +%s).aof
+# Valkey ≥7 uses a multi-part AOF: /data/appendonlydir/ holds a base
+# file, incr files, and a manifest. Copy the whole directory off for
+# postmortem before fixing.
+kubectl -n ate-system cp <affected-pod>:/data/appendonlydir /tmp/incident-aof-$(date +%s)/
 
 # Attach a debug container that mounts the affected pod's PVC,
-# then truncate the AOF to the last valid command:
-kubectl -n ate-system exec -it <debug-pod> -- valkey-check-aof --fix /data/appendonly.aof
+# then truncate the AOF to the last valid command (point the tool
+# at the manifest so it repairs the whole set):
+kubectl -n ate-system exec -it <debug-pod> -- \
+  valkey-check-aof --fix /data/appendonlydir/appendonly.aof.manifest
 # Confirm acceptable loss; type 'y' to truncate.
 
 # Delete the affected pod; StatefulSet recreates and AOF loads cleanly.
@@ -606,6 +629,62 @@ of incident.
 
 ## Common admin operations
 
+### Planned maintenance (coordinated failover)
+
+Any planned action that takes down a **primary** — node drain, rolling
+upgrade, resize — should hand the primary role off *first* with
+`CLUSTER FAILOVER`, run from the shard's replica. The replica fully
+syncs before taking over, so the handoff loses **zero acked writes**;
+letting the eviction race the gossip timeout instead turns every
+planned upgrade into an unplanned-failover loss event (see "Primary
+loss" above).
+
+```bash
+# 1. Find the role of the pod you intend to take down
+kubectl -n ate-system exec <target-pod> -- vcli info replication
+# role:master → coordinated failover required. role:slave → just drain it.
+
+# 2. Identify the shard's replica (cluster nodes maps replicas to primaries)
+kubectl -n ate-system exec valkey-cluster-0 -- vcli cluster nodes
+
+# 3. On the REPLICA of that shard, request a graceful takeover
+kubectl -n ate-system exec <replica-pod> -- vcli cluster failover
+# (no FORCE/TAKEOVER argument — the graceful form is the whole point)
+
+# 4. Wait for the role swap to complete before touching the pod
+kubectl -n ate-system exec <replica-pod> -- vcli info replication
+# Expect: role:master. And cluster_state:ok on any node.
+
+# 5. Now drain/delete the demoted pod (it is a replica; only HA is
+#    briefly reduced). One shard at a time; wait for full resync
+#    before moving to the next shard.
+```
+
+Rules of thumb: never run two shards' maintenance concurrently, and
+never skip step 4 — deleting the old primary while the failover is
+mid-election produces exactly the unplanned pause this procedure
+exists to avoid.
+
+### Backups and restore
+
+**Deployed today: none.** Everything below is the 10M-target design
+(see [`scaling_to_10m.md`](./scaling_to_10m.md)) so the whole-shard
+recovery path above has somewhere to point; treat it as the spec for
+the backlog item, not a description of a running system.
+
+- **Take backups from replicas, never primaries**: a CronJob triggers
+  `BGSAVE` on each shard's replica and streams the resulting RDB to
+  object storage. Interval 15–60 min by tier; retain 7–30 days.
+- **Restore (single shard)**: scale down the affected shard's pods,
+  place the RDB on a fresh PVC, start the pod with `appendonly no`
+  for the initial load, let it rejoin and re-replicate, then re-enable
+  AOF. Loss is bounded by the backup interval for that shard's slot
+  range only.
+- **Drill it**: a restore that has never been exercised is a
+  hypothesis, not a capability. Run one restore drill per release
+  cycle; at single-digit-GB shard sizes this is a sub-30-minute
+  exercise.
+
 ### Inspect cluster state
 
 ```bash
@@ -614,11 +693,13 @@ kubectl -n ate-system exec valkey-cluster-0 -- vcli cluster nodes
 # Expect cluster_state:ok, cluster_slots_ok:16384
 ```
 
-### Inspect worker cache state from an API server pod
+### Inspect worker cache state
 
 ```bash
-# Number of workers in the cache (via the API)
-kubectl -n ate-system exec deployment/ate-api-server -- ate worker list | wc -l
+# Number of workers according to the control plane (kubectl-ate
+# plugin, run from your workstation — the API-server image is a bare
+# binary with no CLI inside)
+kubectl ate get workers | wc -l
 
 # Compare against the source-of-truth count in Valkey
 kubectl -n ate-system exec valkey-cluster-0 -- vcli --cluster call valkey-cluster-0:6379 --no-auth-warning eval "return #redis.call('keys', 'worker:*')" 0
@@ -632,14 +713,15 @@ If the two numbers differ persistently, the cache is missing events
 ```bash
 # Direct from Valkey
 kubectl -n ate-system exec valkey-cluster-0 -- vcli get worker:<ns>:<pool>:<pod>
-# Look for the actor_id field in the returned JSON.
+# Look at the "assignment" field in the returned JSON:
+# assignment.actor is {atespace, name}; absent assignment = idle worker.
 ```
 
 ### Force the workercache to re-sync
 
 ```bash
 # Restart the API server pod — it will run a fresh initial sync
-kubectl -n ate-system rollout restart deployment ate-api-server
+kubectl -n ate-system rollout restart deployment ate-api-server-deployment
 ```
 
 ## Open risks
@@ -661,6 +743,9 @@ either accepted-with-rationale or carried-pending-action.
 | Worker cache initial-sync cost on every API-server restart | Operational | Bounded; stagger restarts via PDB |
 | K8s node-failure → ghost workers in cache for minutes | Operational | Bounded by K8s eviction timeouts; consider tuning if user-visible |
 | `DebugClearAll` is package-public with no production guard | Operational hazard | **Active**: rename to `_TESTONLY` or build-tag guard |
+| PAUSED actor on a dead node is unrecoverable via the API — `boot=true` cannot bypass an existing local snapshot, and the syncer never resets a finalized pause | Per-actor availability | **Active**: needs an API-level escape hatch (force-boot or snapshot-clear) |
+| `node_vms_with_local_snapshots` written once at pause — node death or checkpoint eviction never updates it, so it can silently go stale | Operational | Watch — largely subsumed by the paused-actor escape-hatch fix above |
+| Durable snapshots are never cleaned up — `DeleteActor` leaves blobs in object storage | Cost / hygiene | Active: needs delete-time cleanup or a GC sweep |
 
 **Items marked Active are the short list of cheap, high-ROI
 hardening steps that should land before any meaningful production
