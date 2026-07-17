@@ -14,6 +14,10 @@ Part of: [ci-testinfra-architecture.md](./ci-testinfra-architecture.md)
    access and without asking a maintainer to click buttons.
 4. Anyone with standing can stop a merge (`/hold`) pending an
    unresolved discussion, and release it (`/unhold`).
+5. A first-time contributor's PR does not run CI until someone with
+   standing says `/ok-to-test` — untrusted code never executes on
+   project runners by default, and releasing it is one comment, not
+   a trip to the Actions UI.
 
 Today none of this journey is supported: branch protection on `main`
 enforces zero required status checks, merges are manual, a
@@ -54,7 +58,17 @@ Reruns are cheap because the Ariane bot re-triggers workflows from
 comments.
 
 **etcd** uses Prow's `lgtm`/`approve`/`trigger` (free `/retest`) but
-no merge automation — a maintainer merges manually on green.
+no merge automation — a maintainer merges manually on green. Most
+relevant here: etcd retrofits Prow's trust model onto GitHub Actions
+with `.github/workflows/gh-workflow-approve.yaml` in
+[etcd-io/etcd](https://github.com/etcd-io/etcd) — when a maintainer
+applies the `ok-to-test` label (the Prow convention), a workflow
+auto-approves any Actions runs held by GitHub's
+first-time-contributor approval gate. Kubernetes' own rationale for
+the gate is the same one that applies to Substrate: presubmits
+execute the PR's code, so execution is withheld until a trusted
+member vouches for the change
+([Prow trigger plugin docs](https://docs.prow.k8s.io/docs/components/plugins/trigger/)).
 
 The Prow-emulation actions available for plain GitHub (single
 root-level OWNERS file, comment-driven labels) are chat-ops
@@ -76,6 +90,7 @@ and `/hold` need small new workflows.
 | merge | Maintainer clicks "Merge when ready": the PR enters the merge queue and lands only after required checks pass on the merge-group SHA — the Tide invariant, natively | Maintainers | Merge queue |
 | `/retest` | New small workflow on `issue_comment`: if the commenter is a Maintainer/Reviewer (team membership check), call the Actions API to re-run failed jobs on the PR's head SHA. Human-invoked rerun is allowed; automatic retry of failed tests is banned by the flake policy ([flaky-tests.md](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-testing/flaky-tests.md); see [ci-cuj-stability-alerting.md](./ci-cuj-stability-alerting.md)) | Reviewers+ | n/a |
 | `/hold`, `/unhold` | New small workflow applying/removing a `do-not-merge/hold` label, plus a `merge-blockers` job that fails a required context while any `do-not-merge/*` label is present (cilium's MLH pattern) | Reviewers+ | Ruleset (via the blocker context) |
+| `/ok-to-test` | New small workflow: comment applies an `ok-to-test` label; a companion workflow approves the PR's held Actions runs via the API whenever the label is present — including on subsequent pushes (etcd's `gh-workflow-approve.yaml` pattern). Backed by the repo setting "require approval for all outside collaborators", which is the actual trust boundary | Reviewers+ | Repo setting (Actions approval gate) |
 
 ### Merge gating configuration
 
@@ -101,6 +116,24 @@ and `/hold` need small new workflows.
   (`if: github.event_name != 'merge_group'`) while keeping it
   PR-blocking — not to weaken the PR gate.
 
+### Security constraints on the command workflows
+
+The comment-command workflows run with write permissions, which makes
+them the classic privileged-workflow attack surface. Three rules
+bound the design:
+
+- Standing is checked by team membership, not comment-author
+  heuristics.
+- The privileged workflows only call GitHub APIs (approve runs,
+  rerun jobs, apply labels); they never check out or execute PR
+  code.
+- Strengthen the Actions approval setting from GitHub's default
+  ("first-time contributors") to "all outside collaborators" when
+  `/ok-to-test` ships: the command makes the stronger setting
+  ergonomically free, and Substrate's E2E jobs execute PR code on
+  KVM-enabled runners, which is exactly the workload the gate
+  exists to protect.
+
 ### Explicitly not built
 
 No OWNERS-file emulation, no label-driven auto-merge bot, no
@@ -117,8 +150,11 @@ GitHub-native.
 | R1 | Aggregate gate + ruleset + merge queue + `merge_group` trigger | P0 | ~2 days |
 | R2 | `/retest` workflow | P1 | ~1 day |
 | R3 | `/hold`–`do-not-merge/*` labels + `merge-blockers` required context | P1 | ~1 day |
+| R4 | `/ok-to-test` label + run-approval workflow; tighten Actions approval setting to all outside collaborators | P1 | ~1 day |
 
 Exit criteria: a red or stale PR cannot merge by any non-admin path;
 one week of queue operation without a stuck entry; a Reviewer
 successfully reruns a failed job and holds a PR without maintainer
-intervention.
+intervention; a first-time contributor's held CI is released by
+comment, and their next push is auto-approved while the label
+remains.

@@ -78,7 +78,7 @@ placement rationale live in
 | Concern | Substrate today | Target | Effort | CUJ doc |
 |---|---|---|---|---|
 | Merge gating | Zero required checks; manual merges of possibly-stale PRs | Required contexts + merge queue | S | review-commands |
-| Review commands | None; contributors can't rerun CI | `/retest`, `/hold` workflows; native approvals for `/lgtm`, `/approve` | S | review-commands |
+| Review commands | None; contributors can't rerun CI; first-time-contributor runs need Actions-UI clicks | `/retest`, `/hold`, `/ok-to-test` workflows; native approvals for `/lgtm`, `/approve` | S | review-commands |
 | Trigger tiers | Presubmit + cache-warming cron mixed in one workflow; no periodic E2E vs `main` | Explicit tier convention + nightly periodic | S | integration-testing |
 | Review routing | No CODEOWNERS; `GOVERNANCE.md` ladder unenforced | CODEOWNERS + teams + lint; LLM review advisory-only | S–M | review-assignment |
 | Flake management | Nothing | Policy doc, `ci/flake` label, quarantine ladder; later auto-detection | S policy, M automation | stability-alerting |
@@ -139,7 +139,7 @@ Milestone IDs refer to the tables in each CUJ doc.
 |---|---|---|---|---|
 | 1 | R1 — gate + ruleset + merge queue | review-commands | P0 | ~2 days |
 | 2 | T1 — nightly periodic (starts lane 0) | integration-testing | P0 | ~2–3 days |
-| 3 | R2, R3 — `/retest`, `/hold` | review-commands | P1 | ~2 days |
+| 3 | R2–R4 — `/retest`, `/hold`, `/ok-to-test` | review-commands | P1 | ~3 days |
 | 4 | S1 — CI policy doc + flake labels (start early; consensus overlaps other work) | stability-alerting | P1 | ~2 days + latency |
 | 5 | A1, A2 — CODEOWNERS decision + implementation | review-assignment | P1 | ~2–3 days + decisions |
 | 6 | P1, P2 — Locust CI mode + perf periodic (protected block) | perf-regression | P2 | ~2–3 weeks |
@@ -183,7 +183,8 @@ concepts, as practiced by containerd and cilium — not Prow itself.
 Five CUJ sub-issues, each independently shippable:
 
 - [ ] CUJ: review commands and merge gating (P0 core) —
-      aggregate gate, ruleset, merge queue, /retest, /hold
+      aggregate gate, ruleset, merge queue, /retest, /hold,
+      /ok-to-test (fork-PR CI released by trusted comment)
 - [ ] CUJ: CI tiers and integration testing (P0 core) —
       nightly periodic E2E + soak against main; tier budgets
 - [ ] CUJ: automatic review assignment (P1) —
@@ -207,8 +208,8 @@ advisory-only and never a required check.
 Runner minutes are free (public repo); real costs are one extra full
 CI run per merge (merge group), one nightly E2E matrix + one nightly
 perf run of periodic compute, and a weekly triage habit. Maintenance
-surface added: ruleset config, CODEOWNERS, three small workflows
-(/retest, /hold, CI-health), two scheduled workflows.
+surface added: ruleset config, CODEOWNERS, four small workflows
+(/retest, /hold, /ok-to-test, CI-health), two scheduled workflows.
 
 ## Requested from maintainers
 
