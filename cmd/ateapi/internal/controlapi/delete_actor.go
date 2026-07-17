@@ -24,23 +24,25 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-func (s *Service) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.DeleteActorResponse, error) {
+func (s *Service) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
 	if err := validateDeleteActorRequest(req); err != nil {
 		return nil, err
 	}
 
-	if err := s.persistence.DeleteActor(ctx, req.GetActorId()); err != nil {
+	deleted, err := s.persistence.DeleteActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName())
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", req.GetActorId())
+			return nil, status.Errorf(codes.NotFound, "Actor %s not found", req.GetActor().GetName())
 		}
 		if errors.Is(err, store.ErrFailedPrecondition) {
-			actor, getErr := s.persistence.GetActor(ctx, req.GetActorId())
+			current, getErr := s.persistence.GetActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName())
 			if getErr == nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "Actor %s is not suspended (status: %v)", req.GetActorId(), actor.GetStatus())
+				return nil, status.Errorf(codes.FailedPrecondition, "Actor %s is not suspended (status: %v)", req.GetActor().GetName(), current.GetStatus())
 			}
-			return nil, status.Errorf(codes.FailedPrecondition, "Actor %s is not suspended", req.GetActorId())
+			return nil, status.Errorf(codes.FailedPrecondition, "Actor %s is not suspended", req.GetActor().GetName())
 		}
 		if errors.Is(err, store.ErrPersistenceRetry) {
 			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
@@ -48,15 +50,21 @@ func (s *Service) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequ
 		return nil, fmt.Errorf("while deleting actor from DB: %w", err)
 	}
 
-	return &ateapipb.DeleteActorResponse{}, nil
+	return deleted, nil
 }
 
 func validateDeleteActorRequest(req *ateapipb.DeleteActorRequest) error {
-	if req.GetActorId() == "" {
-		return status.Error(codes.InvalidArgument, "actor_id is required")
+	var fldPath *field.Path
+	var errs field.ErrorList
+
+	if val, fldPath := req.Actor, fldPath.Child("actor"); val == nil {
+		errs = append(errs, field.Required(fldPath, ""))
+	} else {
+		errs = append(errs, resources.ValidateObjectRef(val, fldPath)...)
 	}
-	if err := resources.ValidateActorID(req.GetActorId()); err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+
+	if len(errs) > 0 {
+		return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
 	}
 	return nil
 }

@@ -223,9 +223,10 @@ These resources define the intended state of the system and are managed via
 Kubernetes CRD APIs. They are used for administrative operations and actor
 environment definitions.
 
-  * **WorkerPool**: Defines a pool of "warm" compute capacity. It specifies the
-    hardware shape (CPU, memory, accelerators), manages a fleet of standby
-    worker pods initialized and ready to receive resumed actor states.
+  * **WorkerPool**: Defines a pool of "warm" compute capacity. It manages a
+    fleet of standby worker pods initialized and ready to receive resumed actor
+    states. Optional `spec.template` fields configure worker pod node
+    selection, tolerations, priority class, and node affinity.
 
   * **ActorTemplate**: An immutable definition of an actor-version. It
     encapsulates the container image, configuration, and environment required
@@ -262,6 +263,48 @@ and Performance:
       and Templates) allows platform teams to apply familiar RBAC, auditing,
       and policy enforcement to the underlying infrastructure.
 
+### Resource Model
+
+The CRDs and control-plane records described above, with their relationships and
+multiplicities (UML class diagram):
+
+```mermaid
+classDiagram
+    namespace kube-apiserver {
+        class ActorTemplate {
+            <<CRD>>
+        }
+        class WorkerPool {
+            <<CRD>>
+        }
+        class Deployment
+        class WorkerPod {
+            ateom
+            runsc
+        }
+    }
+
+    namespace ate-api-server {
+        class Actor {
+            <<record>>
+            status
+            snapshotRefs
+        }
+        class Worker {
+            <<record>>
+            actorId
+            podIP
+        }
+    }
+
+    ActorTemplate "1" --> "1" WorkerPool : workerPoolRef
+    WorkerPool ..> Deployment : reconciled by atecontroller
+    Deployment "1" *-- "*" WorkerPod : manages
+    Actor ..> ActorTemplate : derived from
+    Actor "0..1" --> "0..1" Worker : runs on
+    Worker "1" --> "1" WorkerPod : maps to
+```
+
 ## System Components
 
 ### Control Plane (`ate-api-server`)
@@ -283,17 +326,25 @@ The node-level subsystem manages the physical execution of sandboxes and the mov
 
   * **atelet**: A lightweight supervisor running on each node as a DaemonSet. It acts as the "Herder," managing a pool of physical pods and communicating with the Control Plane.
 
-  * **ateom**: A specialized "interior gVisor" container image that runs inside the physical worker pods. It provides a gRPC interface for `atelet` to trigger `RunWorkload`, `CheckpointWorkload`, and `RestoreWorkload` operations. This separation ensures that the physical pod lifecycle remains decoupled from the sandboxed agent process.
+  * **ateom**: A specialized sandbox-herder container image — one per sandbox class (`ateom-gvisor`, `ateom-microvm`) — that runs inside the physical worker pods. It provides a gRPC interface for `atelet` to trigger `RunWorkload`, `CheckpointWorkload`, and `RestoreWorkload` operations. This separation ensures that the physical pod lifecycle remains decoupled from the sandboxed agent process.
 
-  * **Lifecycle Management**: The `ateom` process invokes the sandbox runtime (e.g., `runsc` for gVisor) to checkpoint or restore processes within the physical pod boundaries. (Note: Substrate currently requires a `runsc` version with the `--allow-connected-on-save` flag to work around a bug in networking resumption during checkpointing).
+  * **Lifecycle Management**: The `ateom` process invokes the sandbox runtime to checkpoint or restore processes within the physical pod boundaries — `runsc` for gVisor, or the Kata + Cloud Hypervisor stack for micro-VMs. (Note: the gVisor backend currently requires a `runsc` version with the `--allow-connected-on-save` flag to work around a bug in networking resumption during checkpointing.)
 
   * **Storage Mover**: The `atelet` streams snapshots to and from GCS/S3, ensuring process state is persistent and portable across the cluster.
+
+### Sandbox Classes
+
+A `WorkerPool` selects a **sandbox class** (`spec.sandboxClass`), and each class has a matching `ateom` herder image. The sandbox binaries themselves are not baked into the worker image — they are fetched at runtime from a cluster-scoped [`SandboxConfig`](api-guide.md#3-sandboxconfig-sandbox-binaries) and pinned into each snapshot's manifest so restores stay reproducible across runtime upgrades.
+
+  * **gVisor** (`ateom-gvisor`, the default): Runs the workload under `runsc` for kernel-level sandboxing. Suspend and resume leverage gVisor's native checkpoint/restore of the sandboxed process tree.
+
+  * **micro-VM** (`ateom-microvm`): Runs the workload inside a [Kata Containers](https://katacontainers.io/) guest on the [Cloud Hypervisor](https://www.cloudhypervisor.org/) VMM. Suspend and resume capture a memory-only VM snapshot and restore it on-demand using `userfaultfd` memory demand-paging, with container rootfs writes captured in guest RAM via a `tmpfs` overlay.
 
 ### Networking Stack (`atenet` + Envoy)
 
 Handles session-aware routing and automatic re-animation.
 
-  * **Uniform DNS Mesh**: Substrate provides a location-transparent actor discovery scheme via a global DNS suffix (`<id>.actors.resources.substrate.ate.dev`).
+  * **Uniform DNS Mesh**: Substrate provides a location-transparent actor discovery scheme via a global DNS suffix (`<id>.<atespace>.actors.resources.substrate.ate.dev`).
 
   * **Routing**: The `atenet` router (powered by Envoy and an External Processing server) intercepts traffic destined for the mesh. It extracts the actor ID from the `Host` header, queries the Control Plane to determine the actor's current location, and triggers a `ResumeActor` workflow if the session is currently suspended.
 
@@ -301,7 +352,48 @@ Handles session-aware routing and automatic re-animation.
 
 ## Actor Lifecycle
 
-The lifecycle of an actor follows a state-driven sequence.
+The lifecycle of an actor follows a state-driven sequence. A request reaches an
+actor through the networking stack, which resumes it onto a worker if it is
+suspended (UML sequence diagram):
+
+```mermaid
+sequenceDiagram
+    actor Client
+    participant DNS as atenet DNS
+    participant Router as atenet router
+    participant API as ate-api-server
+    participant Atelet as atelet
+    participant Ateom as ateom
+    participant Store as snapshot storage
+
+    Client->>DNS: resolve actor DNS name
+    DNS-->>Client: router address
+    Client->>Router: HTTP request (Host = actor)
+    Router->>API: ResumeActor(actorID)
+    API->>Atelet: Restore
+    Store-->>Atelet: download snapshot
+    Atelet->>Ateom: RestoreWorkload
+    Note over Ateom: runsc restore
+    Ateom-->>Atelet: ready
+    Atelet-->>API: worker pod IP
+    API-->>Router: worker pod IP
+    Router->>Ateom: proxy request to worker pod
+    Ateom-->>Router: response
+    Router-->>Client: response
+    Note over API,Store: later: an explicit SuspendActor checkpoints back to storage and frees the worker
+```
+
+An Actor's `status` moves through these states (UML state machine diagram):
+
+```mermaid
+stateDiagram-v2
+    [*] --> SUSPENDED : CreateActor
+    SUSPENDED --> RESUMING : ResumeActor
+    RESUMING --> RUNNING : restore / boot complete
+    RUNNING --> SUSPENDING : SuspendActor
+    SUSPENDING --> SUSPENDED : checkpoint complete
+    SUSPENDED --> [*] : DeleteActor
+```
 
 ### Phase 1: Creation (`CreateActor`)
 
@@ -326,7 +418,7 @@ Triggered by an inbound request at the Gateway or an explicit API call.
   2. **Assignment**: The Control Plane claims a warm worker from the
      `WorkerPool`.
 
-  3. **Hydration**: The `atelet` supervisor coordinates with the `ateom` process inside the worker pod to restore the `GoldenSnapshot` (for first-run) or the `LastSnapshot` (for recurring runs) into the sandbox.
+  3. **Hydration**: The `atelet` supervisor coordinates with the `ateom` process inside the worker pod to restore the `GoldenSnapshot` (for first-run) or the `LatestSnapshotInfo` (for recurring runs) into the sandbox.
 
   4. **Status**: Status transitions to `STATUS_RUNNING`. The actor now has an
      active Worker IP.
@@ -345,7 +437,7 @@ Triggered by an explicit `SuspendActor` call.
   3. **Reclaim**: The physical worker is wiped and returned to the `WorkerPool`.
 
   4. **Status**: Status transitions back to `STATUS_SUSPENDED`, now pointing to
-     the `LastSnapshot` for future resumptions.
+     the `LatestSnapshotInfo` for future resumptions.
 
 ### Phase 4: Deletion
 
@@ -386,7 +478,7 @@ Agent Substrate is built on a **Defense-in-Depth** model:
 
   * **Request Authorization**: The system currently performs **Identity-Aware
     Routing** by utilizing a uniform DNS routing scheme
-    (`<actor id>.actors.resources.substrate.ate.dev`)
+    (`<actor id>.<atespace>.actors.resources.substrate.ate.dev`)
     at the gateway to extract and validate actor identifiers from incoming traffic. This
     ensures requests are only routed to recognized, registered actors.
     Pluggable, granular authorization policies are planned for future

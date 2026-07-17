@@ -7,9 +7,12 @@ This guide explains how Agent Substrate achieves observability across these susp
 ## The Observability Model
 
 To make underlying infrastructure transitions transparent, Agent Substrate establishes a standardized metadata model to identify actors across worker pods:
-* `ate.dev/actor_id`: The unique identifier of the actor (e.g., `my-counter-1` or `test`).
+* `ate.dev/actor_name`: actor name visible to the caller (e.g., `my-counter-1` or `test`).
+* `ate.dev/actor_atespace`: The atespace the actor lives in (e.g., `ate-demo-counter`).
+* `ate.dev/actor_uid`: Server-assigned UID of the actor, unique to the lifetime of an actor.
 * `ate.dev/actor_template_name`: The name of the actor's ActorTemplate (e.g., `counter`).
 * `ate.dev/actor_template_namespace`: The Kubernetes namespace of the actor's ActorTemplate (e.g., `ate-demo-counter`).
+* `ate.dev/container_name`: The name of the container within the actor that produced the log line (e.g., `counter`), so a multi-container actor's logs can be demultiplexed by container.
 
 Currently, Agent Substrate automatically wraps container output and injects these metadata labels into **container logs**. For metrics and distributed tracing, Agent Substrate provides foundational system telemetry and on-demand request tracing, with roadmap plans to fully integrate actor-level correlation.
 
@@ -23,7 +26,7 @@ Agent Substrate captures container standard output/error, wraps them into struct
 For quick, on-demand debugging of an active actor, use the Agent Substrate CLI:
 
 ```bash
-kubectl ate logs <actor_id> [--follow / -f]
+kubectl ate logs actors <actor_id> [--follow / -f]
 ```
 
 > **Note:** By default, `kubectl ate logs` queries the Kubernetes API of the worker pod where the actor is *currently* running. It is designed for immediate inspection of active actors. To view historical logs across past worker pods and suspension cycles, use a centralized logging backend.
@@ -32,7 +35,7 @@ kubectl ate logs <actor_id> [--follow / -f]
 If an actor is suspended or not assigned to a worker pod, the CLI informs you immediately:
 
 ```bash
-$ kubectl ate logs test
+$ kubectl ate logs actors test
 Error: actor test is not currently running on any worker pod
 ```
 
@@ -40,7 +43,7 @@ Error: actor test is not currently running on any worker pod
 When an active actor is assigned to a worker pod, the CLI outputs clean, uniform JSON lines stripped of Substrate metadata, perfectly matching standard `kubectl logs` behavior:
 
 ```bash
-$ kubectl ate logs test
+$ kubectl ate logs actors test
 {"time":"2026-05-22T21:49:15.23700774Z","message":"Actor started"}
 {"time":"2026-05-22T21:49:15.23700774Z","level":"INFO","msg":"Starting counter server on port 80"}
 {"time":"2026-05-22T21:49:15.255765354Z","count":0,"fshash":"mCY7G4S318ztOUojPTF2NA/W+ZSmWyr+T5K3udFuP50","level":"INFO","msg":"Count"}
@@ -51,11 +54,11 @@ $ kubectl ate logs test
 To stream actor logs in real-time, append the `--follow` (or `-f`) flag. The CLI is fully actor-aware, automatically resuming the stream if the actor is suspended or migrates to a different worker pod:
 
 ```bash
-$ kubectl ate logs test -f
-Actor is currently running on pod ate-demo-counter/counter-deployment-d8f99-m7d96
+$ kubectl ate logs actors test -f
+Actor is currently running on pod ate-demo-counter/counter-d8f99-m7d96
 {"time":"2026-05-22T21:49:15.255765354Z","count":0,"fshash":"mCY7...","level":"INFO","msg":"Count"}
 {"time":"2026-05-22T21:49:25.263744806Z","count":1,"fshash":"mCY7...","level":"INFO","msg":"Count"}
-Actor is currently running on pod ate-demo-counter/counter-deployment-ab123-x4y5z
+Actor is currently running on pod ate-demo-counter/counter-ab123-x4y5z
 {"time":"2026-05-22T21:50:02.123456789Z","count":2,"fshash":"mCY7...","level":"INFO","msg":"Count"}
 ```
 
@@ -74,18 +77,25 @@ To track the unified, continuous lifecycle of a single actor regardless of how m
 labels.actor_id="test"
 ```
 
-#### 2. Template-Centric View
-To monitor or debug all actor instances created from a specific template (e.g., analyzing the collective behavior or error rates of all counter actors):
+#### 2. Atespace-Centric View
+To monitor or debug all actor instances in a specific atespace (e.g., analyzing the collective behavior or error rates of all actors belonging to one tenant):
 
 ```text
-labels.actor_template="counter"
+labels.actor_atespace="ate-demo-counter"
 ```
 
-#### 3. Pod-Centric View
+#### 3. Template-Centric View
+To monitor or debug all actor instances created from a specific ActorTemplate (e.g., analyzing the collective behavior or error rates of all counter actors). One atespace can run actors from many templates, so this is a distinct dimension from the atespace view above:
+
+```text
+labels.actor_template_name="counter"
+```
+
+#### 4. Pod-Centric View
 To inspect the physical worker pod's aggregate stream and see all co-located actors multiplexed together (useful for investigating pod-level resource exhaustion or noisy neighbor issues):
 
 ```text
-resource.labels.pod_name="counter-deployment-c995fdf4c-m7d96"
+resource.labels.pod_name="counter-c995fdf4c-m7d96"
 ```
 
 ---
@@ -98,7 +108,7 @@ Agent Substrate emits foundational OpenTelemetry system and server metrics to mo
 |--------|------------|------|----------|
 | `rpc.server.call.duration` | ateapi & atelet (gRPC servers, via `otelgrpc`) | histogram | per-method gRPC latency, request rate, and errors (labels `rpc.method`, `rpc.response.status_code`) |
 | `atenet.router.route.duration` | atenet-router | histogram | Substrate E2E — Envoy receiving a request to Envoy forwarding it to the resolved worker, excluding actor compute and the response |
-| `atelet.snapshot.size` | atelet | histogram | uncompressed size in bytes of each gVisor snapshot image written during checkpoint (labels `kind`, `actor_template_name`) |
+| `atelet.snapshot.size` | atelet | histogram | uncompressed size in bytes of each gVisor snapshot image written during checkpoint (labels `kind`, `actor_template_namespace`, `actor_template_name`) |
 
 The table lists the OpenTelemetry instrument names. How a name appears in a query depends on the backend (Cloud Monitoring (GMP) / Kind collector).
 
@@ -146,9 +156,9 @@ To visualize traces locally:
 
 3. **Generate Traces**: Run a CLI command or API call with the `--trace` flag, e.g.:
    ```bash
-   kubectl ate get actor --trace
+   kubectl ate get actor -A --trace
    # or
-   kubectl ate suspend actor <actor-id> --trace
+   kubectl ate suspend actor <actor-id> -a <atespace> --trace
    ```
 
 4. **Search and Inspect**: Copy the printed Trace ID from the CLI output and paste it into the Jaeger search box (top right), or select `ateapi` or `atelet` under the **Service** dropdown and click **Find Traces** to inspect detailed call stacks, DB transactions, state updates, and worker pod handoffs.
@@ -179,5 +189,5 @@ Telemetry is emitted the same way everywhere; only the backend differs between a
 Dashboard definitions live in [`tools/setup-gcp/dashboards/`](../tools/setup-gcp/dashboards/) (see its README for the per-dashboard breakdown). They are created and updated **as part of GCP setup**: `tools/setup-gcp` applies each dashboard idempotently (matched and updated by display name), so re-running is safe.
 
 ```sh
-go run ./tools/setup-gcp --create-monitoring-dashboards   # also part of: --all
+go run ./tools/setup-gcp create dashboards   # also part of: bootstrap
 ```

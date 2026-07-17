@@ -39,7 +39,8 @@ func (m *resumerMockClient) ResumeActor(ctx context.Context, in *ateapipb.Resume
 }
 
 func TestActorResumer_ResumeActor(t *testing.T) {
-	const testActorID = "actor-a"
+	const testActorName = "actor-a"
+	const testAtespace = "team-a"
 	const expectedIP = "10.0.0.52"
 
 	t.Run("SuspendedResumedSuccessfully", func(t *testing.T) {
@@ -49,7 +50,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				resumeCalled++
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						ActorId:    testActorID,
+						Metadata:   &ateapipb.ResourceMetadata{Name: testActorName},
 						Status:     ateapipb.Actor_STATUS_RUNNING,
 						AteomPodIp: expectedIP,
 					},
@@ -58,7 +59,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		}
 
 		resumer := NewActorResumer(mock)
-		actor, err := resumer.ResumeActor(context.Background(), testActorID)
+		actor, err := resumer.ResumeActor(context.Background(), testAtespace, testActorName)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -80,7 +81,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				}
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						ActorId:    testActorID,
+						Metadata:   &ateapipb.ResourceMetadata{Name: testActorName},
 						Status:     ateapipb.Actor_STATUS_RUNNING,
 						AteomPodIp: expectedIP,
 					},
@@ -89,7 +90,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		}
 
 		resumer := NewActorResumer(mock)
-		actor, err := resumer.ResumeActor(context.Background(), testActorID)
+		actor, err := resumer.ResumeActor(context.Background(), testAtespace, testActorName)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -109,7 +110,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		}
 
 		resumer := NewActorResumer(mock)
-		_, err := resumer.ResumeActor(context.Background(), testActorID)
+		_, err := resumer.ResumeActor(context.Background(), testAtespace, testActorName)
 		if got := status.Code(err); got != codes.NotFound {
 			t.Errorf("expected gRPC code NotFound, got %v (err=%v)", got, err)
 		}
@@ -127,7 +128,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				time.Sleep(20 * time.Millisecond)
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						ActorId:    testActorID,
+						Metadata:   &ateapipb.ResourceMetadata{Name: testActorName},
 						Status:     ateapipb.Actor_STATUS_RUNNING,
 						AteomPodIp: expectedIP,
 					},
@@ -146,7 +147,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		for i := 0; i < concurrentRequests; i++ {
 			go func(idx int) {
 				defer wg.Done()
-				results[idx], errs[idx] = resumer.ResumeActor(context.Background(), testActorID)
+				results[idx], errs[idx] = resumer.ResumeActor(context.Background(), testAtespace, testActorName)
 			}(i)
 		}
 		wg.Wait()

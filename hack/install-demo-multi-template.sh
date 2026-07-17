@@ -37,13 +37,16 @@ demo-multi-template_deploy() {
 
   # Wait for both ActorTemplates to be ready before returning.
   log_step "Waiting for multi-template demo to be ready..."
-  run_kubectl rollout status deployment/shared-pool-deployment -n ate-demo-multi-template-pool --timeout=300s
+  run_kubectl rollout status deployment/shared-pool -n ate-demo-multi-template-pool --timeout=300s
   run_kubectl wait --for=condition=Ready actortemplate/counter -n ate-demo-multi-template-counter --timeout=300s
   run_kubectl wait --for=condition=Ready actortemplate/fspersist -n ate-demo-multi-template-fspersist --timeout=300s
 }
 
 demo-multi-template_delete() {
   log_step "demo-multi-template_delete"
+  delete_demo_actors \
+    ate-demo-multi-template-counter counter \
+    ate-demo-multi-template-fspersist fspersist
   sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/multi-template/multi-template.yaml.tmpl \
     | run_kubectl delete --ignore-not-found -f -
 }

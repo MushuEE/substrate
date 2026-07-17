@@ -7,7 +7,7 @@ eligible for the [Google Open Source Software Vulnerability Rewards Program](htt
 
 ## What is Agent Substrate?
 
-Agent substrate is a system built on top of Kubernetes which manages agent-like
+Agent Substrate is a system built on top of Kubernetes which manages agent-like
 workloads to achieve higher scale and efficiency than Kubernetes alone can
 offer, with lower latency.  It builds on top of Kubernetes features like
 Pods and Pod autoscaling, but takes the Kubernetes control-plane out of the
@@ -114,8 +114,9 @@ hack/install-ate-kind.sh --deploy-demo-counter
 # install kubectl-ate
 go install ./cmd/kubectl-ate
 
-# create a counter actor and demo it
-kubectl ate create actor my-counter-1 --template ate-demo-counter/counter
+# create an atespace (required before creating actors), then a counter actor in it
+kubectl ate create atespace demo
+kubectl ate create actor my-counter-1 -a demo --template ate-demo-counter/counter
 
 # port-forward the network router to bind to local port `8000`
 kubectl port-forward -n ate-system svc/atenet-router 8000:80
@@ -123,7 +124,7 @@ kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
 3. In a **separate terminal**, send an HTTP request to increment the counter:
 ```shell
-curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
+curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/
 ```
 
 ### GKE Quickstart (Development)
@@ -143,7 +144,7 @@ curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http:
 
 3. Provision the required GCP resources (GKE cluster, Redis, GCS, and IAM bindings):
    ```bash
-   go run ./tools/setup-gcp --all
+   go run ./tools/setup-gcp bootstrap
    ```
 
 4. Deploy the Agent Substrate system to your cluster (remember to navigate back to root directory of this repo before running the following commands):
@@ -160,17 +161,17 @@ curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http:
 
 You can run individual setup steps to create GCP resources as needed. See `go run ./tools/setup-gcp --help` for available options. For example:
 ```bash
-go run ./tools/setup-gcp --create-cluster
-go run ./tools/setup-gcp --create-gvisor-node-pool
+go run ./tools/setup-gcp create cluster
+go run ./tools/setup-gcp create bucket
 ```
 
 Similarly, you can deploy or cleanup specific Agent Substrate components using the installation script. See `./hack/install-ate.sh --help` for all options.
 ```bash
 # Re-deploy only ate-apiserver of the ATE system
-./hack/install-ate-kind.sh --deploy-ate-apiserver
+./hack/install-ate.sh --deploy-ate-apiserver
 
 # Delete everything (core system and all demos)
-./hack/install-ate-kind.sh --delete-all
+./hack/install-ate.sh --delete-all
 ```
 
 #### Tearing down resources (GCP)
@@ -203,7 +204,9 @@ We provide several sample applications demonstrating Agent Substrate's capabilit
 ### Documentation & Guides
 * [API Configuration Guide](docs/api-guide.md): Detailed reference for configuring WorkerPools, ActorTemplates, Secrets, and Volumes.
 * [Full CLI Documentation](cmd/kubectl-ate/README.md): Installation and usage for `kubectl-ate`.
+* [Glossary](docs/glossary.md): Core terms (Actor, ActorTemplate, WorkerPool, Worker, ate-api-server, atenet, atelet, ateom) and how they relate.
 * [Observability Guide](docs/observability.md): Guide to actor logging, metrics, and distributed tracing.
+* [Benchmarking Guide](benchmarking/README.md): Locust-based load tests, monitoring stack, and the orchestrated benchmark harness.
 
 ## Tour
 

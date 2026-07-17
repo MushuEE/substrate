@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -37,13 +38,20 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // InitLogger sets the global slog logger to a JSON handler wrapped in
-// contextlogging.NewHandler. Call once at process start.
+// contextlogging.NewHandler, writing to os.Stdout. Call once at process start.
 func InitLogger() {
-	slog.SetDefault(slog.New(contextlogging.NewHandler(slog.NewJSONHandler(os.Stdout, nil))))
+	InitLoggerWithWriter(os.Stdout)
+}
+
+// InitLoggerWithWriter is InitLogger with an explicit destination. Use it to share
+// one synchronized writer between the runtime logger and a separate writer (e.g.
+// ateom's actor-log forwarder) so their lines don't interleave.
+func InitLoggerWithWriter(w io.Writer) {
+	slog.SetDefault(slog.New(contextlogging.NewHandler(slog.NewJSONHandler(w, nil))))
 }
 
 // serviceInstanceID is generated once so the tracer and meter resources share it.
@@ -54,6 +62,9 @@ var serviceInstanceID = uuid.NewString()
 func newResource(ctx context.Context, serviceName string) (*resource.Resource, error) {
 	res, err := resource.New(ctx,
 		resource.WithTelemetrySDK(),
+		// Must track the schema version the SDK's own detectors emit, else the
+		// merge drops the schema URL with ErrSchemaURLConflict (tolerated below).
+		resource.WithSchemaURL(semconv.SchemaURL),
 		resource.WithAttributes(
 			semconv.ServiceName(serviceName),
 			semconv.ServiceInstanceID(serviceInstanceID),

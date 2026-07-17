@@ -63,6 +63,7 @@ function usage() {
   echo "  --deploy-ate-system                    Deploy core system (CRDs, atelet, apiserver)"
   echo "  --delete-ate-system                    Delete core system"
   echo "  --delete-all                           Delete core system and all registered demos"
+  echo "  --auth-mode=mtls|jwt                   Select ateapi auth mode for --deploy-ate-system (default: mtls)"
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -78,6 +79,12 @@ function usage() {
   echo "  --create-podcertificate-controller-cas Create podcertificate controller CAs"
   echo "  --create-valkey-ca-certs-secret        Create Valkey CA certs secret"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
+  echo ""
+  echo "Benchmarks (see benchmarking/README.md for details and customization):"
+  echo ""
+  echo "  --deploy-benchmarks                    Deploy workloads + locust load test stack"
+  echo "  --delete-benchmarks                    Delete the locust stack and workloads"
+  echo "  --benchmark-worker-count N             Number of WorkerPool replicas (default: 1)"
   echo ""
   for demo_name in "${ATE_DEMOS[@]}"; do
     echo "Demo: ${demo_name}"
@@ -103,17 +110,61 @@ run_kubectl_ate() {
 }
 
 run_ko() {
+  # Build up a set of ldflags to pass to ko.
+  local ldflags=()
+  mapfile -t ldflags < <(make ldflags)
+  for i in "${!ldflags[@]}"; do
+    ldflags[i]="--ldflags=${ldflags[i]}"
+  done
+
   # Only ko subcommands that delegate to kubectl (apply, create, delete, run)
   # accept args after `--`. ko build, resolve, deps, login etc. reject
   # `--context=...` as an unknown subcommand and abort the install.
   case "${1:-}" in
     apply|create|delete|run)
-      ./hack/run-tool.sh ko "$@" ${KUBECTL_CONTEXT:+-- --context="${KUBECTL_CONTEXT}"}
+      ./hack/run-tool.sh ko "$@" \
+          "${ldflags[@]}" \
+          ${KUBECTL_CONTEXT:+-- --context="${KUBECTL_CONTEXT}"}
       ;;
     *)
-      ./hack/run-tool.sh ko "$@"
+      ./hack/run-tool.sh ko "$@" \
+          "${ldflags[@]}"
       ;;
   esac
+}
+
+ate_auth_mode() {
+  case "${ATE_API_AUTH_MODE:-mtls}" in
+    mtls|jwt)
+      echo "${ATE_API_AUTH_MODE:-mtls}"
+      ;;
+    *)
+      echo "Error: ATE_API_AUTH_MODE must be mtls or jwt, got '${ATE_API_AUTH_MODE}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+render_ate_system_manifests() {
+  local auth_mode=""
+  auth_mode="$(ate_auth_mode)"
+
+  if [[ "${auth_mode}" == "jwt" ]]; then
+    local overlay="manifests/ate-install/jwt"
+    if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+      overlay="manifests/ate-install/kind-jwt"
+    fi
+    kubectl kustomize "${overlay}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    return
+  fi
+
+  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+    # Build everything resolved with Kustomize for Kind
+    kubectl kustomize manifests/ate-install/kind --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+  else
+    # Build everything resolved with base manifests for GKE
+    run_ko resolve -f manifests/ate-install
+  fi
 }
 
 create_valkey_ca_certs_secret() {
@@ -202,7 +253,7 @@ create_api_server_env_vars() {
 
 ensure_crds() {
   log_step "ensure_crds"
-  if run_kubectl get crd workerpools.ate.dev actortemplates.ate.dev >/dev/null 2>&1; then
+  if run_kubectl get crd workerpools.ate.dev actortemplates.ate.dev sandboxconfigs.ate.dev >/dev/null 2>&1; then
     return
   fi
 
@@ -217,6 +268,16 @@ deploy_crds() {
 deploy_ate_system() {
   log_step "deploy_ate_system"
   ensure_crds
+
+  # Enforce per-class SandboxConfig asset requirements (applied before any
+  # SandboxConfig so the defaults below are validated too).
+  run_kubectl apply -f manifests/ate-install/sandboxconfig-validation.yaml
+
+  # Install the cluster-wide default sandbox config(s). Sandbox binaries live on
+  # cluster-scoped SandboxConfigs resolved via each WorkerPool's SandboxClass
+  # (decoupled from ActorTemplate). gVisor pools resolve to this default unless
+  # they name their own SandboxConfig.
+  run_kubectl apply -f manifests/ate-install/sandboxconfig-gvisor.yaml
 
   # Ensure namespace exists
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
@@ -238,17 +299,11 @@ deploy_ate_system() {
   done
 
   local manifests=""
-  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
-    # Build everything resolved with Kustomize for Kind
-    manifests=$(kubectl kustomize manifests/ate-install/kind --load-restrictor LoadRestrictionsNone | run_ko resolve -f -)
-  else
-    # Build everything resolved with base manifests for GKE
-    manifests=$(run_ko resolve -f manifests/ate-install)
-  fi
+  manifests="$(render_ate_system_manifests)"
   echo "${manifests}" | run_kubectl apply -f -
 
   log_step "Waiting for ATE system components to be ready..."
-  run_kubectl rollout status deployment/ate-api-server-deployment -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
@@ -282,7 +337,7 @@ deploy_ate_apiserver() {
   ensure_apiserver_prerequisites
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
-  run_kubectl rollout status deployment/ate-api-server-deployment -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
 }
 
 deploy_atelet() {
@@ -319,6 +374,103 @@ deploy_atenet() {
   run_kubectl rollout status deployment/atenet-dns -n ate-system --timeout=120s
 }
 
+# get_actor_status echoes the actor's status enum (e.g. STATUS_SUSPENDED).
+get_actor_status() {
+  local actor_id="$1"
+  local atespace="$2"
+  local json
+
+  if ! json=$(run_kubectl_ate get actor "${actor_id}" -a "${atespace}" -o json 2>/dev/null); then
+    return 1
+  fi
+  jq -r '.actors[0].status // empty' <<<"${json}"
+}
+
+# prepare_actor_for_delete suspends (or resumes then suspends) until DeleteActor
+# is allowed. Actors must be STATUS_SUSPENDED before deletion.
+prepare_actor_for_delete() {
+  local actor_id="$1"
+  local atespace="$2"
+  local timeout_secs="${3:-120}"
+  local deadline=$((SECONDS + timeout_secs))
+  local status
+
+  while ((SECONDS < deadline)); do
+    if ! status=$(get_actor_status "${actor_id}" "${atespace}"); then
+      return 0
+    fi
+
+    case "${status}" in
+      STATUS_SUSPENDED)
+        return 0
+        ;;
+      STATUS_PAUSED)
+        run_kubectl_ate resume actor "${actor_id}" -a "${atespace}" -o json >/dev/null
+        ;;
+      STATUS_RUNNING)
+        run_kubectl_ate suspend actor "${actor_id}" -a "${atespace}" -o json >/dev/null
+        ;;
+      STATUS_RESUMING | STATUS_SUSPENDING | STATUS_PAUSING)
+        ;;
+      *)
+        echo "cannot delete actor ${actor_id}: unexpected status ${status}" >&2
+        return 1
+        ;;
+    esac
+    sleep 2
+  done
+
+  echo "timed out waiting for actor ${actor_id} to reach STATUS_SUSPENDED" >&2
+  return 1
+}
+
+# delete_demo_actors removes all actors for one or more (namespace, template)
+# pairs before the demo manifests are deleted. Arguments are alternating
+# namespace and template name, e.g.:
+#   delete_demo_actors ate-demo-counter counter
+#   delete_demo_actors ns-a tmpl-a ns-b tmpl-b
+delete_demo_actors() {
+  if ! command -v jq &>/dev/null; then
+    echo "jq is required to delete demo actors" >&2
+    return 1
+  fi
+
+  if (($# == 0 || $# % 2 != 0)); then
+    echo "delete_demo_actors expects namespace/template pairs" >&2
+    return 1
+  fi
+
+  if ! run_kubectl get deployment/ate-api-server -n ate-system >/dev/null 2>&1; then
+    log_step "ate-api-server not found; skipping actor cleanup"
+    return 0
+  fi
+
+  local actors_json
+  if ! actors_json=$(run_kubectl_ate get actors -A -o json 2>/dev/null); then
+    echo "warning: could not list actors; skipping actor cleanup" >&2
+    return 0
+  fi
+
+  local ns tmpl atespace actor_name
+  while (($# > 0)); do
+    ns="$1"
+    tmpl="$2"
+    shift 2
+
+    log_step "Deleting actors for ${ns}/${tmpl}"
+    while IFS=$'\t' read -r atespace actor_name; do
+      [[ -z "${actor_name}" ]] && continue
+      log_step "  preparing actor ${atespace}/${actor_name} for delete"
+      prepare_actor_for_delete "${actor_name}" "${atespace}"
+      run_kubectl_ate delete actor "${actor_name}" -a "${atespace}"
+    done < <(
+      jq -r --arg ns "${ns}" --arg tmpl "${tmpl}" \
+        '.actors[]? | select(.actorTemplateNamespace == $ns and .actorTemplateName == $tmpl) | "\(.metadata.atespace)\t\(.metadata.name)"' \
+        <<<"${actors_json}"
+    )
+  done
+}
+
 delete_ate_system() {
   log_step "delete_ate_system"
   if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
@@ -333,6 +485,16 @@ delete_ate_system() {
 delete_atenet() {
   log_step "delete_atenet"
   run_kubectl delete --ignore-not-found -f manifests/ate-install/atenet-router.yaml
+}
+
+deploy_benchmarks() {
+  log_step "deploy_benchmarks (worker_count=${BENCHMARK_WORKER_COUNT})"
+  "${ROOT}/benchmarking/deploy_locust.sh" --deploy --worker-count "${BENCHMARK_WORKER_COUNT}"
+}
+
+delete_benchmarks() {
+  log_step "delete_benchmarks"
+  "${ROOT}/benchmarking/deploy_locust.sh" --delete
 }
 
 delete_all() {
@@ -360,6 +522,31 @@ for arg in "$@"; do
   esac
 done
 
+# Pre-scan value-bearing flags so they can appear before or after the action
+# flag they configure (e.g. --benchmark-worker-count before/after
+# --deploy-benchmarks). The dispatch loop below also accepts these flags but
+# treats them as no-ops since the value is already captured here.
+BENCHMARK_WORKER_COUNT=1
+prescan_args=("$@")
+for ((i = 0; i < ${#prescan_args[@]}; i++)); do
+  case "${prescan_args[i]}" in
+    --auth-mode=*) ATE_API_AUTH_MODE="${prescan_args[i]#*=}" ;;
+    --auth-mode)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --auth-mode requires mtls or jwt" >&2
+        exit 1
+      fi
+      ATE_API_AUTH_MODE="${prescan_args[$((i + 1))]}"
+      ;;
+    --benchmark-worker-count)
+      BENCHMARK_WORKER_COUNT="${prescan_args[i+1]:-1}"
+      ;;
+    --benchmark-worker-count=*)
+      BENCHMARK_WORKER_COUNT="${prescan_args[i]#*=}"
+      ;;
+  esac
+done
+
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
   # handled this argument and can continue. Otherwise, fallthrough to check
@@ -374,6 +561,16 @@ while [[ "$#" -gt 0 ]]; do
   done
 
   case $1 in
+    --auth-mode=*) ATE_API_AUTH_MODE="${1#*=}" ;;
+    --auth-mode)
+      shift
+      if [[ "$#" -eq 0 ]]; then
+        echo "Error: --auth-mode requires mtls or jwt" >&2
+        exit 1
+      fi
+      ATE_API_AUTH_MODE="$1"
+      ;;
+
     --deploy-ate-system) deploy_ate_system ;;
     --delete-ate-system) delete_ate_system ;;
     --delete-all) delete_all ;;
@@ -383,6 +580,13 @@ while [[ "$#" -gt 0 ]]; do
 
     --deploy-atenet) deploy_atenet ;;
     --delete-atenet) delete_atenet ;;
+
+    --deploy-benchmarks) deploy_benchmarks ;;
+    --delete-benchmarks) delete_benchmarks ;;
+    # Value captured in the pre-scan above; consume the value arg here so the
+    # dispatch loop's `*)` unknown-option branch doesn't reject it.
+    --benchmark-worker-count) shift ;;
+    --benchmark-worker-count=*) ;;
 
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
     --create-session-id-ca-pool-secret) create_session_id_ca_pool_secret ;;

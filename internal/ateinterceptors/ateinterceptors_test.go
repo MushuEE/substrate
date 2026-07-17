@@ -19,12 +19,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
+	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -51,7 +56,7 @@ func TestStatusErrorInterceptor(t *testing.T) {
 			name:       "RawErrorFallback",
 			handlerErr: errors.New("database connection failed"),
 			wantCode:   codes.Internal,
-			wantMsg:    "internal server error",
+			wantMsg:    "internal server error: database connection failed",
 		},
 	}
 
@@ -90,6 +95,127 @@ func TestStatusErrorInterceptor(t *testing.T) {
 				t.Errorf("expected message %q, got %q", tt.wantMsg, st.Message())
 			}
 		})
+	}
+}
+
+// errorInfoOf returns the ErrorInfo detail carried by err, or nil if none.
+func errorInfoOf(t *testing.T, err error) *epb.ErrorInfo {
+	t.Helper()
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("status.FromError(%v) = _, false; want a status error", err)
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*epb.ErrorInfo); ok {
+			return info
+		}
+	}
+	return nil
+}
+
+// TestInternalServerUnaryInterceptorPreservesDetails verifies the interceptor
+// returns structured errors (from NewGRPCError) intact — preserving the code and
+// the ErrorInfo carrying the Reason — while collapsing plain errors to Internal
+// with no ErrorInfo detail.
+func TestInternalServerUnaryInterceptorPreservesDetails(t *testing.T) {
+	tests := []struct {
+		name          string
+		handlerErr    error
+		wantCode      codes.Code
+		wantReason    string
+		wantErrorInfo bool
+	}{
+		{
+			name:          "structured error keeps code and reason",
+			handlerErr:    ateerrors.NewGRPCError(context.Background(), codes.DataLoss, ateerrors.ReasonFaileSaveSnapshot, ateerrors.ActorCrashedMetadata(), errors.New("boom")),
+			wantCode:      codes.DataLoss,
+			wantReason:    string(ateerrors.ReasonFaileSaveSnapshot),
+			wantErrorInfo: true,
+		},
+		{
+			name:          "plain error collapses to Internal with no ErrorInfo",
+			handlerErr:    errors.New("database connection failed"),
+			wantCode:      codes.Internal,
+			wantErrorInfo: false,
+		},
+	}
+
+	interceptor := InternalServerUnaryInterceptor
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+				return nil, tt.handlerErr
+			}
+
+			_, err := interceptor(context.Background(), "request", &grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"}, handler)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			st, _ := status.FromError(err)
+			if st.Code() != tt.wantCode {
+				t.Errorf("code = %v, want %v", st.Code(), tt.wantCode)
+			}
+
+			info := errorInfoOf(t, err)
+			if !tt.wantErrorInfo {
+				if info != nil {
+					t.Errorf("ErrorInfo = %v, want none", info)
+				}
+				return
+			}
+			if info == nil {
+				t.Fatal("status is missing the ErrorInfo detail")
+			}
+			if got := info.GetReason(); got != tt.wantReason {
+				t.Errorf("ErrorInfo.Reason = %q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+type trailerStream struct {
+	method   string
+	trailers metadata.MD
+}
+
+func (s *trailerStream) Method() string                  { return s.method }
+func (s *trailerStream) SetHeader(md metadata.MD) error  { return nil }
+func (s *trailerStream) SendHeader(md metadata.MD) error { return nil }
+func (s *trailerStream) SetTrailer(md metadata.MD) error {
+	if s.trailers == nil {
+		s.trailers = metadata.MD{}
+	}
+	for k, v := range md {
+		s.trailers[k] = append(s.trailers[k], v...)
+	}
+	return nil
+}
+
+func TestServerUnaryInterceptorEmitsElapsedTrailer(t *testing.T) {
+	const minHandlerDuration = 5 * time.Millisecond
+	stream := &trailerStream{method: "/test.Service/Method"}
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), stream)
+
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		time.Sleep(minHandlerDuration)
+		return "response", nil
+	}
+
+	if _, err := ServerUnaryInterceptor(ctx, "request", &grpc.UnaryServerInfo{FullMethod: stream.method}, handler); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vals := stream.trailers.Get(ServerElapsedTrailer)
+	if len(vals) != 1 {
+		t.Fatalf("expected one %s trailer, got %v", ServerElapsedTrailer, vals)
+	}
+	elapsedUs, err := strconv.ParseInt(vals[0], 10, 64)
+	if err != nil {
+		t.Fatalf("could not parse %s as int64: %v", vals[0], err)
+	}
+	if got, min := time.Duration(elapsedUs)*time.Microsecond, minHandlerDuration; got < min {
+		t.Errorf("trailer reported %s; expected at least %s (handler sleep)", got, min)
 	}
 }
 

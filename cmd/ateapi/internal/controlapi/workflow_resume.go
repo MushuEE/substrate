@@ -20,23 +20,29 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"slices"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
 
 // ResumeInput holds the immutable parameters requested by the client.
 type ResumeInput struct {
-	ActorID string
-	Boot    bool
+	ActorName string
+	Atespace  string
+	Boot      bool
 }
 
 // ResumeState holds the mutable state loaded and modified during execution.
@@ -56,10 +62,10 @@ func (s *LoadActorForResumeStep) IsComplete(ctx context.Context, input *ResumeIn
 	return false, nil
 }
 func (s *LoadActorForResumeStep) Execute(ctx context.Context, input *ResumeInput, state *ResumeState) error {
-	actor, err := s.store.GetActor(ctx, input.ActorID)
+	actor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return status.Errorf(codes.NotFound, "Actor %s not found", input.ActorID)
+			return status.Errorf(codes.NotFound, "Actor %s not found", input.ActorName)
 		}
 		return fmt.Errorf("while getting actor from DB: %w", err)
 	}
@@ -76,8 +82,32 @@ func (s *LoadActorForResumeStep) Execute(ctx context.Context, input *ResumeInput
 
 func (s *LoadActorForResumeStep) RetryBackoff() *wait.Backoff { return nil }
 
+func isWorkerEligibleForActor(worker *ateapipb.Worker, templateClass atev1alpha1.SandboxClass, templateSelector *metav1.LabelSelector, actorSelector *ateapipb.Selector) (bool, error) {
+	// Snapshots are not portable across sandbox classes, so the worker's class
+	// must match the template's. Both classes are populated by the CRD default
+	// (gvisor), so we compare them directly.
+	if worker.GetSandboxClass() != string(templateClass) {
+		return false, nil
+	}
+
+	templateSel := labels.Everything()
+	if templateSelector != nil {
+		sel, err := metav1.LabelSelectorAsSelector(templateSelector)
+		if err != nil {
+			return false, fmt.Errorf("invalid template worker selector: %w", err)
+		}
+		templateSel = sel
+	}
+
+	actorSel := labels.SelectorFromSet(labels.Set(actorSelector.GetMatchLabels()))
+
+	set := labels.Set(worker.GetLabels())
+	return templateSel.Matches(set) && actorSel.Matches(set), nil
+}
+
 type AssignWorkerStep struct {
-	store store.Interface
+	store       store.Interface
+	workerCache *workercache.Cache
 }
 
 func (s *AssignWorkerStep) Name() string { return "AssignWorker" }
@@ -86,24 +116,48 @@ func (s *AssignWorkerStep) IsComplete(ctx context.Context, input *ResumeInput, s
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_RUNNING, nil
 }
 func (s *AssignWorkerStep) Execute(ctx context.Context, input *ResumeInput, state *ResumeState) error {
-	workers, err := s.store.ListWorkers(ctx)
+	workers, err := s.workerCache.Workers()
 	if err != nil {
 		return fmt.Errorf("while listing workers: %w", err)
 	}
 
 	var assignedWorker *ateapipb.Worker
 
-	// Check if we already have a worker assigned from a previous failed attempt
+	// Check if we already have a worker assigned from a previous failed attempt.
+	// If that worker's pool is no longer eligible (e.g. the actor's
+	// worker_selector was updated after the failed attempt), release it back
+	// to the free pool instead of leaving it claimed forever — nothing else
+	// reclaims a healthy worker whose actor moved on to a different pool.
 	for _, worker := range workers {
-		if worker.GetActorId() == input.ActorID && worker.GetWorkerPool() == state.ActorTemplate.Spec.WorkerPoolRef.Name && worker.GetWorkerNamespace() == state.ActorTemplate.Spec.WorkerPoolRef.Namespace {
+		if worker.Assignment == nil {
+			continue
+		}
+		if worker.Assignment.Actor.Atespace != input.Atespace || worker.Assignment.Actor.Name != input.ActorName {
+			continue
+		}
+		eligible, err := isWorkerEligibleForActor(worker, state.ActorTemplate.Spec.SandboxClass, state.ActorTemplate.Spec.WorkerSelector, state.Actor.GetWorkerSelector())
+		if err != nil {
+			return fmt.Errorf("while checking worker eligibility: %w", err)
+		}
+		if eligible {
 			assignedWorker = worker
 			break
+		}
+		// Workers() returns pointers directly from the cache so we need to clone before
+		// mutating so that the cache is not corrupted if UpdateWorker fails.
+		release := proto.Clone(worker).(*ateapipb.Worker)
+		release.Assignment = nil
+		if err := s.store.UpdateWorker(ctx, release, release.Version); err != nil {
+			return fmt.Errorf("while releasing stale worker assignment: %w", err)
 		}
 	}
 
 	// If not, find a free one using randomized shuffling
 	if assignedWorker == nil {
-		pickedWorker := s.findFreeWorker(workers, state.ActorTemplate.Spec.WorkerPoolRef.Namespace, state.ActorTemplate.Spec.WorkerPoolRef.Name)
+		pickedWorker, err := s.findFreeWorker(workers, state.ActorTemplate.Spec.SandboxClass, state.ActorTemplate.Spec.WorkerSelector, state.Actor.GetWorkerSelector(), state.Actor.GetLatestSnapshotInfo().GetLocal().GetNodeVmsWithLocalSnapshots())
+		if err != nil {
+			return err
+		}
 		if pickedWorker == nil {
 			return status.Errorf(codes.FailedPrecondition, "no free workers available")
 		}
@@ -112,9 +166,19 @@ func (s *AssignWorkerStep) Execute(ctx context.Context, input *ResumeInput, stat
 		slog.InfoContext(ctx, "Picked worker", slog.Any("worker", pickedWorker.String()))
 	}
 
-	assignedWorker.ActorId = input.ActorID
-	assignedWorker.ActorNamespace = state.Actor.GetActorTemplateNamespace()
-	assignedWorker.ActorTemplate = state.Actor.GetActorTemplateName()
+	// Workers() returns pointers directly from the cache so we need to clone before
+	// mutating so that the cache is not corrupted if UpdateWorker fails.
+	assignedWorker = proto.Clone(assignedWorker).(*ateapipb.Worker)
+	assignedWorker.Assignment = &ateapipb.Assignment{
+		ActorTemplate: &ateapipb.KubeNamespacedObjectRef{
+			Namespace: state.Actor.GetActorTemplateNamespace(),
+			Name:      state.Actor.GetActorTemplateName(),
+		},
+		Actor: &ateapipb.ObjectRef{
+			Name:     input.ActorName,
+			Atespace: state.Actor.GetMetadata().GetAtespace(),
+		},
+	}
 
 	if err := s.store.UpdateWorker(ctx, assignedWorker, assignedWorker.Version); err != nil {
 		return err
@@ -125,10 +189,13 @@ func (s *AssignWorkerStep) Execute(ctx context.Context, input *ResumeInput, stat
 	state.Actor.AteomPodName = assignedWorker.GetWorkerPod()
 	state.Actor.AteomPodIp = assignedWorker.GetIp()
 	state.Actor.AteomPodUid = assignedWorker.GetWorkerPodUid()
+	state.Actor.WorkerPoolName = assignedWorker.GetWorkerPool()
 
-	if err := s.store.UpdateActor(ctx, state.Actor, state.Actor.GetVersion()); err != nil {
+	updatedActor, err := s.store.UpdateActor(ctx, state.Actor, state.Actor.GetMetadata().GetVersion())
+	if err != nil {
 		return err
 	}
+	state.Actor = updatedActor
 	return nil
 }
 
@@ -141,10 +208,26 @@ func (s *AssignWorkerStep) RetryBackoff() *wait.Backoff {
 	}
 }
 
-func (s *AssignWorkerStep) findFreeWorker(workers []*ateapipb.Worker, workerPoolNamespace, workerPoolName string) *ateapipb.Worker {
+func (s *AssignWorkerStep) findFreeWorker(
+	workers []*ateapipb.Worker,
+	templateClass atev1alpha1.SandboxClass,
+	templateSelector *metav1.LabelSelector,
+	actorSelector *ateapipb.Selector,
+	nodesRestrictions []string,
+) (*ateapipb.Worker, error) {
 	var freeWorkers []*ateapipb.Worker
 	for _, worker := range workers {
-		if worker.GetActorId() == "" && worker.GetWorkerPool() == workerPoolName && worker.GetWorkerNamespace() == workerPoolNamespace {
+		if worker.Assignment != nil {
+			continue
+		}
+		eligible, err := isWorkerEligibleForActor(worker, templateClass, templateSelector, actorSelector)
+		if err != nil {
+			return nil, err
+		}
+		if !eligible {
+			continue
+		}
+		if len(nodesRestrictions) == 0 || slices.Contains(nodesRestrictions, worker.GetNodeName()) {
 			freeWorkers = append(freeWorkers, worker)
 		}
 	}
@@ -153,15 +236,18 @@ func (s *AssignWorkerStep) findFreeWorker(workers []*ateapipb.Worker, workerPool
 		rand.Shuffle(len(freeWorkers), func(i, j int) {
 			freeWorkers[i], freeWorkers[j] = freeWorkers[j], freeWorkers[i]
 		})
-		return freeWorkers[0]
+		return freeWorkers[0], nil
 	}
-	return nil
+	return nil, nil
 }
 
 type CallAteletRestoreStep struct {
-	dialer      *AteletDialer
-	kubeClient  kubernetes.Interface
-	secretCache *envSecretCache
+	store               store.Interface
+	dialer              *AteletDialer
+	kubeClient          kubernetes.Interface
+	secretCache         *envSecretCache
+	workerPoolLister    listersv1alpha1.WorkerPoolLister
+	sandboxConfigLister listersv1alpha1.SandboxConfigLister
 }
 
 func (s *CallAteletRestoreStep) Name() string { return "CallAteletRestore" }
@@ -175,47 +261,46 @@ func (s *CallAteletRestoreStep) Execute(ctx context.Context, input *ResumeInput,
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
-	workloadSpec, err := workloadSpecFromActorTemplate(ctx, s.kubeClient, s.secretCache, state.ActorTemplate)
+	workloadSpec, err := workloadSpecFromActorTemplateWithEnv(ctx, s.kubeClient, s.secretCache, state.ActorTemplate)
 	if err != nil {
 		return err
 	}
 
-	runscCfg := &ateletpb.RunscConfig{}
-	if state.ActorTemplate.Spec.Runsc.AMD64 != nil {
-		runscCfg.Amd64 = &ateletpb.RunscPlatformConfig{
-			Sha256Hash: state.ActorTemplate.Spec.Runsc.AMD64.SHA256Hash,
-			Url:        state.ActorTemplate.Spec.Runsc.AMD64.URL,
-		}
-	}
-	if state.ActorTemplate.Spec.Runsc.ARM64 != nil {
-		runscCfg.Arm64 = &ateletpb.RunscPlatformConfig{
-			Sha256Hash: state.ActorTemplate.Spec.Runsc.ARM64.SHA256Hash,
-			Url:        state.ActorTemplate.Spec.Runsc.ARM64.URL,
-		}
-	}
-	if state.ActorTemplate.Spec.Runsc.Authentication.GCP != nil {
-		authnCfg := &ateletpb.AuthenticationConfig{}
-		authnCfg.Gcp = &ateletpb.GCPAuthenticationConfig{Use: true}
-		runscCfg.Authentication = authnCfg
-	}
-
-	if state.Actor.LastSnapshot != "" {
+	if data := state.Actor.GetLatestSnapshotInfo().GetData(); data != nil {
 		slog.InfoContext(ctx, "Actor has snapshot; Restoring from snapshot")
 
 		req := &ateletpb.RestoreRequest{
 			TargetAteomUid:         state.Actor.GetAteomPodUid(),
+			Atespace:               state.Actor.GetMetadata().GetAtespace(),
+			ActorName:              state.Actor.GetMetadata().GetName(),
 			ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
 			ActorTemplateName:      state.Actor.GetActorTemplateName(),
-			ActorId:                state.Actor.GetActorId(),
-			Runsc:                  runscCfg,
 			Spec:                   workloadSpec,
-			SnapshotUriPrefix:      state.Actor.GetLastSnapshot(),
+			ActorUid:               state.Actor.GetMetadata().Uid,
 		}
+		switch d := data.(type) {
+		case *ateapipb.SnapshotInfo_Local:
+			req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+			req.Config = &ateletpb.RestoreRequest_LocalConfig{
+				LocalConfig: &ateletpb.LocalCheckpointConfiguration{
+					SnapshotPrefix: d.Local.GetSnapshotPrefix(),
+				},
+			}
+			req.Scope = toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnPause)
+		case *ateapipb.SnapshotInfo_External:
+			req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL
+			req.Config = &ateletpb.RestoreRequest_ExternalConfig{
+				ExternalConfig: &ateletpb.ExternalCheckpointConfiguration{
+					SnapshotUriPrefix: d.External.GetSnapshotUriPrefix(),
+				},
+			}
+			req.Scope = toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit)
+		default:
+			return fmt.Errorf("unsupported snapshot type: %T", data)
+		}
+
 		_, err = client.Restore(ctx, req)
-		if err != nil {
-			return fmt.Errorf("while restoring workload: %w", err)
-		}
-		return nil
+		return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while restoring workload")
 	} else if state.ActorTemplate.Status.GoldenSnapshot != "" && !input.Boot {
 		slog.InfoContext(ctx, "Actor has no snapshot; ActorTemplate has golden snapshot; Restoring from golden snapshot")
 
@@ -223,34 +308,45 @@ func (s *CallAteletRestoreStep) Execute(ctx context.Context, input *ResumeInput,
 
 		req := &ateletpb.RestoreRequest{
 			TargetAteomUid:         state.Actor.GetAteomPodUid(),
+			Atespace:               state.Actor.GetMetadata().GetAtespace(),
+			ActorName:              state.Actor.GetMetadata().GetName(),
 			ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
 			ActorTemplateName:      state.Actor.GetActorTemplateName(),
-			ActorId:                state.Actor.GetActorId(),
-			Runsc:                  runscCfg,
 			Spec:                   workloadSpec,
-			SnapshotUriPrefix:      snapshot,
+			Type:                   ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
+			Config: &ateletpb.RestoreRequest_ExternalConfig{
+				ExternalConfig: &ateletpb.ExternalCheckpointConfiguration{
+					SnapshotUriPrefix: snapshot,
+				},
+			},
+			Scope:    toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit),
+			ActorUid: state.Actor.GetMetadata().Uid,
 		}
 		_, err = client.Restore(ctx, req)
-		if err != nil {
-			return fmt.Errorf("while creating workload from golden snapshot: %w", err)
-		}
-		return nil
+		return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while creating workload from golden snapshot")
 	} else {
 		slog.InfoContext(ctx, "Actor has no snapshot; ActorTemplate has no golden snapshot; Booting from ActorTemplate spec")
-		req := &ateletpb.RunRequest{
-			TargetAteomUid:         state.Actor.GetAteomPodUid(),
-			ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
-			ActorTemplateName:      state.Actor.GetActorTemplateName(),
-			ActorId:                state.Actor.GetActorId(),
-			Runsc:                  runscCfg,
-			Spec:                   workloadSpec,
-		}
-		_, err = client.Run(ctx, req)
+
+		// Booting from scratch: resolve the sandbox binaries from the pool's
+		// SandboxConfig and send them so atelet can fetch and record them.
+		// (Restores above are self-describing via the snapshot manifest.)
+		sandboxAssets, err := resolveSandboxAssets(s.workerPoolLister, s.sandboxConfigLister, state.Actor.GetAteomPodNamespace(), state.Actor.GetWorkerPoolName())
 		if err != nil {
-			return fmt.Errorf("while creating workload from spec: %w", err)
+			return fmt.Errorf("while resolving sandbox assets: %w", err)
 		}
 
-		return nil
+		req := &ateletpb.RunRequest{
+			TargetAteomUid:         state.Actor.GetAteomPodUid(),
+			Atespace:               state.Actor.GetMetadata().GetAtespace(),
+			ActorName:              state.Actor.GetMetadata().GetName(),
+			ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
+			ActorTemplateName:      state.Actor.GetActorTemplateName(),
+			SandboxAssets:          sandboxAssets,
+			Spec:                   workloadSpec,
+			ActorUid:               state.Actor.GetMetadata().Uid,
+		}
+		_, err = client.Run(ctx, req)
+		return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while creating workload from spec")
 	}
 	// Unreachable
 }
@@ -266,17 +362,18 @@ func (s *FinalizeRunningStep) IsComplete(ctx context.Context, input *ResumeInput
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_RUNNING, nil
 }
 func (s *FinalizeRunningStep) Execute(ctx context.Context, input *ResumeInput, state *ResumeState) error {
-	latestActor, err := s.store.GetActor(ctx, input.ActorID)
+	latestActor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
 	if err != nil {
 		return err
 	}
 
 	latestActor.Status = ateapipb.Actor_STATUS_RUNNING
-	err = s.store.UpdateActor(ctx, latestActor, latestActor.GetVersion())
-	if err == nil {
-		state.Actor = latestActor
+	updatedActor, err := s.store.UpdateActor(ctx, latestActor, latestActor.GetMetadata().GetVersion())
+	if err != nil {
+		return err
 	}
-	return err
+	state.Actor = updatedActor
+	return nil
 }
 
 func (s *FinalizeRunningStep) RetryBackoff() *wait.Backoff { return nil }

@@ -22,12 +22,25 @@ import (
 	"os"
 	"slices"
 	"text/tabwriter"
+	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/apimachinery/pkg/util/duration"
 	"sigs.k8s.io/yaml"
 )
+
+// timeNow returns the current time. It is a package variable so tests can pin
+// it and make age rendering deterministic.
+var timeNow = time.Now
+
+// formatAge renders a resource's age from its creation timestamp, kubectl-style
+// (e.g. "5m", "3h", "2d").
+func formatAge(ts *timestamppb.Timestamp) string {
+	return duration.HumanDuration(timeNow().Sub(ts.AsTime()))
+}
 
 // PrintActors prints a slice of actors to stdout in the requested format.
 func PrintActors(actors []*ateapipb.Actor, format string) error {
@@ -36,13 +49,16 @@ func PrintActors(actors []*ateapipb.Actor, format string) error {
 
 func sortActors(actors []*ateapipb.Actor) {
 	slices.SortFunc(actors, func(a, b *ateapipb.Actor) int {
+		if c := cmp.Compare(a.GetMetadata().GetAtespace(), b.GetMetadata().GetAtespace()); c != 0 {
+			return c
+		}
 		if c := cmp.Compare(a.GetActorTemplateNamespace(), b.GetActorTemplateNamespace()); c != 0 {
 			return c
 		}
 		if c := cmp.Compare(a.GetActorTemplateName(), b.GetActorTemplateName()); c != 0 {
 			return c
 		}
-		return cmp.Compare(a.GetActorId(), b.GetActorId())
+		return cmp.Compare(a.GetMetadata().GetName(), b.GetMetadata().GetName())
 	})
 }
 
@@ -54,11 +70,11 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 		return printProto(out, &ateapipb.ListActorsResponse{Actors: actors}, format)
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "NAMESPACE\tTEMPLATE\tID\tSTATUS\tATEOM POD\tATEOM IP\tVERSION")
+		fmt.Fprintln(w, "ATESPACE\tNAME\tTEMPLATE\tSTATUS\tATEOM POD\tATEOM IP\tVERSION\tAGE")
 		for _, actor := range actors {
-			ns := actor.GetActorTemplateNamespace()
-			tmpl := actor.GetActorTemplateName()
-			id := actor.GetActorId()
+			atespace := actor.GetMetadata().GetAtespace()
+			name := actor.GetMetadata().GetName()
+			template := actor.GetActorTemplateNamespace() + "/" + actor.GetActorTemplateName()
 			status := actor.GetStatus().String()
 
 			worker := "<none>"
@@ -66,8 +82,9 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 				worker = actor.GetAteomPodNamespace() + "/" + actor.GetAteomPodName()
 			}
 
-			version := actor.GetVersion()
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n", ns, tmpl, id, status, worker, actor.GetAteomPodIp(), version)
+			version := actor.GetMetadata().GetVersion()
+			age := formatAge(actor.GetMetadata().GetCreateTime())
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", atespace, name, template, status, worker, actor.GetAteomPodIp(), version, age)
 		}
 		return w.Flush()
 	default:
@@ -108,9 +125,10 @@ func PrintWorkersTo(out io.Writer, workers []*ateapipb.Worker, format string) er
 
 			status := "FREE"
 			assignedActor := "<none>"
-			if worker.GetActorId() != "" {
+			if wass := worker.Assignment; wass != nil {
 				status = "ASSIGNED"
-				assignedActor = fmt.Sprintf("%s/%s/%s", worker.GetActorNamespace(), worker.GetActorTemplate(), worker.GetActorId())
+				assignedActor = fmt.Sprintf("%s/%s/%s/%s",
+					wass.ActorTemplate.Namespace, wass.ActorTemplate.Name, wass.Actor.Atespace, wass.Actor.Name)
 			}
 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ns, pool, pod, status, assignedActor)
@@ -124,6 +142,40 @@ func PrintWorkersTo(out io.Writer, workers []*ateapipb.Worker, format string) er
 // PrintActor prints a single actor in the requested format.
 func PrintActor(actor *ateapipb.Actor, format string) error {
 	return PrintActors([]*ateapipb.Actor{actor}, format)
+}
+
+// PrintAtespaces prints a slice of atespaces to stdout in the requested format.
+func PrintAtespaces(atespaces []*ateapipb.Atespace, format string) error {
+	return PrintAtespacesTo(os.Stdout, atespaces, format)
+}
+
+func sortAtespaces(atespaces []*ateapipb.Atespace) {
+	slices.SortFunc(atespaces, func(a, b *ateapipb.Atespace) int {
+		return cmp.Compare(a.GetMetadata().GetName(), b.GetMetadata().GetName())
+	})
+}
+
+// PrintAtespacesTo prints a slice of atespaces to the provided writer.
+func PrintAtespacesTo(out io.Writer, atespaces []*ateapipb.Atespace, format string) error {
+	sortAtespaces(atespaces)
+	switch format {
+	case "json", "yaml":
+		return printProto(out, &ateapipb.ListAtespacesResponse{Atespaces: atespaces}, format)
+	case "table":
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "NAME\tAGE")
+		for _, a := range atespaces {
+			fmt.Fprintf(w, "%s\t%s\n", a.GetMetadata().GetName(), formatAge(a.GetMetadata().GetCreateTime()))
+		}
+		return w.Flush()
+	default:
+		return fmt.Errorf("unsupported format %q", format)
+	}
+}
+
+// PrintAtespace prints a single atespace in the requested format.
+func PrintAtespace(atespace *ateapipb.Atespace, format string) error {
+	return PrintAtespaces([]*ateapipb.Atespace{atespace}, format)
 }
 
 func printProto(out io.Writer, msg proto.Message, format string) error {

@@ -23,10 +23,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	getActorsAtespaceFlag string
+	getActorsAllAtespaces bool
+)
+
 var getActorsCmd = &cobra.Command{
-	Use:     "actors [actor-id]",
+	Use:     "actors <actor-name ...>",
 	Aliases: []string{"actor"},
-	Short:   "List all actors or get a specific actor",
+	Short:   "List all actors or get one or more actors",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
@@ -37,13 +42,35 @@ var getActorsCmd = &cobra.Command{
 		}
 		defer apiClient.Close()
 
-		// 2. Handle Get Single Actor
+		// 2. Handle Get Actors
 		if len(args) > 0 {
-			resp, err := apiClient.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: args[0]})
-			if err != nil {
-				return fmt.Errorf("failed to get actor: %w", err)
+			// An actor is addressed by (atespace, name), so the atespace is
+			// mandatory and "all atespaces" is meaningless here.
+			if getActorsAllAtespaces {
+				return fmt.Errorf("-A/--all-atespaces cannot be used when getting actors; pass --atespace")
 			}
-			return printer.PrintActor(resp.GetActor(), outputFmt)
+			if getActorsAtespaceFlag == "" {
+				return fmt.Errorf("--atespace is required when getting actors")
+			}
+
+			actors := make([]*ateapipb.Actor, 0, len(args))
+			for _, actorName := range args {
+				resp, err := apiClient.GetActor(ctx, &ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: getActorsAtespaceFlag, Name: actorName}})
+				if err != nil {
+					return fmt.Errorf("failed to get actor %q: %w", actorName, err)
+				}
+				actors = append(actors, resp)
+			}
+			return printer.PrintActors(actors, outputFmt)
+		}
+
+		// Listing requires exactly one of --atespace (one atespace) or -A (all
+		// atespaces). There is no default atespace to fall back on.
+		if getActorsAllAtespaces && getActorsAtespaceFlag != "" {
+			return fmt.Errorf("--atespace and -A/--all-atespaces are mutually exclusive")
+		}
+		if !getActorsAllAtespaces && getActorsAtespaceFlag == "" {
+			return fmt.Errorf("specify --atespace <name> to list one atespace, or -A/--all-atespaces for all")
 		}
 
 		// 3. Handle List All Actors
@@ -54,6 +81,7 @@ var getActorsCmd = &cobra.Command{
 			resp, err := apiClient.ListActors(ctx, &ateapipb.ListActorsRequest{
 				PageSize:  1000,
 				PageToken: pageToken,
+				Atespace:  getActorsAtespaceFlag,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to list actors: %w", err)
@@ -71,5 +99,7 @@ var getActorsCmd = &cobra.Command{
 }
 
 func init() {
+	getActorsCmd.Flags().StringVarP(&getActorsAtespaceFlag, "atespace", "a", "", "Atespace to list/get actors in. Required when getting actors; for listing, use this or -A.")
+	getActorsCmd.Flags().BoolVarP(&getActorsAllAtespaces, "all-atespaces", "A", false, "List actors across all atespaces (listing only; mutually exclusive with --atespace)")
 	getCmd.AddCommand(getActorsCmd)
 }

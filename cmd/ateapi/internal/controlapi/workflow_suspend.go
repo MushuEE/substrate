@@ -33,7 +33,8 @@ import (
 
 // SuspendInput holds the immutable parameters requested by the client.
 type SuspendInput struct {
-	ActorID string
+	ActorName string
+	Atespace  string
 }
 
 // SuspendState holds the mutable state loaded and modified during execution.
@@ -53,7 +54,7 @@ func (s *LoadActorForSuspendStep) IsComplete(ctx context.Context, input *Suspend
 	return false, nil
 }
 func (s *LoadActorForSuspendStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	actor, err := s.store.GetActor(ctx, input.ActorID)
+	actor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
 	if err != nil {
 		return err
 	}
@@ -86,13 +87,19 @@ func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, s
 
 	state.Actor.Status = ateapipb.Actor_STATUS_SUSPENDING
 	snapshotID := time.Now().Format(time.RFC3339) + "-" + rand.Text()
-	state.Actor.InProgressSnapshot = strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/" + input.ActorID + "/" + snapshotID
-	return s.store.UpdateActor(ctx, state.Actor, state.Actor.GetVersion())
+	state.Actor.InProgressSnapshot = strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/" + input.ActorName + "/" + snapshotID
+	updatedActor, err := s.store.UpdateActor(ctx, state.Actor, state.Actor.GetMetadata().GetVersion())
+	if err != nil {
+		return err
+	}
+	state.Actor = updatedActor
+	return nil
 }
 
 func (s *MarkSuspendingStep) RetryBackoff() *wait.Backoff { return nil }
 
 type CallAteletSuspendStep struct {
+	store  store.Interface
 	dialer *AteletDialer
 }
 
@@ -102,8 +109,11 @@ func (s *CallAteletSuspendStep) IsComplete(ctx context.Context, input *SuspendIn
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED, nil
 }
 func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	if state.Actor.GetAteomPodNamespace() == "" {
-		return fmt.Errorf("actor is in SUSPENDING state but has no active worker")
+	if state.Actor.GetAteomPodNamespace() == "" || state.Actor.GetAteomPodName() == "" {
+		if err := crashActor(ctx, s.store, state.Actor.GetMetadata().GetAtespace(), state.Actor.GetMetadata().GetName()); err != nil {
+			slog.Error("Failed to crash actor", slog.String("err", err.Error()))
+		}
+		return fmt.Errorf("actor is CRASHED because it was in SUSPENDING state but has no active worker")
 	}
 
 	ateletConn, err := s.dialer.DialForWorker(state.Actor.GetAteomPodNamespace(), state.Actor.GetAteomPodName())
@@ -116,61 +126,30 @@ func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
-	runscCfg := &ateletpb.RunscConfig{}
-	if state.ActorTemplate.Spec.Runsc.AMD64 != nil {
-		runscCfg.Amd64 = &ateletpb.RunscPlatformConfig{
-			Sha256Hash: state.ActorTemplate.Spec.Runsc.AMD64.SHA256Hash,
-			Url:        state.ActorTemplate.Spec.Runsc.AMD64.URL,
-		}
-	}
-	if state.ActorTemplate.Spec.Runsc.ARM64 != nil {
-		runscCfg.Arm64 = &ateletpb.RunscPlatformConfig{
-			Sha256Hash: state.ActorTemplate.Spec.Runsc.ARM64.SHA256Hash,
-			Url:        state.ActorTemplate.Spec.Runsc.ARM64.URL,
-		}
-	}
-	if state.ActorTemplate.Spec.Runsc.Authentication.GCP != nil {
-		authnCfg := &ateletpb.AuthenticationConfig{}
-		authnCfg.Gcp = &ateletpb.GCPAuthenticationConfig{Use: true}
-		runscCfg.Authentication = authnCfg
-	}
+	workloadSpec := workloadSpecFromActorTemplate(state.ActorTemplate)
 
+	// Checkpoint does not carry the sandbox config: atelet uses the version the
+	// actor is currently running (recorded on-node at Run/Restore) and pins it
+	// into the snapshot manifest.
 	req := &ateletpb.CheckpointRequest{
 		TargetAteomUid:         state.Actor.GetAteomPodUid(),
+		Atespace:               state.Actor.GetMetadata().GetAtespace(),
+		ActorName:              state.Actor.GetMetadata().GetName(),
 		ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
 		ActorTemplateName:      state.Actor.GetActorTemplateName(),
-		ActorId:                state.Actor.GetActorId(),
-		Runsc:                  runscCfg,
-		Spec: &ateletpb.WorkloadSpec{
-			PauseImage: state.ActorTemplate.Spec.PauseImage,
+		Spec:                   workloadSpec,
+		Type:                   ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
+		Config: &ateletpb.CheckpointRequest_ExternalConfig{
+			ExternalConfig: &ateletpb.ExternalCheckpointConfiguration{
+				SnapshotUriPrefix: state.Actor.GetInProgressSnapshot(),
+			},
 		},
-		SnapshotUriPrefix: state.Actor.GetInProgressSnapshot(),
-	}
-	for _, ctr := range state.ActorTemplate.Spec.Containers {
-		ateletCtr := &ateletpb.Container{
-			Name:    ctr.Name,
-			Image:   ctr.Image,
-			Command: ctr.Command,
-		}
-		for _, env := range ctr.Env {
-			var val string
-			if env.Value != nil {
-				val = *env.Value
-			}
-			ateletEnv := &ateletpb.EnvEntry{
-				Name:  env.Name,
-				Value: val,
-			}
-			ateletCtr.Env = append(ateletCtr.Env, ateletEnv)
-		}
-		req.Spec.Containers = append(req.Spec.Containers, ateletCtr)
-	}
-	_, err = client.Checkpoint(ctx, req)
-	if err != nil {
-		return fmt.Errorf("while checkpointing workload: %w", err)
+		Scope:    toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit),
+		ActorUid: state.Actor.GetMetadata().Uid,
 	}
 
-	return nil
+	_, err = client.Checkpoint(ctx, req)
+	return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while checkpointing workload")
 }
 
 func (s *CallAteletSuspendStep) RetryBackoff() *wait.Backoff { return nil }
@@ -185,7 +164,7 @@ func (s *FinalizeSuspendedStep) IsComplete(ctx context.Context, input *SuspendIn
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED && state.Actor.GetAteomPodNamespace() == "", nil
 }
 func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	latestActor, err := s.store.GetActor(ctx, input.ActorID)
+	latestActor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
 	if err != nil {
 		return err
 	}
@@ -195,7 +174,7 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 		workerNs := latestActor.GetAteomPodNamespace()
 		workerPod := latestActor.GetAteomPodName()
 
-		workerPool := state.ActorTemplate.Spec.WorkerPoolRef.Name
+		workerPool := latestActor.GetWorkerPoolName()
 
 		worker, err := s.store.GetWorker(ctx, workerNs, workerPool, workerPod)
 		if err != nil {
@@ -205,35 +184,42 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 			slog.Warn("Worker already gone during finalize suspend, skipping release", "worker", workerPod)
 		} else {
 			// Only free it if it still belongs to us
-			if worker.GetActorId() == input.ActorID {
-				worker.ActorNamespace = ""
-				worker.ActorTemplate = ""
-				worker.ActorId = ""
-
-				err = s.store.UpdateWorker(ctx, worker, worker.Version)
-				if err != nil {
-					return err
+			if wass := worker.Assignment; wass != nil {
+				if wass.Actor.Atespace == input.Atespace && wass.Actor.Name == input.ActorName {
+					worker.Assignment = nil
+					err = s.store.UpdateWorker(ctx, worker, worker.Version)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
 
 		// 2. Safely clear ActiveWorker now that the worker object in DB is freed
-		latestActor, err = s.store.GetActor(ctx, input.ActorID)
+		latestActor, err = s.store.GetActor(ctx, input.Atespace, input.ActorName)
 		if err != nil {
 			return err
 		}
 		latestActor.Status = ateapipb.Actor_STATUS_SUSPENDED
 		if latestActor.InProgressSnapshot != "" {
-			latestActor.LastSnapshot = latestActor.InProgressSnapshot
+			latestActor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
+				Data: &ateapipb.SnapshotInfo_External{
+					External: &ateapipb.ExternalSnapshotInfo{
+						SnapshotUriPrefix: latestActor.InProgressSnapshot,
+					},
+				},
+			}
 			latestActor.InProgressSnapshot = ""
 		}
 		latestActor.AteomPodNamespace = ""
 		latestActor.AteomPodName = ""
 		latestActor.AteomPodIp = ""
-		err = s.store.UpdateActor(ctx, latestActor, latestActor.GetVersion())
+		latestActor.WorkerPoolName = ""
+		updatedActor, err := s.store.UpdateActor(ctx, latestActor, latestActor.GetMetadata().GetVersion())
 		if err != nil {
 			return err
 		}
+		latestActor = updatedActor
 	}
 
 	state.Actor = latestActor

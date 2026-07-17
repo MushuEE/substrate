@@ -15,8 +15,11 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +42,54 @@ func (m *mockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRe
 	return m.resumeFn(ctx, in, opts...)
 }
 
+func TestHandleRequestHeadersDoesNotLogSensitiveData(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	const secret = "do-not-log-me"
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	s := NewExtProcServer(50051, &mockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{AteomPodIp: "10.0.0.52"}}, nil
+		},
+	}, nil)
+
+	reqHeaders := &extprocv3.HttpHeaders{
+		Headers: &corev3.HeaderMap{
+			Headers: []*corev3.HeaderValue{
+				{Key: ":path", Value: "/api/v1/reset?token=" + secret},
+				{Key: ":authority", Value: testUUID + ".team-a.actors.resources.substrate.ate.dev"},
+				{Key: ":method", Value: "POST"},
+				{Key: "authorization", Value: "Bearer " + secret},
+				{Key: "cookie", Value: "session=" + secret},
+			},
+		},
+	}
+
+	_, metadata, target, _, _, err := s.handleRequestHeaders(context.Background(), reqHeaders)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Errorf("router log leaked sensitive value: %s", out)
+	}
+	if !strings.Contains(out, testUUID) {
+		t.Errorf("router log missing actor/host routing context: %s", out)
+	}
+
+	s.recorder.AddRouterRequest(time.Now(), time.Millisecond, "Route ok", target, metadata)
+	for _, q := range s.recorder.Get() {
+		if blob, _ := json.Marshal(q); strings.Contains(string(blob), secret) {
+			t.Errorf("recorder/statusz retained sensitive value: %s", blob)
+		}
+	}
+}
+
 func TestExtProcHeadersEvaluation(t *testing.T) {
 	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
 
@@ -56,12 +107,12 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 			name:           "invalid host returns 404 identifying the host",
 			authority:      "invalid-host.com",
 			expectErr:      true,
-			expectedErrStr: `invalid host "invalid-host.com": invalid actor_id: must end with actors.resources.substrate.ate.dev, got "invalid-host.com"`,
+			expectedErrStr: `invalid host "invalid-host.com": invalid actor DNS name: must end with actors.resources.substrate.ate.dev, got "invalid-host.com"`,
 			expectedStatus: envoy_type.StatusCode_NotFound,
 		},
 		{
 			name:           "non-gRPC resume error collapses to 500 without leaking detail",
-			authority:      testUUID + ".actors.resources.substrate.ate.dev",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeErr:      errors.New("resume failed with sensitive detail"),
 			expectErr:      true,
 			expectedErrStr: `error resuming actor "123e4567-e89b-12d3-a456-426614174000"`,
@@ -69,7 +120,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:           "FailedPrecondition maps to 503 with preserved desc",
-			authority:      testUUID + ".actors.resources.substrate.ate.dev",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeErr:      status.Error(codes.FailedPrecondition, "no free workers available"),
 			expectErr:      true,
 			expectedErrStr: `actor "123e4567-e89b-12d3-a456-426614174000" unavailable: no free workers available`,
@@ -77,7 +128,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:           "NotFound maps to 404",
-			authority:      testUUID + ".actors.resources.substrate.ate.dev",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeErr:      status.Error(codes.NotFound, "actor missing"),
 			expectErr:      true,
 			expectedErrStr: `actor "123e4567-e89b-12d3-a456-426614174000" not found`,
@@ -85,7 +136,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:           "Unavailable maps to 503",
-			authority:      testUUID + ".actors.resources.substrate.ate.dev",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeErr:      status.Error(codes.Unavailable, "control-plane down"),
 			expectErr:      true,
 			expectedErrStr: `actor "123e4567-e89b-12d3-a456-426614174000" unavailable`,
@@ -93,7 +144,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:           "DeadlineExceeded maps to 504",
-			authority:      testUUID + ".actors.resources.substrate.ate.dev",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeErr:      status.Error(codes.DeadlineExceeded, "deadline"),
 			expectErr:      true,
 			expectedErrStr: `actor "123e4567-e89b-12d3-a456-426614174000" request timed out`,
@@ -101,7 +152,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:      "Bad Actor IP from resume returns 500 without leaking IP",
-			authority: testUUID + ".actors.resources.substrate.ate.dev",
+			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeResp: &ateapipb.ResumeActorResponse{
 				Actor: &ateapipb.Actor{
 					AteomPodIp: "invalid-ip",
@@ -113,7 +164,7 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		},
 		{
 			name:      "Successful resume",
-			authority: testUUID + ".actors.resources.substrate.ate.dev",
+			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
 			resumeResp: &ateapipb.ResumeActorResponse{
 				Actor: &ateapipb.Actor{
 					AteomPodIp: "10.0.0.52",
@@ -128,8 +179,8 @@ func TestExtProcHeadersEvaluation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientMock := &mockClient{
 				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-					if in.GetActorId() != testUUID {
-						t.Errorf("unexpected identifier parsed in test context: %s", in.GetActorId())
+					if in.GetActor().GetName() != testUUID {
+						t.Errorf("unexpected identifier parsed in test context: %s", in.GetActor().GetName())
 					}
 					if tc.resumeErr != nil {
 						return nil, tc.resumeErr

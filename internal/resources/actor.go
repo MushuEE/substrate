@@ -16,32 +16,46 @@ package resources
 
 import (
 	"fmt"
-	"regexp"
+	"strings"
 )
 
 const (
-	// ActorIDRegexPattern is the regular expression pattern for matching valid actor IDs.
-	ActorIDRegexPattern = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
+	// ResourceNameRegexPattern is the regular expression pattern for a valid
+	// Substrate resource name.
+	ResourceNameRegexPattern = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
 	// ActorDNSSuffix is suffix to the DNS name for direct access to Actor
-	// "<actor id>.actors.resources.substrate.ate.dev."
+	// "<actor_name>.<atespace>.actors.resources.substrate.ate.dev."
 	ActorDNSSuffix = "actors.resources.substrate.ate.dev"
+	// GoldenActorAtespace is the reserved system atespace that per-template golden
+	// actors live in.
+	GoldenActorAtespace = "ate-golden"
 )
 
-var actorIDRegex = regexp.MustCompile("^" + ActorIDRegexPattern + "$")
+// ActorDNSName returns the mesh DNS name an actor is reachable at:
+// "<actor_name>.<atespace>.actors.resources.substrate.ate.dev". The atespace is
+// part of the name because an actor name is only unique within its atespace.
+func ActorDNSName(atespace, actorName string) string {
+	return actorName + "." + atespace + "." + ActorDNSSuffix
+}
 
-// ValidateActorID validates whether the provided actor ID is valid or not.
-// Actor IDs must be valid DNS-1123 labels.
-//
-// 1. Must be between 1 and 63 characters in length.
-// 2. Must start with a lower-case alphanumeric character (a-z, 0-9).
-// 3. Must contain only lower-case alphanumeric characters and hyphens (a-z, 0-9, -).
-// 4. Must end with a lower-case alphanumeric character (cannot end with a hyphen).
-func ValidateActorID(id string) error {
-	if len(id) > 63 {
-		return fmt.Errorf("invalid actor_id: must be no more than 63 characters")
+// ParseActorDNSName parses a mesh DNS name of the form
+// "<actor_name>.<atespace>.actors.resources.substrate.ate.dev" (a trailing dot
+// is tolerated) into its atespace and actor name, validating both. It does not
+// accept a host:port; callers must strip the port first.
+func ParseActorDNSName(name string) (atespace, actorName string, err error) {
+	rest, found := strings.CutSuffix(strings.TrimSuffix(name, "."), "."+ActorDNSSuffix)
+	if !found {
+		return "", "", fmt.Errorf("invalid actor DNS name: must end with %s, got %q", ActorDNSSuffix, name)
 	}
-	if !actorIDRegex.MatchString(id) {
-		return fmt.Errorf("invalid actor_id: must start and end with a lower case alphanumeric character, and consist only of lower case alphanumeric characters or '-'")
+	actorName, atespace, found = strings.Cut(rest, ".")
+	if !found {
+		return "", "", fmt.Errorf("invalid actor DNS name: expected <actor_name>.<atespace>.%s, got %q", ActorDNSSuffix, name)
 	}
-	return nil
+	if !IsValidResourceName(actorName) {
+		return "", "", fmt.Errorf("invalid actor DNS name %q: %q is not a valid actor name", name, actorName)
+	}
+	if !IsValidResourceName(atespace) {
+		return "", "", fmt.Errorf("invalid actor DNS name %q: %q is not a valid atespace", name, atespace)
+	}
+	return atespace, actorName, nil
 }

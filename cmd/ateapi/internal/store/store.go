@@ -39,20 +39,45 @@ var (
 
 // Interface defines the contract for the persistence layer storing actor state.
 type Interface interface {
-	// Fetches an actor by id. Returns ErrNotFound if missing.
-	GetActor(ctx context.Context, id string) (*ateapipb.Actor, error)
+	// Fetches an actor by (atespace, name). Returns ErrNotFound if missing.
+	GetActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error)
 
-	// Stores a new actor in suspended state. Returns ErrAlreadyExists if key is taken.
-	CreateActor(ctx context.Context, actor *ateapipb.Actor) error
+	// Stores a new actor in suspended state and returns the stored resource with
+	// server-assigned metadata (uid, version, timestamps). The input is not
+	// mutated. Returns ErrAlreadyExists if key is taken.
+	CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error)
 
-	// Updates actor state with optimistic concurrency check. Returns ErrNotFound if missing, or ErrPersistenceRetry on version mismatch.
-	UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) error
+	// Updates actor state with optimistic concurrency check and returns the stored
+	// resource with advanced metadata (version, update_time). The input is not
+	// mutated. Returns ErrNotFound if missing, or ErrPersistenceRetry on version mismatch.
+	UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) (*ateapipb.Actor, error)
 
-	// Removes an actor. Returns ErrNotFound if missing, or ErrFailedPrecondition if not suspended.
-	DeleteActor(ctx context.Context, id string) error
+	// Removes an actor and returns the deleted resource. Returns ErrNotFound if
+	// missing, or ErrFailedPrecondition if not suspended.
+	DeleteActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error)
 
-	// Lists all known actors. Returns a page of actors and a next page token.
-	ListActors(ctx context.Context, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error)
+	// Lists actors in the given atespace (scoped scan), or across ALL atespaces if atespace is
+	// empty. Returns a page of actors and a next page token.
+	ListActors(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error)
+
+	// Stores a new atespace and returns the stored resource with server-assigned
+	// metadata (uid, version, timestamps). The input is not mutated. Returns
+	// ErrAlreadyExists if the name is taken.
+	CreateAtespace(ctx context.Context, atespace *ateapipb.Atespace) (*ateapipb.Atespace, error)
+
+	// Fetches an atespace by name. Returns ErrNotFound if missing.
+	GetAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
+
+	// Lists all atespaces. Returns nil if none found.
+	ListAtespaces(ctx context.Context) ([]*ateapipb.Atespace, error)
+
+	// AtespaceExists reports whether the atespace object exists.
+	AtespaceExists(ctx context.Context, name string) (bool, error)
+
+	// Removes an empty atespace and returns the deleted resource. Returns
+	// ErrNotFound if missing, or ErrFailedPrecondition if the atespace is not empty
+	// (e.g. there are actors in it).
+	DeleteAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
 
 	// Fetches worker state by namespace, pool, and pod name. Returns ErrNotFound if missing.
 	GetWorker(ctx context.Context, namespace, pool, pod string) (*ateapipb.Worker, error)
@@ -69,6 +94,13 @@ type Interface interface {
 	// Lists all known workers. Returns nil if none found.
 	ListWorkers(ctx context.Context) ([]*ateapipb.Worker, error)
 
+	// WatchWorkers returns an active subscription to track worker state changes.
+	// The watch's Events channel is closed when the caller calls Close, the
+	// context is cancelled, or the underlying notification system is lost.
+	// Callers should treat a closed channel as a signal to re-subscribe, and
+	// must Close the watch to release its subscription.
+	WatchWorkers(ctx context.Context) (*WorkerWatch, error)
+
 	// AcquireLock attempts to acquire a distributed lock with a TTL.
 	// Returns true if the lock was successfully acquired.
 	// Returns false if the lock is already held by another client (conflict).
@@ -84,3 +116,39 @@ type Interface interface {
 	// DebugClearAll drop all data from the database. Useful for debugging / local testing/
 	DebugClearAll(ctx context.Context) error
 }
+
+// WorkerEventType indicates the type of change to a Worker.
+type WorkerEventType int
+
+const (
+	WorkerEventCreated WorkerEventType = iota
+	WorkerEventUpdated
+	WorkerEventDeleted
+)
+
+// WorkerEvent carries a single worker state change notification.
+type WorkerEvent struct {
+	Type   WorkerEventType
+	Worker *ateapipb.Worker
+}
+
+// WorkerWatch is an active subscription to worker state changes. The caller
+// must call Close when done to release the underlying subscription. Events is
+// closed when Close is called, the originating context is cancelled, or the
+// underlying notification system is lost.
+type WorkerWatch struct {
+	// Events delivers worker state changes until the watch is torn down.
+	Events <-chan WorkerEvent
+	// stop releases the subscription backing Events. It is a context.CancelFunc,
+	// so it is safe to call multiple times.
+	stop context.CancelFunc
+}
+
+// NewWorkerWatch builds a WorkerWatch from an events channel and the cancel
+// func that tears down its subscription.
+func NewWorkerWatch(events <-chan WorkerEvent, stop context.CancelFunc) *WorkerWatch {
+	return &WorkerWatch{Events: events, stop: stop}
+}
+
+// Close releases the subscription. Safe to call multiple times.
+func (w *WorkerWatch) Close() { w.stop() }

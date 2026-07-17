@@ -17,13 +17,16 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: ate-api-server-role
+  name: ate-api-server
 rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "watch", "list"]
 - apiGroups: ["ate.dev"]
-  resources: ["actortemplates"]
+  resources: ["actortemplates", "workerpools", "sandboxconfigs"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["ate.dev"]
+  resources: ["workerpools"]
   verbs: ["get", "watch", "list"]
 # Secret reads for env source resolution are intentionally NOT granted
 # cluster-wide here. Each demo / tenant is responsible for granting
@@ -42,21 +45,21 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: ate-api-server-binding
+  name: ate-api-server
 subjects:
 - kind: ServiceAccount
   name: ate-api-server
   namespace: ate-system
 roleRef:
   kind: ClusterRole
-  name: ate-api-server-role
+  name: ate-api-server
   apiGroup: rbac.authorization.k8s.io
 ---
 # 5. Deploy the API Server
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ate-api-server-deployment
+  name: ate-api-server
   namespace: ate-system
 spec:
   replicas: 1

@@ -35,14 +35,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Control_GetActor_FullMethodName     = "/ateapi.Control/GetActor"
-	Control_CreateActor_FullMethodName  = "/ateapi.Control/CreateActor"
-	Control_SuspendActor_FullMethodName = "/ateapi.Control/SuspendActor"
-	Control_ResumeActor_FullMethodName  = "/ateapi.Control/ResumeActor"
-	Control_DeleteActor_FullMethodName  = "/ateapi.Control/DeleteActor"
-	Control_ListWorkers_FullMethodName  = "/ateapi.Control/ListWorkers"
-	Control_ListActors_FullMethodName   = "/ateapi.Control/ListActors"
-	Control_DebugClear_FullMethodName   = "/ateapi.Control/DebugClear"
+	Control_GetActor_FullMethodName       = "/ateapi.Control/GetActor"
+	Control_CreateActor_FullMethodName    = "/ateapi.Control/CreateActor"
+	Control_UpdateActor_FullMethodName    = "/ateapi.Control/UpdateActor"
+	Control_SuspendActor_FullMethodName   = "/ateapi.Control/SuspendActor"
+	Control_PauseActor_FullMethodName     = "/ateapi.Control/PauseActor"
+	Control_ResumeActor_FullMethodName    = "/ateapi.Control/ResumeActor"
+	Control_DeleteActor_FullMethodName    = "/ateapi.Control/DeleteActor"
+	Control_ListWorkers_FullMethodName    = "/ateapi.Control/ListWorkers"
+	Control_ListActors_FullMethodName     = "/ateapi.Control/ListActors"
+	Control_CreateAtespace_FullMethodName = "/ateapi.Control/CreateAtespace"
+	Control_GetAtespace_FullMethodName    = "/ateapi.Control/GetAtespace"
+	Control_ListAtespaces_FullMethodName  = "/ateapi.Control/ListAtespaces"
+	Control_DeleteAtespace_FullMethodName = "/ateapi.Control/DeleteAtespace"
 )
 
 // ControlClient is the client API for Control service.
@@ -52,21 +57,31 @@ const (
 // Control is the primary RPC interface for Agentic Substrate.
 type ControlClient interface {
 	// Get an Actor.
-	GetActor(ctx context.Context, in *GetActorRequest, opts ...grpc.CallOption) (*GetActorResponse, error)
+	GetActor(ctx context.Context, in *GetActorRequest, opts ...grpc.CallOption) (*Actor, error)
 	// Create a new Actor deriving from a given ActorTemplate.
-	CreateActor(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*CreateActorResponse, error)
+	CreateActor(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*Actor, error)
+	// Update mutable fields on an existing Actor.
+	UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*UpdateActorResponse, error)
 	// Suspend a given actor to a new snapshot.
 	SuspendActor(ctx context.Context, in *SuspendActorRequest, opts ...grpc.CallOption) (*SuspendActorResponse, error)
+	// Pause a given actor and keep its snapshots on node VM.
+	PauseActor(ctx context.Context, in *PauseActorRequest, opts ...grpc.CallOption) (*PauseActorResponse, error)
 	// Resume an actor from its latest snapshot.
 	ResumeActor(ctx context.Context, in *ResumeActorRequest, opts ...grpc.CallOption) (*ResumeActorResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
-	DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*DeleteActorResponse, error)
+	DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*Actor, error)
 	// List all workers currently reflected in redis.
 	ListWorkers(ctx context.Context, in *ListWorkersRequest, opts ...grpc.CallOption) (*ListWorkersResponse, error)
 	// List all actors currently reflected in redis.
 	ListActors(ctx context.Context, in *ListActorsRequest, opts ...grpc.CallOption) (*ListActorsResponse, error)
-	// Debugging: drop all data from the ate database.
-	DebugClear(ctx context.Context, in *DebugClearRequest, opts ...grpc.CallOption) (*DebugClearResponse, error)
+	// Create a new Atespace. Substrate-native, stored in Redis.
+	CreateAtespace(ctx context.Context, in *CreateAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error)
+	// Get an Atespace by name.
+	GetAtespace(ctx context.Context, in *GetAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error)
+	// List all Atespaces.
+	ListAtespaces(ctx context.Context, in *ListAtespacesRequest, opts ...grpc.CallOption) (*ListAtespacesResponse, error)
+	// Delete an empty Atespace. Rejects (FailedPrecondition) if any actors remain.
+	DeleteAtespace(ctx context.Context, in *DeleteAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error)
 }
 
 type controlClient struct {
@@ -77,9 +92,9 @@ func NewControlClient(cc grpc.ClientConnInterface) ControlClient {
 	return &controlClient{cc}
 }
 
-func (c *controlClient) GetActor(ctx context.Context, in *GetActorRequest, opts ...grpc.CallOption) (*GetActorResponse, error) {
+func (c *controlClient) GetActor(ctx context.Context, in *GetActorRequest, opts ...grpc.CallOption) (*Actor, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetActorResponse)
+	out := new(Actor)
 	err := c.cc.Invoke(ctx, Control_GetActor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -87,10 +102,20 @@ func (c *controlClient) GetActor(ctx context.Context, in *GetActorRequest, opts 
 	return out, nil
 }
 
-func (c *controlClient) CreateActor(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*CreateActorResponse, error) {
+func (c *controlClient) CreateActor(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*Actor, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CreateActorResponse)
+	out := new(Actor)
 	err := c.cc.Invoke(ctx, Control_CreateActor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*UpdateActorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateActorResponse)
+	err := c.cc.Invoke(ctx, Control_UpdateActor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +132,16 @@ func (c *controlClient) SuspendActor(ctx context.Context, in *SuspendActorReques
 	return out, nil
 }
 
+func (c *controlClient) PauseActor(ctx context.Context, in *PauseActorRequest, opts ...grpc.CallOption) (*PauseActorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PauseActorResponse)
+	err := c.cc.Invoke(ctx, Control_PauseActor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlClient) ResumeActor(ctx context.Context, in *ResumeActorRequest, opts ...grpc.CallOption) (*ResumeActorResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ResumeActorResponse)
@@ -117,9 +152,9 @@ func (c *controlClient) ResumeActor(ctx context.Context, in *ResumeActorRequest,
 	return out, nil
 }
 
-func (c *controlClient) DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*DeleteActorResponse, error) {
+func (c *controlClient) DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*Actor, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(DeleteActorResponse)
+	out := new(Actor)
 	err := c.cc.Invoke(ctx, Control_DeleteActor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -147,10 +182,40 @@ func (c *controlClient) ListActors(ctx context.Context, in *ListActorsRequest, o
 	return out, nil
 }
 
-func (c *controlClient) DebugClear(ctx context.Context, in *DebugClearRequest, opts ...grpc.CallOption) (*DebugClearResponse, error) {
+func (c *controlClient) CreateAtespace(ctx context.Context, in *CreateAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(DebugClearResponse)
-	err := c.cc.Invoke(ctx, Control_DebugClear_FullMethodName, in, out, cOpts...)
+	out := new(Atespace)
+	err := c.cc.Invoke(ctx, Control_CreateAtespace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) GetAtespace(ctx context.Context, in *GetAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Atespace)
+	err := c.cc.Invoke(ctx, Control_GetAtespace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) ListAtespaces(ctx context.Context, in *ListAtespacesRequest, opts ...grpc.CallOption) (*ListAtespacesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListAtespacesResponse)
+	err := c.cc.Invoke(ctx, Control_ListAtespaces_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) DeleteAtespace(ctx context.Context, in *DeleteAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Atespace)
+	err := c.cc.Invoke(ctx, Control_DeleteAtespace_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -164,21 +229,31 @@ func (c *controlClient) DebugClear(ctx context.Context, in *DebugClearRequest, o
 // Control is the primary RPC interface for Agentic Substrate.
 type ControlServer interface {
 	// Get an Actor.
-	GetActor(context.Context, *GetActorRequest) (*GetActorResponse, error)
+	GetActor(context.Context, *GetActorRequest) (*Actor, error)
 	// Create a new Actor deriving from a given ActorTemplate.
-	CreateActor(context.Context, *CreateActorRequest) (*CreateActorResponse, error)
+	CreateActor(context.Context, *CreateActorRequest) (*Actor, error)
+	// Update mutable fields on an existing Actor.
+	UpdateActor(context.Context, *UpdateActorRequest) (*UpdateActorResponse, error)
 	// Suspend a given actor to a new snapshot.
 	SuspendActor(context.Context, *SuspendActorRequest) (*SuspendActorResponse, error)
+	// Pause a given actor and keep its snapshots on node VM.
+	PauseActor(context.Context, *PauseActorRequest) (*PauseActorResponse, error)
 	// Resume an actor from its latest snapshot.
 	ResumeActor(context.Context, *ResumeActorRequest) (*ResumeActorResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
-	DeleteActor(context.Context, *DeleteActorRequest) (*DeleteActorResponse, error)
+	DeleteActor(context.Context, *DeleteActorRequest) (*Actor, error)
 	// List all workers currently reflected in redis.
 	ListWorkers(context.Context, *ListWorkersRequest) (*ListWorkersResponse, error)
 	// List all actors currently reflected in redis.
 	ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error)
-	// Debugging: drop all data from the ate database.
-	DebugClear(context.Context, *DebugClearRequest) (*DebugClearResponse, error)
+	// Create a new Atespace. Substrate-native, stored in Redis.
+	CreateAtespace(context.Context, *CreateAtespaceRequest) (*Atespace, error)
+	// Get an Atespace by name.
+	GetAtespace(context.Context, *GetAtespaceRequest) (*Atespace, error)
+	// List all Atespaces.
+	ListAtespaces(context.Context, *ListAtespacesRequest) (*ListAtespacesResponse, error)
+	// Delete an empty Atespace. Rejects (FailedPrecondition) if any actors remain.
+	DeleteAtespace(context.Context, *DeleteAtespaceRequest) (*Atespace, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -189,19 +264,25 @@ type ControlServer interface {
 // pointer dereference when methods are called.
 type UnimplementedControlServer struct{}
 
-func (UnimplementedControlServer) GetActor(context.Context, *GetActorRequest) (*GetActorResponse, error) {
+func (UnimplementedControlServer) GetActor(context.Context, *GetActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetActor not implemented")
 }
-func (UnimplementedControlServer) CreateActor(context.Context, *CreateActorRequest) (*CreateActorResponse, error) {
+func (UnimplementedControlServer) CreateActor(context.Context, *CreateActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateActor not implemented")
+}
+func (UnimplementedControlServer) UpdateActor(context.Context, *UpdateActorRequest) (*UpdateActorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateActor not implemented")
 }
 func (UnimplementedControlServer) SuspendActor(context.Context, *SuspendActorRequest) (*SuspendActorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SuspendActor not implemented")
 }
+func (UnimplementedControlServer) PauseActor(context.Context, *PauseActorRequest) (*PauseActorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PauseActor not implemented")
+}
 func (UnimplementedControlServer) ResumeActor(context.Context, *ResumeActorRequest) (*ResumeActorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResumeActor not implemented")
 }
-func (UnimplementedControlServer) DeleteActor(context.Context, *DeleteActorRequest) (*DeleteActorResponse, error) {
+func (UnimplementedControlServer) DeleteActor(context.Context, *DeleteActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteActor not implemented")
 }
 func (UnimplementedControlServer) ListWorkers(context.Context, *ListWorkersRequest) (*ListWorkersResponse, error) {
@@ -210,8 +291,17 @@ func (UnimplementedControlServer) ListWorkers(context.Context, *ListWorkersReque
 func (UnimplementedControlServer) ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListActors not implemented")
 }
-func (UnimplementedControlServer) DebugClear(context.Context, *DebugClearRequest) (*DebugClearResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method DebugClear not implemented")
+func (UnimplementedControlServer) CreateAtespace(context.Context, *CreateAtespaceRequest) (*Atespace, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateAtespace not implemented")
+}
+func (UnimplementedControlServer) GetAtespace(context.Context, *GetAtespaceRequest) (*Atespace, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetAtespace not implemented")
+}
+func (UnimplementedControlServer) ListAtespaces(context.Context, *ListAtespacesRequest) (*ListAtespacesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListAtespaces not implemented")
+}
+func (UnimplementedControlServer) DeleteAtespace(context.Context, *DeleteAtespaceRequest) (*Atespace, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteAtespace not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -270,6 +360,24 @@ func _Control_CreateActor_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_UpdateActor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).UpdateActor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_UpdateActor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).UpdateActor(ctx, req.(*UpdateActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Control_SuspendActor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SuspendActorRequest)
 	if err := dec(in); err != nil {
@@ -284,6 +392,24 @@ func _Control_SuspendActor_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControlServer).SuspendActor(ctx, req.(*SuspendActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_PauseActor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).PauseActor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_PauseActor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).PauseActor(ctx, req.(*PauseActorRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -360,20 +486,74 @@ func _Control_ListActors_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Control_DebugClear_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DebugClearRequest)
+func _Control_CreateAtespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateAtespaceRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(ControlServer).DebugClear(ctx, in)
+		return srv.(ControlServer).CreateAtespace(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Control_DebugClear_FullMethodName,
+		FullMethod: Control_CreateAtespace_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ControlServer).DebugClear(ctx, req.(*DebugClearRequest))
+		return srv.(ControlServer).CreateAtespace(ctx, req.(*CreateAtespaceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_GetAtespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAtespaceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetAtespace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetAtespace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetAtespace(ctx, req.(*GetAtespaceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_ListAtespaces_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAtespacesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).ListAtespaces(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_ListAtespaces_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).ListAtespaces(ctx, req.(*ListAtespacesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_DeleteAtespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteAtespaceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).DeleteAtespace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_DeleteAtespace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).DeleteAtespace(ctx, req.(*DeleteAtespaceRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -394,8 +574,16 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_CreateActor_Handler,
 		},
 		{
+			MethodName: "UpdateActor",
+			Handler:    _Control_UpdateActor_Handler,
+		},
+		{
 			MethodName: "SuspendActor",
 			Handler:    _Control_SuspendActor_Handler,
+		},
+		{
+			MethodName: "PauseActor",
+			Handler:    _Control_PauseActor_Handler,
 		},
 		{
 			MethodName: "ResumeActor",
@@ -414,8 +602,130 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_ListActors_Handler,
 		},
 		{
+			MethodName: "CreateAtespace",
+			Handler:    _Control_CreateAtespace_Handler,
+		},
+		{
+			MethodName: "GetAtespace",
+			Handler:    _Control_GetAtespace_Handler,
+		},
+		{
+			MethodName: "ListAtespaces",
+			Handler:    _Control_ListAtespaces_Handler,
+		},
+		{
+			MethodName: "DeleteAtespace",
+			Handler:    _Control_DeleteAtespace_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "ateapi.proto",
+}
+
+const (
+	Debug_DebugClear_FullMethodName = "/ateapi.Debug/DebugClear"
+)
+
+// DebugClient is the client API for Debug service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Debug is the RPC interface for administrative and debugging operations
+// (such as wiping state during development).
+type DebugClient interface {
+	// Debugging: drop all data from the ate database.
+	DebugClear(ctx context.Context, in *DebugClearRequest, opts ...grpc.CallOption) (*DebugClearResponse, error)
+}
+
+type debugClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewDebugClient(cc grpc.ClientConnInterface) DebugClient {
+	return &debugClient{cc}
+}
+
+func (c *debugClient) DebugClear(ctx context.Context, in *DebugClearRequest, opts ...grpc.CallOption) (*DebugClearResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DebugClearResponse)
+	err := c.cc.Invoke(ctx, Debug_DebugClear_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DebugServer is the server API for Debug service.
+// All implementations must embed UnimplementedDebugServer
+// for forward compatibility.
+//
+// Debug is the RPC interface for administrative and debugging operations
+// (such as wiping state during development).
+type DebugServer interface {
+	// Debugging: drop all data from the ate database.
+	DebugClear(context.Context, *DebugClearRequest) (*DebugClearResponse, error)
+	mustEmbedUnimplementedDebugServer()
+}
+
+// UnimplementedDebugServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedDebugServer struct{}
+
+func (UnimplementedDebugServer) DebugClear(context.Context, *DebugClearRequest) (*DebugClearResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DebugClear not implemented")
+}
+func (UnimplementedDebugServer) mustEmbedUnimplementedDebugServer() {}
+func (UnimplementedDebugServer) testEmbeddedByValue()               {}
+
+// UnsafeDebugServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to DebugServer will
+// result in compilation errors.
+type UnsafeDebugServer interface {
+	mustEmbedUnimplementedDebugServer()
+}
+
+func RegisterDebugServer(s grpc.ServiceRegistrar, srv DebugServer) {
+	// If the following call panics, it indicates UnimplementedDebugServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Debug_ServiceDesc, srv)
+}
+
+func _Debug_DebugClear_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DebugClearRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DebugServer).DebugClear(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Debug_DebugClear_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DebugServer).DebugClear(ctx, req.(*DebugClearRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Debug_ServiceDesc is the grpc.ServiceDesc for Debug service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Debug_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "ateapi.Debug",
+	HandlerType: (*DebugServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
 			MethodName: "DebugClear",
-			Handler:    _Control_DebugClear_Handler,
+			Handler:    _Debug_DebugClear_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

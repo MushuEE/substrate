@@ -42,12 +42,13 @@ demo-counter_deploy() {
   # with a tight readiness deadline -- run against an already-warm node instead
   # of racing that cold-start work.
   log_step "Waiting for counter demo to be ready..."
-  run_kubectl rollout status deployment/counter-deployment -n ate-demo-counter --timeout=300s
+  run_kubectl rollout status deployment/counter -n ate-demo-counter --timeout=300s
   run_kubectl wait --for=condition=Ready actortemplate/counter -n ate-demo-counter --timeout=300s
 }
 
 demo-counter_delete() {
   log_step "demo-counter_delete"
+  delete_demo_actors ate-demo-counter counter
   sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/counter/counter.yaml.tmpl \
     | run_kubectl delete --ignore-not-found -f -
 }

@@ -78,11 +78,15 @@ demo-claude-code-multiplex_deploy() {
       -e "s|\${ANTHROPIC_API_KEY}|${ANTHROPIC_API_KEY}|g" \
       -e "s|\${WORKLOAD_IMAGE}|${workload_image}|g" \
       demos/claude-code-multiplex/claude-code-multiplex.yaml.tmpl \
-    | run_kubectl apply -f -
+    | run_ko apply -f -
 }
 
 demo-claude-code-multiplex_delete() {
   log_step "demo-claude-code-multiplex_delete"
+  delete_demo_actors \
+    claude-multiplex-demo agent-luna \
+    claude-multiplex-demo agent-mars \
+    claude-multiplex-demo agent-orion
   # Delete-time substitution doesn't need a real image — k8s identifies
   # resources by metadata, not container spec. Use placeholders so sed
   # produces valid YAML even when the env vars aren't set.

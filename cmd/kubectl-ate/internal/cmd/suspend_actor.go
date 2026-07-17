@@ -23,8 +23,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var suspendAtespaceFlag string
+
 var suspendActorCmd = &cobra.Command{
-	Use:   "actor [actor-id]",
+	Use:   "actor <actor-name>",
 	Short: "Suspend an actor",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -36,7 +38,7 @@ var suspendActorCmd = &cobra.Command{
 		defer apiClient.Close()
 
 		resp, err := apiClient.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-			ActorId: args[0],
+			Actor: &ateapipb.ObjectRef{Atespace: suspendAtespaceFlag, Name: args[0]},
 		})
 		if err != nil {
 			return fmt.Errorf("failed to suspend actor: %w", err)
@@ -47,5 +49,7 @@ var suspendActorCmd = &cobra.Command{
 }
 
 func init() {
+	suspendActorCmd.Flags().StringVarP(&suspendAtespaceFlag, "atespace", "a", "", "Atespace the actor lives in")
+	_ = suspendActorCmd.MarkFlagRequired("atespace")
 	suspendCmd.AddCommand(suspendActorCmd)
 }

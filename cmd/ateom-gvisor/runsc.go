@@ -28,33 +28,36 @@ import (
 )
 
 type runsc struct {
-	path                   string
-	actorTemplateNamespace string
-	actorTemplateName      string
-	actorID                string
+	path     string
+	actorUID string
 }
 
-func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string) error {
+func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
 	reapLock.RLock()
 	defer reapLock.RUnlock()
 
 	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
+		// "-debug-log", ateompath.RunscDebugLogDir(r.actorUID, containerName) + "/",
 		// "-debug-to-user-log",
 		// "-log-packets",
 		// "-strace",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"create",
-		"-bundle", ateompath.OCIBundlePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
-		"-pid-file", ateompath.PIDFilePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
-		containerName, // Name of the container
+		"-bundle", ateompath.OCIBundlePath(r.actorUID, containerName),
+		"-pid-file", ateompath.PIDFilePath(r.actorUID, containerName),
+	}
+
+	args = append(args, additionalArgs...)
+	args = append(args, containerName) // Name of the container
+	cmd := exec.CommandContext(
+		ctx,
+		r.path,
+		args...,
 	)
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -79,12 +82,12 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
+		// "-debug-log", ateompath.RunscDebugLogDir(r.actorUID, containerName)+"/",
 		// "-debug-to-user-log",
 		// "-log-packets",
 		// "-strace",
 		"-allow-connected-on-save",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"start",
 		containerName, // Name of the container
 	)
@@ -111,11 +114,11 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
+		// "-debug-log", ateompath.RunscDebugLogDir(r.actorUID, containerName)+"/",
 		// "-debug-to-user-log",
 		// "-log-packets",
 		// "-strace",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"checkpoint",
 		"-image-path", checkpointPath,
 		containerName, // Name of the container
@@ -125,6 +128,45 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("while running `runsc checkpoint`: %w", err)
+	}
+	return nil
+}
+
+func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
+	reapLock.RLock()
+	defer reapLock.RUnlock()
+
+	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
+
+	args := []string{
+		"-log-format", "json",
+		"--alsologtostderr",
+		// "-debug",
+		// "-debug-log", ateompath.RunscDebugLogDir(r.actorUID, containerName)+"/",
+		// "-debug-to-user-log",
+		// "-log-packets",
+		// "-strace",
+		"-root", ateompath.RunSCStateDir(r.actorUID),
+		"fscheckpoint",
+		"-image-path", checkpointPath,
+	}
+	for _, ddv := range durableDirMounts {
+		args = append(args, "-path", ddv)
+	}
+
+	// name of the container must be the last parameter.
+	args = append(args, containerName)
+
+	cmd := exec.CommandContext(
+		ctx,
+		r.path,
+		args...,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("while running `runsc fscheckpoint`: %w", err)
 	}
 	return nil
 }
@@ -143,15 +185,15 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
+		// "-debug-log", ateompath.RunscDebugLogDir(r.actorUID, containerName)+"/",
 		// "-debug-to-user-log",
 		// "-log-packets",
 		// "-strace",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"restore",
-		"-bundle", ateompath.OCIBundlePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
+		"-bundle", ateompath.OCIBundlePath(r.actorUID, containerName),
 		"-image-path", checkpointPath,
-		"-pid-file", ateompath.PIDFilePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
+		"-pid-file", ateompath.PIDFilePath(r.actorUID, containerName),
 		"-background",
 		"-direct",
 		"-detach",
@@ -178,7 +220,7 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"delete",
 		"-force",
 		containerName,
@@ -203,7 +245,7 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
+		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"state",
 		containerName,
 	)

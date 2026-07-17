@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
@@ -115,34 +116,49 @@ func runStep[Params any, Context any](ctx context.Context, params Params, wCtx C
 // ActorWorkflow handles the workflows for actor's resume / suspend operations.
 type ActorWorkflow struct {
 	store               store.Interface
+	workerCache         *workercache.Cache
 	dialer              *AteletDialer
 	actorTemplateLister listersv1alpha1.ActorTemplateLister
+	workerPoolLister    listersv1alpha1.WorkerPoolLister
+	sandboxConfigLister listersv1alpha1.SandboxConfigLister
 	kubeClient          kubernetes.Interface
 	secretCache         *envSecretCache
 }
 
 // NewActorWorkflow creates a new ActorWorkflow.
-func NewActorWorkflow(store store.Interface, dialer *AteletDialer, actorTemplateLister listersv1alpha1.ActorTemplateLister, kubeClient kubernetes.Interface) *ActorWorkflow {
+func NewActorWorkflow(
+	store store.Interface,
+	workerCache *workercache.Cache,
+	dialer *AteletDialer,
+	actorTemplateLister listersv1alpha1.ActorTemplateLister,
+	workerPoolLister listersv1alpha1.WorkerPoolLister,
+	sandboxConfigLister listersv1alpha1.SandboxConfigLister,
+	kubeClient kubernetes.Interface,
+) *ActorWorkflow {
 	return &ActorWorkflow{
 		store:               store,
+		workerCache:         workerCache,
 		dialer:              dialer,
 		actorTemplateLister: actorTemplateLister,
+		workerPoolLister:    workerPoolLister,
+		sandboxConfigLister: sandboxConfigLister,
 		kubeClient:          kubeClient,
 		secretCache:         newEnvSecretCache(envSecretCacheTTL),
 	}
 }
 
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent.
-func (w *ActorWorkflow) ResumeActor(ctx context.Context, id string, boot bool) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) ResumeActor(ctx context.Context, atespace, name string, boot bool) (*ateapipb.Actor, error) {
 	input := &ResumeInput{
-		ActorID: id,
-		Boot:    boot,
+		ActorName: name,
+		Atespace:  atespace,
+		Boot:      boot,
 	}
 	state := &ResumeState{}
 
 	// Acquire lock and get the timeout context for the workflow
-	// Lock TTL is 7 seconds, with 2 seconds padding for workflow timeout
-	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 30*time.Second, 2*time.Second)
+	// Lock TTL is 30 seconds, with 2 seconds padding for workflow timeout
+	ctx, releaseLock, err := w.acquireActorLock(ctx, atespace, name, 30*time.Second, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -150,8 +166,8 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, id string, boot bool) (
 
 	steps := []WorkflowStep[*ResumeInput, *ResumeState]{
 		&LoadActorForResumeStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
-		&AssignWorkerStep{store: w.store},
-		&CallAteletRestoreStep{dialer: w.dialer, kubeClient: w.kubeClient, secretCache: w.secretCache},
+		&AssignWorkerStep{store: w.store, workerCache: w.workerCache},
+		&CallAteletRestoreStep{store: w.store, dialer: w.dialer, kubeClient: w.kubeClient, secretCache: w.secretCache, workerPoolLister: w.workerPoolLister, sandboxConfigLister: w.sandboxConfigLister},
 		&FinalizeRunningStep{store: w.store},
 	}
 
@@ -163,15 +179,16 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, id string, boot bool) (
 }
 
 // SuspendActor executes the workflow to suspend a running actor. Idempotent.
-func (w *ActorWorkflow) SuspendActor(ctx context.Context, id string) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) SuspendActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error) {
 	input := &SuspendInput{
-		ActorID: id,
+		ActorName: name,
+		Atespace:  atespace,
 	}
 	state := &SuspendState{}
 
 	// Acquire lock and get the timeout context for the workflow
-	// Lock TTL is 7 seconds, with 2 seconds padding for workflow timeout
-	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 30*time.Second, 2*time.Second)
+	// Lock TTL is 30 seconds, with 2 seconds padding for workflow timeout
+	ctx, releaseLock, err := w.acquireActorLock(ctx, atespace, name, 30*time.Second, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +197,7 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, id string) (*ateapipb.
 	steps := []WorkflowStep[*SuspendInput, *SuspendState]{
 		&LoadActorForSuspendStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
 		&MarkSuspendingStep{store: w.store},
-		&CallAteletSuspendStep{dialer: w.dialer},
+		&CallAteletSuspendStep{store: w.store, dialer: w.dialer},
 		&FinalizeSuspendedStep{store: w.store},
 	}
 
@@ -191,8 +208,38 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, id string) (*ateapipb.
 	return state.Actor, nil
 }
 
-func (w *ActorWorkflow) acquireActorLock(ctx context.Context, id string, ttl time.Duration, padding time.Duration) (context.Context, func(), error) {
-	lockKey := "lock:actor:" + id
+// PauseActor executes the workflow to pause a running actor. Idempotent.
+func (w *ActorWorkflow) PauseActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error) {
+	input := &PauseInput{
+		ActorName: name,
+		Atespace:  atespace,
+	}
+	state := &PauseState{}
+
+	// Acquire lock and get the timeout context for the workflow
+	// Lock TTL is 30 seconds, with 2 seconds padding for workflow timeout
+	ctx, releaseLock, err := w.acquireActorLock(ctx, atespace, name, 30*time.Second, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLock()
+
+	steps := []WorkflowStep[*PauseInput, *PauseState]{
+		&LoadActorForPauseStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
+		&MarkPausingStep{store: w.store},
+		&CallAteletPauseStep{store: w.store, dialer: w.dialer},
+		&FinalizePausedStep{store: w.store},
+	}
+
+	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+		return nil, err
+	}
+
+	return state.Actor, nil
+}
+
+func (w *ActorWorkflow) acquireActorLock(ctx context.Context, atespace, name string, ttl time.Duration, padding time.Duration) (context.Context, func(), error) {
+	lockKey := "lock:actor:" + atespace + ":" + name
 	lockValue := uuid.New().String()
 
 	// Create a child context for the workflow that expires BEFORE the lock

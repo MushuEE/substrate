@@ -15,7 +15,7 @@
 // Package ateredis is an ate storage backend built on Redis.
 //
 // Actors are stored in keys of the form
-// `actor:<actor-id>`.  They are
+// `actor:<atespace>:<name>`.  They are
 // stored as DBActor JSON-serialized objects, which lets us manipulate them from
 // Redis lua.
 //
@@ -47,6 +47,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -54,15 +55,23 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+type workerPubSubMsg struct {
+	Type   int    `json:"t"`
+	Worker string `json:"w"` // protojson-encoded Worker
+}
 
 type redisClient interface {
 	redis.Cmdable
 	ForEachMaster(ctx context.Context, fn func(ctx context.Context, client *redis.Client) error) error
 	Watch(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error
+	Subscribe(ctx context.Context, channels ...string) *redis.PubSub
 }
 
 // Persistence is a service that stores information about applications in Redis.
@@ -79,12 +88,228 @@ func NewPersistence(redisClient *redis.ClusterClient) *Persistence {
 	}
 }
 
-func actorDBKey(id string) string {
-	return "actor:" + id
+func actorDBKey(atespace, name string) string {
+	return "actor:" + atespace + ":" + name
+}
+
+// actorScanPattern returns the SCAN match pattern for listing actors. An empty
+// atespace lists across all atespaces (actor:*); a non-empty atespace scopes the
+// scan to that atespace (actor:<atespace>:*).
+func actorScanPattern(atespace string) string {
+	if atespace == "" {
+		return "actor:*"
+	}
+	return "actor:" + atespace + ":*"
+}
+
+func atespaceDBKey(name string) string {
+	return "atespace:" + name
+}
+
+func (s *Persistence) CreateAtespace(ctx context.Context, atespace *ateapipb.Atespace) (*ateapipb.Atespace, error) {
+	dbKey := atespaceDBKey(atespace.GetMetadata().GetName())
+
+	dbAtespace := proto.Clone(atespace).(*ateapipb.Atespace)
+	// Atespace is global-scoped: identity is the name alone (atespace stays empty).
+	dbAtespace.Metadata = newCreateMetadata("", atespace.GetMetadata().GetName())
+
+	dbBytes, err := protojson.Marshal(dbAtespace)
+	if err != nil {
+		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
+	}
+	ok, err := s.rdb.SetNX(ctx, dbKey, dbBytes, 0).Result()
+	if err != nil {
+		return nil, fmt.Errorf("while executing redis set: %w", err)
+	}
+	if !ok {
+		return nil, store.ErrAlreadyExists
+	}
+	return dbAtespace, nil
+}
+
+func (s *Persistence) GetAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error) {
+	dbKey := atespaceDBKey(name)
+	dbBytes, err := s.rdb.Get(ctx, dbKey).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("while getting atespace key %q: %w", dbKey, err)
+	}
+	atespace := &ateapipb.Atespace{}
+	if err := protojson.Unmarshal(dbBytes, atespace); err != nil {
+		return nil, fmt.Errorf("while unmarshaling atespace: %w", err)
+	}
+	if atespace.GetMetadata().GetName() != name {
+		return nil, fmt.Errorf("(impossible) mismatch between stored name and key %q", dbKey)
+	}
+	return atespace, nil
+}
+
+// AtespaceExists reports whether the atespace object exists. This is a plain
+// EXISTS check and is NOT atomic with respect to a concurrent DeleteAtespace.
+func (s *Persistence) AtespaceExists(ctx context.Context, name string) (bool, error) {
+	n, err := s.rdb.Exists(ctx, atespaceDBKey(name)).Result()
+	if err != nil {
+		return false, fmt.Errorf("while checking atespace existence: %w", err)
+	}
+	return n > 0, nil
+}
+
+func (s *Persistence) ListAtespaces(ctx context.Context) ([]*ateapipb.Atespace, error) {
+	var result []*ateapipb.Atespace
+	var mu sync.Mutex
+
+	err := s.rdb.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+		iter := master.Scan(ctx, 0, "atespace:*", 0).Iterator()
+		for iter.Next(ctx) {
+			key := iter.Val()
+			getCmd := master.Get(ctx, key)
+			if getCmd.Err() != nil {
+				return fmt.Errorf("while getting atespace %q: %w", key, getCmd.Err())
+			}
+			atespace := &ateapipb.Atespace{}
+			if err := protojson.Unmarshal([]byte(getCmd.Val()), atespace); err != nil {
+				return fmt.Errorf("in protojson.Unmarshal: %w", err)
+			}
+			mu.Lock()
+			result = append(result, atespace)
+			mu.Unlock()
+		}
+		if err := iter.Err(); err != nil {
+			return fmt.Errorf("error from iterator: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("while iterating all redis master: %w", err)
+	}
+	return result, nil
+}
+
+// DeleteAtespace deletes an empty atespace. Returns store.ErrNotFound if the
+// atespace does not exist, or store.ErrFailedPrecondition if any actor still
+// lives in it.
+func (s *Persistence) DeleteAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error) {
+	dbKey := atespaceDBKey(name)
+
+	// Read first, so a missing atespace returns NotFound (not a silent no-op) and
+	// so we can return the deleted resource.
+	currentVal, err := s.rdb.Get(ctx, dbKey).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("while getting atespace key %q: %w", dbKey, err)
+	}
+
+	deleted := &ateapipb.Atespace{}
+	if err := protojson.Unmarshal(currentVal, deleted); err != nil {
+		return nil, fmt.Errorf("in protojson.Unmarshal: %w", err)
+	}
+
+	// Reject a non-empty atespace.
+	actors, _, err := s.ListActors(ctx, name, 1, "")
+	if err != nil {
+		return nil, fmt.Errorf("while checking atespace emptiness: %w", err)
+	}
+	if len(actors) > 0 {
+		return nil, store.ErrFailedPrecondition
+	}
+
+	if err := s.rdb.Del(ctx, dbKey).Err(); err != nil {
+		return nil, fmt.Errorf("while deleting atespace key %q: %w", dbKey, err)
+	}
+	return deleted, nil
 }
 
 func workerDBKey(namespace, poolName, podName string) string {
 	return "worker:" + namespace + ":" + poolName + ":" + podName
+}
+
+func marshalWorkerEvent(eventType store.WorkerEventType, worker *ateapipb.Worker) (string, error) {
+	workerJSON, err := protojson.Marshal(worker)
+	if err != nil {
+		return "", fmt.Errorf("in protojson.Marshal: %w", err)
+	}
+	msg, err := json.Marshal(workerPubSubMsg{Type: int(eventType), Worker: string(workerJSON)})
+	if err != nil {
+		return "", fmt.Errorf("in json.Marshal: %w", err)
+	}
+	return string(msg), nil
+}
+
+func unmarshalWorkerEvent(payload string) (store.WorkerEvent, error) {
+	var msg workerPubSubMsg
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+		return store.WorkerEvent{}, fmt.Errorf("in json.Unmarshal: %w", err)
+	}
+	worker := &ateapipb.Worker{}
+	if err := protojson.Unmarshal([]byte(msg.Worker), worker); err != nil {
+		return store.WorkerEvent{}, fmt.Errorf("in protojson.Unmarshal: %w", err)
+	}
+	return store.WorkerEvent{Type: store.WorkerEventType(msg.Type), Worker: worker}, nil
+}
+
+const workerPubSubChannel = "worker-changes"
+
+// subscribeConfirmTimeout bounds WatchWorkers' wait for the SUBSCRIBE
+// confirmation.
+const subscribeConfirmTimeout = 5 * time.Second
+
+func (s *Persistence) publishWorkerEvent(ctx context.Context, eventType store.WorkerEventType, worker *ateapipb.Worker) {
+	payload, err := marshalWorkerEvent(eventType, worker)
+	if err != nil {
+		slog.ErrorContext(ctx, "worker event marshal failed", slog.Any("err", err))
+		return
+	}
+	if err := s.rdb.Publish(ctx, workerPubSubChannel, payload).Err(); err != nil {
+		slog.ErrorContext(ctx, "worker event publish failed", slog.Any("err", err))
+	}
+}
+
+func (s *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, error) {
+	// watchCtx scopes the subscription's lifetime: it is cancelled either by the
+	// caller via WorkerWatch.Close or when the parent ctx is cancelled.
+	watchCtx, cancel := context.WithCancel(ctx)
+	pubsub := s.rdb.Subscribe(watchCtx, workerPubSubChannel)
+	// Subscribe sends the SUBSCRIBE command asynchronously; wait for the
+	// confirmation reply so that events published after WatchWorkers returns
+	// are guaranteed to be delivered to this subscription.
+	receiveCtx, receiveCancel := context.WithTimeout(watchCtx, subscribeConfirmTimeout)
+	defer receiveCancel()
+	if _, err := pubsub.Receive(receiveCtx); err != nil {
+		pubsub.Close()
+		cancel()
+		return nil, fmt.Errorf("while confirming worker subscription: %w", err)
+	}
+	ch := make(chan store.WorkerEvent, 128)
+	go func() {
+		defer close(ch)
+		defer pubsub.Close()
+		msgCh := pubsub.Channel()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case msg, ok := <-msgCh:
+				if !ok {
+					return
+				}
+				event, err := unmarshalWorkerEvent(msg.Payload)
+				if err != nil {
+					slog.ErrorContext(ctx, "worker event unmarshal failed", slog.Any("err", err))
+					continue
+				}
+				select {
+				case ch <- event:
+				case <-watchCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return store.NewWorkerWatch(ch, cancel), nil
 }
 
 // DebugClearAll flushes all data from Redis.
@@ -101,8 +326,8 @@ func (s *Persistence) DebugClearAll(ctx context.Context) error {
 	return err
 }
 
-func (s *Persistence) GetActor(ctx context.Context, id string) (*ateapipb.Actor, error) {
-	dbKey := actorDBKey(id)
+func (s *Persistence) GetActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error) {
+	dbKey := actorDBKey(atespace, name)
 
 	dbActorBytes, err := s.rdb.Get(ctx, dbKey).Bytes()
 	if err != nil {
@@ -117,35 +342,35 @@ func (s *Persistence) GetActor(ctx context.Context, id string) (*ateapipb.Actor,
 		return nil, fmt.Errorf("while unmarshaling actor: %w", err)
 	}
 
-	if actor.GetActorId() != id {
-		return nil, fmt.Errorf("(impossible) mismatch between stored id and key id")
+	if actor.GetMetadata().GetName() != name || actor.GetMetadata().GetAtespace() != atespace {
+		return nil, fmt.Errorf("(impossible) mismatch between stored name/atespace and key")
 	}
 
 	return actor, nil
 }
 
-func (s *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) error {
-	dbKey := actorDBKey(actor.GetActorId())
+func (s *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error) {
+	dbKey := actorDBKey(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
 
-	// Clone because we will update the version field, and we don't want to
-	// stomp the caller's copy.
+	// Clone so we don't stomp the caller's copy, then attach fresh server-owned
+	// metadata carrying the caller-specified identity.
 	dbActor := proto.Clone(actor).(*ateapipb.Actor)
-	dbActor.Version = 1
+	dbActor.Metadata = newCreateMetadata(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
 
 	dbActorBytes, err := protojson.Marshal(dbActor)
 	if err != nil {
-		return fmt.Errorf("in protojson.Marshal: %w", err)
+		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
 	}
 
 	ok, err := s.rdb.SetNX(ctx, dbKey, dbActorBytes, 0).Result()
 	if err != nil {
-		return fmt.Errorf("while executing redis set: %w", err)
+		return nil, fmt.Errorf("while executing redis set: %w", err)
 	}
 	if !ok {
-		return store.ErrAlreadyExists
+		return nil, store.ErrAlreadyExists
 	}
 
-	return nil
+	return dbActor, nil
 }
 
 func (s *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker) error {
@@ -169,6 +394,7 @@ func (s *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker)
 		return store.ErrAlreadyExists
 	}
 
+	s.publishWorkerEvent(ctx, store.WorkerEventCreated, dbWorker)
 	return nil
 }
 
@@ -251,6 +477,7 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		return fmt.Errorf("while executing update worker transaction: %w", err)
 	}
 
+	s.publishWorkerEvent(ctx, store.WorkerEventUpdated, dbWorker)
 	return nil
 }
 
@@ -260,11 +487,16 @@ func (s *Persistence) DeleteWorker(ctx context.Context, namespace, pool, pod str
 	if err != nil {
 		return fmt.Errorf("while deleting worker key %q: %w", dbKey, err)
 	}
+	s.publishWorkerEvent(ctx, store.WorkerEventDeleted, &ateapipb.Worker{
+		WorkerNamespace: namespace,
+		WorkerPod:       pod,
+	})
 	return nil
 }
 
-func (s *Persistence) DeleteActor(ctx context.Context, id string) error {
-	dbKey := actorDBKey(id)
+func (s *Persistence) DeleteActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error) {
+	dbKey := actorDBKey(atespace, name)
+	var deleted *ateapipb.Actor
 	err := s.rdb.Watch(ctx, func(tx *redis.Tx) error {
 		currentVal, err := tx.Get(ctx, dbKey).Bytes()
 		if err != nil {
@@ -279,29 +511,33 @@ func (s *Persistence) DeleteActor(ctx context.Context, id string) error {
 			return fmt.Errorf("in protojson.Unmarshal: %w", err)
 		}
 
-		if currentActor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDED {
+		if currentActor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDED &&
+			currentActor.GetStatus() != ateapipb.Actor_STATUS_CRASHED {
 			return store.ErrFailedPrecondition
 		}
 
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		if _, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Del(ctx, dbKey)
 			return nil
-		})
-		return err
+		}); err != nil {
+			return err
+		}
+		deleted = currentActor
+		return nil
 	}, dbKey)
 
 	if err != nil {
 		if errors.Is(err, redis.TxFailedErr) {
-			return store.ErrPersistenceRetry
+			return nil, store.ErrPersistenceRetry
 		}
-		return err
+		return nil, err
 	}
 
-	return nil
+	return deleted, nil
 }
 
-func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) error {
-	dbKey := actorDBKey(actor.GetActorId())
+func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) (*ateapipb.Actor, error) {
+	dbKey := actorDBKey(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
 
 	// Clone because we will update the version field, and we don't want to
 	// stomp the caller's copy.
@@ -321,12 +557,14 @@ func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, ex
 			return fmt.Errorf("in protojson.Unmarshal: %w", err)
 		}
 
-		if currentActor.GetVersion() != expectedVersion {
+		if currentActor.GetMetadata().GetVersion() != expectedVersion {
 			return store.ErrPersistenceRetry
 		}
-		dbActor.Version = currentActor.GetVersion() + 1
-		if currentActor.GetActorId() != dbActor.GetActorId() {
-			return fmt.Errorf("actor_id is immutable")
+		if currentActor.GetMetadata().GetName() != dbActor.GetMetadata().GetName() {
+			return fmt.Errorf("name is immutable")
+		}
+		if currentActor.GetMetadata().GetAtespace() != dbActor.GetMetadata().GetAtespace() {
+			return fmt.Errorf("atespace is immutable")
 		}
 		if currentActor.GetActorTemplateNamespace() != dbActor.GetActorTemplateNamespace() {
 			return fmt.Errorf("actor_template_namespace is immutable")
@@ -334,6 +572,8 @@ func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, ex
 		if currentActor.GetActorTemplateName() != dbActor.GetActorTemplateName() {
 			return fmt.Errorf("actor_template_name is immutable")
 		}
+		// The stored metadata is authoritative; derive the next metadata from it.
+		dbActor.Metadata = newUpdateMetadata(currentActor.GetMetadata())
 
 		newVal, err := protojson.Marshal(dbActor)
 		if err != nil {
@@ -349,13 +589,14 @@ func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, ex
 
 	if err != nil {
 		if errors.Is(err, store.ErrPersistenceRetry) || errors.Is(err, redis.TxFailedErr) {
-			return store.ErrPersistenceRetry
+			return nil, store.ErrPersistenceRetry
 		}
-		return fmt.Errorf("while executing update actor transaction: %w", err)
+		return nil, fmt.Errorf("while executing update actor transaction: %w", err)
 	}
 
-	actor.Version = dbActor.Version
-	return nil
+	// dbActor is the persisted state (advanced version and update_time). The
+	// caller's input is left unmodified.
+	return dbActor, nil
 }
 
 func (s *Persistence) ListWorkers(ctx context.Context) ([]*ateapipb.Worker, error) {
@@ -426,7 +667,10 @@ func hashShardAddr(addr string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (s *Persistence) ListActors(ctx context.Context, pageSize int32, pageTokenStr string) ([]*ateapipb.Actor, string, error) {
+// ListActors lists actors, scoped to the given atespace. An empty atespace lists
+// across all atespaces (SCAN actor:*); a non-empty atespace restricts the scan to
+// that atespace (SCAN actor:<atespace>:*).
+func (s *Persistence) ListActors(ctx context.Context, atespace string, pageSize int32, pageTokenStr string) ([]*ateapipb.Actor, string, error) {
 	token, err := decodePageToken(pageTokenStr)
 	if err != nil {
 		return nil, "", fmt.Errorf("invalid page token: %w", err)
@@ -443,71 +687,50 @@ func (s *Persistence) ListActors(ctx context.Context, pageSize int32, pageTokenS
 	}
 
 	var result []*ateapipb.Actor
-	var nextToken string
-	stop := false
+	i := startIndex
+	cursor := token.Cursor
 
-	for i := startIndex; i < len(masters) && !stop; i++ {
+	for i < len(masters) && len(result) < int(pageSize) {
 		master := masters[i]
-		shardAddr := master.Options().Addr
-		cursor := uint64(0)
-		if i == startIndex && token.ShardHash != "" {
-			cursor = token.Cursor
+		remaining := int(pageSize) - len(result)
+
+		var keys []string
+		keys, cursor, err = master.Scan(ctx, cursor, actorScanPattern(atespace), int64(remaining)).Result()
+		if err != nil {
+			return nil, "", fmt.Errorf("while scanning shard %s: %w", master.Options().Addr, err)
 		}
 
-		for {
-			remaining := int(pageSize) - len(result)
-			if remaining <= 0 {
-				if cursor != 0 {
-					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hashShardAddr(shardAddr),
-						Cursor:    cursor,
-					})
-				} else if i+1 < len(masters) {
-					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hashShardAddr(masters[i+1].Options().Addr),
-						Cursor:    0,
-					})
-				} else {
-					nextToken = ""
-				}
-				stop = true
-				break
-			}
-
-			var keys []string
-			keys, cursor, err = master.Scan(ctx, cursor, "actor:*", int64(remaining)).Result()
+		if len(keys) > 0 {
+			actors, err := s.fetchActors(ctx, master, keys)
 			if err != nil {
-				return nil, "", fmt.Errorf("while scanning shard %s: %w", shardAddr, err)
+				return nil, "", err
 			}
-
-			if len(keys) > 0 {
-				actors, err := s.fetchActors(ctx, master, keys)
-				if err != nil {
-					return nil, "", err
-				}
-				result = append(result, actors...)
-			}
-
-			if cursor == 0 {
-				if i+1 < len(masters) {
-					nextToken = encodePageToken(listActorsPageToken{
-						ShardHash: hashShardAddr(masters[i+1].Options().Addr),
-						Cursor:    0,
-					})
-				} else {
-					nextToken = ""
-				}
-				break
-			}
+			result = append(result, actors...)
 		}
+
+		if cursor == 0 {
+			i++
+		}
+	}
+
+	var nextToken string
+	if i < len(masters) {
+		nextToken = encodePageToken(listActorsPageToken{
+			ShardHash: hashShardAddr(masters[i].Options().Addr),
+			Cursor:    cursor,
+		})
 	}
 
 	return result, nextToken, nil
 }
 
 func (s *Persistence) getSortedMasters(ctx context.Context) ([]*redis.Client, error) {
+	var mu sync.Mutex
 	var masters []*redis.Client
+	// ForEachMaster invokes the callback concurrently, one goroutine per master.
 	err := s.rdb.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+		mu.Lock()
+		defer mu.Unlock()
 		masters = append(masters, master)
 		return nil
 	})
@@ -588,4 +811,23 @@ func (s *Persistence) ReleaseLock(ctx context.Context, key string, value string)
 		return fmt.Errorf("while releasing lock for %q with value %q: %w", key, value, err)
 	}
 	return nil
+}
+
+func newCreateMetadata(atespace, name string) *ateapipb.ResourceMetadata {
+	now := timestamppb.Now()
+	return &ateapipb.ResourceMetadata{
+		Atespace:   atespace,
+		Name:       name,
+		Uid:        uuid.NewString(),
+		Version:    1,
+		CreateTime: now,
+		UpdateTime: now,
+	}
+}
+
+func newUpdateMetadata(current *ateapipb.ResourceMetadata) *ateapipb.ResourceMetadata {
+	next := proto.Clone(current).(*ateapipb.ResourceMetadata)
+	next.Version = current.GetVersion() + 1
+	next.UpdateTime = timestamppb.Now()
+	return next
 }

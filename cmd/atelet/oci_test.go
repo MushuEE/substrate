@@ -20,8 +20,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 )
 
 type tarEntry struct {
@@ -78,6 +82,169 @@ func runUntar(t *testing.T, entries []tarEntry) (string, error) {
 	t.Helper()
 	dir := t.TempDir()
 	return dir, untar(context.Background(), bytes.NewReader(buildTar(t, entries)), dir)
+}
+
+// With an identity dir, a read-only bind mount appears at IdentityMountPath.
+func TestBuildActorOCISpec_IdentityMount(t *testing.T) {
+	spec := buildActorOCISpec(
+		"actor_uid",
+		nil,
+		[]string{"/app"},
+		[]string{"FOO=bar"},
+		map[string]string{"k": "v"},
+		"/run/netns/x",
+		"/host/actors/actor_uid/identity",
+		nil,
+	)
+	found := false
+	for _, m := range spec.Mounts {
+		if m.Destination != IdentityMountPath {
+			continue
+		}
+		found = true
+		if m.Source != "/host/actors/actor_uid/identity" {
+			t.Errorf("identity mount source = %q, want the per-actor identity dir", m.Source)
+		}
+		if m.Type != "bind" {
+			t.Errorf("identity mount type = %q, want bind", m.Type)
+		}
+		if !slices.Contains(m.Options, "ro") {
+			t.Errorf("identity mount must be read-only, options=%v", m.Options)
+		}
+	}
+	if !found {
+		t.Fatalf("identity mount %q missing; mounts=%v", IdentityMountPath, spec.Mounts)
+	}
+}
+
+func TestMergeActorEnv(t *testing.T) {
+	defaultPath := "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+	tests := []struct {
+		name        string
+		imageEnv    []string
+		templateEnv []string
+		want        []string
+	}{
+		{
+			name:        "template overrides image by key",
+			imageEnv:    []string{"FOO=image"},
+			templateEnv: []string{"FOO=template"},
+			want:        []string{"FOO=template", defaultPath},
+		},
+		{
+			name:        "default PATH applies when neither sets it",
+			imageEnv:    []string{"FOO=image"},
+			templateEnv: []string{"BAR=template"},
+			want:        []string{"BAR=template", "FOO=image", defaultPath},
+		},
+		{
+			name:     "image PATH overrides default",
+			imageEnv: []string{"PATH=/image/bin"},
+			want:     []string{"PATH=/image/bin"},
+		},
+		{
+			name:        "template PATH overrides default",
+			templateEnv: []string{"PATH=/template/bin"},
+			want:        []string{"PATH=/template/bin"},
+		},
+		{
+			name:     "blank and keyless entries are dropped",
+			imageEnv: []string{"", "=novalue"},
+			want:     []string{defaultPath},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeActorEnv(tc.imageEnv, tc.templateEnv)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("mergeActorEnv(%v, %v) =\n  %v\nwant:\n  %v", tc.imageEnv, tc.templateEnv, got, tc.want)
+			}
+		})
+	}
+}
+
+// Without an identity dir (the pause container), no identity mount appears.
+func TestBuildActorOCISpec_NoIdentityMountForPause(t *testing.T) {
+	bare := buildActorOCISpec("actor_uid", nil, []string{"/pause"}, nil, nil, "/run/netns/x", "", nil)
+	for _, m := range bare.Mounts {
+		if m.Destination == IdentityMountPath {
+			t.Errorf("identity mount must be absent when identityDir is empty")
+		}
+	}
+}
+
+// Each durable-dir volume mount becomes a bind mount whose source is the
+// per-actor on-host DurableDirVolumeMountPoint for that volume name.
+func TestBuildActorOCISpec_DurableDirVolumeMounts(t *testing.T) {
+	const actorUID = "actor_uid"
+	durableDirs := []*ateletpb.VolumeMount{
+		{Name: "data", MountPath: "/var/data"},
+		{Name: "cache", MountPath: "/var/cache"},
+	}
+	spec := buildActorOCISpec(
+		actorUID,
+		nil, []string{"/app"}, nil, nil,
+		"/run/netns/x",
+		"",
+		durableDirs,
+	)
+
+	for _, vm := range durableDirs {
+		wantSrc := ateompath.DurableDirVolumeMountPoint(actorUID, vm.Name)
+		found := false
+		for _, m := range spec.Mounts {
+			if m.Destination != vm.MountPath {
+				continue
+			}
+			found = true
+			if m.Source != wantSrc {
+				t.Errorf("durable-dir %q source = %q, want %q", vm.Name, m.Source, wantSrc)
+			}
+			if m.Type != "bind" {
+				t.Errorf("durable-dir %q type = %q, want bind", vm.Name, m.Type)
+			}
+		}
+		if !found {
+			t.Fatalf("durable-dir mount for %q missing; mounts=%v", vm.MountPath, spec.Mounts)
+		}
+	}
+}
+
+func TestCreateMountPoint(t *testing.T) {
+	t.Run("creates target inside rootfs", func(t *testing.T) {
+		root := t.TempDir()
+		if err := createMountPoint(root, IdentityMountPath); err != nil {
+			t.Fatalf("createMountPoint: %v", err)
+		}
+		info, err := os.Stat(filepath.Join(root, "run", "ate"))
+		if err != nil {
+			t.Fatalf("mount point not created in rootfs: %v", err)
+		}
+		if !info.IsDir() {
+			t.Errorf("mount point must be a directory to host the identity bind mount")
+		}
+	})
+
+	t.Run("refuses symlink escaping the rootfs", func(t *testing.T) {
+		root := t.TempDir()
+		outside := t.TempDir()
+		// A malicious image could ship /run as a symlink pointing out of the
+		// rootfs; os.Root must refuse to follow it.
+		if err := os.Symlink(outside, filepath.Join(root, "run")); err != nil {
+			t.Fatalf("planting symlink: %v", err)
+		}
+		if err := createMountPoint(root, IdentityMountPath); err == nil {
+			t.Errorf("expected error when /run escapes the rootfs, got nil")
+		}
+		// Nothing may be created through the escaping symlink.
+		if entries, err := os.ReadDir(outside); err != nil {
+			t.Errorf("reading outside dir: %v", err)
+		} else if len(entries) != 0 {
+			t.Errorf("write escaped the rootfs: %s is not empty (%d entries)", outside, len(entries))
+		}
+	})
 }
 
 func TestValidateTarName(t *testing.T) {
@@ -330,6 +497,37 @@ func TestUntar_LaterEntryWins(t *testing.T) {
 			t.Errorf("bin/sh content was overwritten to %q (hardlink was not unlinked)", gotSh)
 		}
 	})
+}
+
+// A read-only directory in the image (e.g. ko ships /ko-app as 0555) must still
+// get its child written AND keep the image's mode, so atelet can unpack arbitrary
+// actor images as plain root without CAP_DAC_OVERRIDE. removeAllWritable must
+// then still be able to delete the restored read-only tree. (Meaningful as a
+// non-root test run; as root the dir-permission checks are bypassed.)
+func TestUntar_ReadOnlyDir(t *testing.T) {
+	entries := []tarEntry{
+		{name: "ko-app", typeflag: tar.TypeDir, mode: 0o555},
+		{name: "ko-app/counter", typeflag: tar.TypeReg, mode: 0o755, body: "bin"},
+	}
+	dir, err := runUntar(t, entries)
+	if err != nil {
+		t.Fatalf("untar into read-only dir: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "ko-app/counter")); string(got) != "bin" {
+		t.Errorf("ko-app/counter = %q, want %q", got, "bin")
+	}
+	info, err := os.Stat(filepath.Join(dir, "ko-app"))
+	if err != nil {
+		t.Fatalf("stat ko-app: %v", err)
+	}
+	if info.Mode().Perm() != 0o555 {
+		t.Errorf("ko-app mode = %v, want the image's 0555 preserved", info.Mode().Perm())
+	}
+	// atelet must be able to delete the restored read-only tree (this also lets
+	// t.TempDir's cleanup succeed, which plain os.RemoveAll could not on 0555).
+	if err := removeAllWritable(filepath.Join(dir, "ko-app")); err != nil {
+		t.Errorf("removeAllWritable on restored read-only dir: %v", err)
+	}
 }
 
 func TestUntar_PathTraversal(t *testing.T) {
