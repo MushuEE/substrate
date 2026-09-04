@@ -26,7 +26,7 @@ import (
 
 type ApiV1alpha1Interface interface {
 	RESTClient() rest.Interface
-	ActorTemplatesGetter
+	CSIDriverConfigsGetter
 	SandboxConfigsGetter
 	WorkerPoolsGetter
 }
@@ -36,8 +36,8 @@ type ApiV1alpha1Client struct {
 	restClient rest.Interface
 }
 
-func (c *ApiV1alpha1Client) ActorTemplates(namespace string) ActorTemplateInterface {
-	return newActorTemplates(c, namespace)
+func (c *ApiV1alpha1Client) CSIDriverConfigs() CSIDriverConfigInterface {
+	return newCSIDriverConfigs(c)
 }
 
 func (c *ApiV1alpha1Client) SandboxConfigs() SandboxConfigInterface {

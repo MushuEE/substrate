@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Worker pool for the counter demo. The ActorTemplate is not a CRD: it lives
+# in counter-template.yaml.tmpl and is created through the ate API with
+# `kubectl ate create actor-template`.
+
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -27,36 +31,30 @@ metadata:
   labels:
     workload: counter
 spec:
-  replicas: 5
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
-
----
-
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: counter
-  namespace: ate-demo-counter
-spec:
-  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
-  containers:
-  - name: counter
-    image: ko://github.com/agent-substrate/substrate/demos/counter
-    command: ["/ko-app/counter"]
-    readyz:
-      httpGet:
-        path: /readyz
-        port: 80
-    volumeMounts:
-    - name: data
-      mountPath: /home/counter
-  workerSelector:
-    matchLabels:
-      workload: counter
-  snapshotsConfig:
-    onPause: Full
-    onCommit: Data
-    location: gs://${BUCKET_NAME}/ate-demo-counter/
-  volumes:
-  - name: data
-    durableDir: {}
+  # Sized to what a small node (a single kind node in CI) can actually place,
+  # with one worker to spare: the only suites that run actors on this pool are
+  # networking and metrics, one actor each, and they can run concurrently. A
+  # pool that cannot place every replica is worse than a smaller one -- the
+  # deploy blocks on a rollout that never completes.
+  replicas: 3
+  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    # Per-worker resources: these size the worker POD and advertise its
+    # scheduling capacity (the per-actor ceiling). The sandbox itself is sized by
+    # the ActorTemplate's resources in counter-template.yaml.tmpl, not by these
+    # (see internal/sizing).
+    #
+    # Capacity comes from the limits (workerCapacity reads limits only), while the
+    # kube-scheduler packs nodes by the requests — so the CPU request is set well
+    # below the limit to keep the pool placeable alongside the rest of the install
+    # without changing what an actor is allowed to use. Memory is not
+    # compressible, so its request matches the limit.
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi

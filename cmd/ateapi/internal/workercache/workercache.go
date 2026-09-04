@@ -31,12 +31,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
+// relistPageSize is the page size used for the relist.
+const relistPageSize = 1000
+
 // Cache maintains an in-memory snapshot of all workers.
 //
 // TODO: add metrics — at minimum a gauge for worker count, a counter for
-// resync events, and a counter for failed PUBLISH operations (in ateredis).
+// resync events, and a counter for failed worker-watch notifications.
 type Cache struct {
-	store          store.Interface
+	store          workerListWatcher
 	relistInterval time.Duration
 
 	mu      sync.RWMutex
@@ -48,12 +51,19 @@ type Cache struct {
 // New creates a Cache backed by a given store. relistInterval controls how
 // often the cache performs a full ListWorkers to recover from state drifts
 // caused by missing WorkerWatch events.
-func New(store store.Interface, relistInterval time.Duration) *Cache {
+func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 	return &Cache{
 		store:          store,
 		relistInterval: relistInterval,
 		workers:        make(map[string]*ateapipb.Worker),
 	}
+}
+
+// workerListWatcher enumerates the exact storage methods needed by this
+// package and nothing more.
+type workerListWatcher interface {
+	WatchWorkers(ctx context.Context) (*store.WorkerWatch, error)
+	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Worker], error)
 }
 
 // Start syncs the cache synchronously, then spawns a background goroutine
@@ -86,6 +96,30 @@ func (c *Cache) Workers() ([]*ateapipb.Worker, error) {
 	return out, nil
 }
 
+// Worker returns the worker with the given name.
+func (c *Cache) Worker(name string) (*ateapipb.Worker, error) {
+	if !c.ready.Load() {
+		return nil, fmt.Errorf("worker cache not ready")
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	worker, ok := c.workers[name]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return worker, nil
+}
+
+// Forget removes a worker that a store write proved no longer exists. The
+// normal delete watch remains authoritative, but this closes the short race in
+// which scheduling selected a worker just after its row was deleted and before
+// the watch event reached the cache.
+func (c *Cache) Forget(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.workers, name)
+}
+
 func (c *Cache) sync(ctx context.Context) (*store.WorkerWatch, error) {
 	watch, err := c.store.WatchWorkers(ctx)
 	if err != nil {
@@ -99,9 +133,18 @@ func (c *Cache) sync(ctx context.Context) (*store.WorkerWatch, error) {
 }
 
 func (c *Cache) relist(ctx context.Context) error {
-	workers, err := c.store.ListWorkers(ctx)
-	if err != nil {
-		return fmt.Errorf("ListWorkers: %w", err)
+	var workers []*ateapipb.Worker
+	pageToken := ""
+	for {
+		page, err := c.store.ListWorkers(ctx, store.ListOptions{PageSize: relistPageSize, PageToken: pageToken})
+		if err != nil {
+			return fmt.Errorf("ListWorkers: %w", err)
+		}
+		workers = append(workers, page.Items...)
+		if !page.HasNextPage() {
+			break
+		}
+		pageToken = page.NextPageToken
 	}
 	newMap := make(map[string]*ateapipb.Worker, len(workers))
 	for _, w := range workers {
@@ -176,12 +219,12 @@ func (c *Cache) applyEvent(event store.WorkerEvent) {
 		delete(c.workers, key)
 	case store.WorkerEventCreated, store.WorkerEventUpdated:
 		existing, ok := c.workers[key]
-		if !ok || event.Worker.GetVersion() >= existing.GetVersion() {
+		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.GetMetadata().GetVersion() {
 			c.workers[key] = event.Worker
 		}
 	}
 }
 
 func workerKey(w *ateapipb.Worker) string {
-	return w.GetWorkerNamespace() + ":" + w.GetWorkerPod()
+	return w.GetMetadata().GetName()
 }

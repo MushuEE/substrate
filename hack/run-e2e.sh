@@ -45,6 +45,7 @@ Common E2E Flags (passed after -args):
   --no-color       Disable colored output
   --kube-config    Path to kubeconfig file
   --kube-context   Kubernetes context to use
+  --storage-class  StorageClass to use for external volume tests (default: csi-nfs-sc)
 
 Common Go Test Flags (passed before -args):
   -run <regexp>    Run only tests matching regexp
@@ -103,5 +104,5 @@ if [[ -n "${KUBECTL_CONTEXT:-}" ]]; then
     extra_e2e_args+=("--kube-context" "${KUBECTL_CONTEXT}")
 fi
 
-exec go test -v "$target_path" "${go_test_args[@]}" -args --e2e "${extra_e2e_args[@]}" "${e2e_args[@]}"
+exec go test -v "$target_path" ${go_test_args[@]+"${go_test_args[@]}"} -args --e2e ${extra_e2e_args[@]+"${extra_e2e_args[@]}"} ${e2e_args[@]+"${e2e_args[@]}"}
 

@@ -18,22 +18,48 @@ import (
 	"context"
 	goflag "flag"
 	"fmt"
+	"os"
+	"sync"
 	"testing"
 
 	"github.com/spf13/pflag"
 )
 
 var (
-	RunE2E      bool
-	KubeConfig  string
-	KubeContext string
+	RunE2E       bool
+	KubeConfig   string
+	KubeContext  string
+	StorageClass string
 )
+
+var (
+	suiteCleanupsMu sync.Mutex
+	suiteCleanups   []func()
+)
+
+func RegisterSuiteCleanup(fn func()) {
+	suiteCleanupsMu.Lock()
+	defer suiteCleanupsMu.Unlock()
+	suiteCleanups = append(suiteCleanups, fn)
+}
+
+func runSuiteCleanups() {
+	suiteCleanupsMu.Lock()
+	fns := suiteCleanups
+	suiteCleanups = nil
+	suiteCleanupsMu.Unlock()
+
+	for i := len(fns) - 1; i >= 0; i-- {
+		fns[i]()
+	}
+}
 
 func bindFlags() {
 	pflag.BoolVar(&RunE2E, "e2e", false, "run e2e tests")
 	pflag.BoolVar(&NoColor, "no-color", false, "disable colors in output")
 	pflag.StringVar(&KubeConfig, "kube-config", "", "Location of the kubeconfig")
 	pflag.StringVar(&KubeContext, "kube-context", "", "Kubernetes context to use")
+	pflag.StringVar(&StorageClass, "storage-class", "csi-nfs-sc", "StorageClass to use for external volume tests")
 }
 
 // RunTestMain should be used to run your e2e test suite.
@@ -41,6 +67,10 @@ func RunTestMain(m *testing.M) int {
 	bindFlags()
 	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	pflag.Parse()
+	if err := pflag.ParseSkippedFlags(os.Args[1:], goflag.CommandLine); err != nil {
+		fmt.Printf("Failed to parse Go test flags: %v\n", err)
+		return 1
+	}
 
 	if !RunE2E {
 		fmt.Println(Colorf(`
@@ -71,7 +101,17 @@ func runAndCleanup(m *testing.M) int {
 		return 1
 	}
 
-	defer CleanupNamespaces()
-
-	return m.Run()
+	// Namespaces are deleted only on success. A failed run keeps them: the actor
+	// lives in a worker pod there, and its ateom logs (for a micro-VM worker, the
+	// guest's console tail too) are the only record of why it failed. Deleting the
+	// namespace takes those pods with it before anyone — a developer or CI's
+	// post-failure log dump — can read them.
+	code := m.Run()
+	runSuiteCleanups()
+	if code != 0 {
+		RetainNamespaces()
+		return code
+	}
+	CleanupNamespaces()
+	return code
 }

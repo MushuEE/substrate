@@ -19,9 +19,35 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// WorkerPoolPodTemplate defines optional scheduling and resource settings for
-// worker pods. NodeAffinity is mapped to spec.affinity.nodeAffinity on the pod.
+// WorkerPoolLabelValue is a Kubernetes label value for generated worker
+// workloads.
+//
+// +kubebuilder:validation:MaxLength=63
+// +kubebuilder:validation:Pattern=`^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$`
+type WorkerPoolLabelValue string
+
+// WorkerPoolPodTemplate defines optional metadata, scheduling, and resource
+// settings for worker workloads. NodeAffinity is mapped to
+// spec.affinity.nodeAffinity on the pod.
 type WorkerPoolPodTemplate struct {
+	// Labels are added to the generated Deployment and worker pods. Keys in
+	// the ate.dev domain and its subdomains are reserved for controllers.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(key, !key.startsWith('ate.dev/') && !key.contains('.ate.dev/'))",message="ate.dev and its subdomains are reserved"
+	// +kubebuilder:validation:XValidation:rule="self.all(key, !format.qualifiedName().validate(key).hasValue())",message="label keys must be valid Kubernetes qualified names"
+	Labels map[string]WorkerPoolLabelValue `json:"labels,omitempty"`
+
+	// Annotations are added to the generated Deployment and worker pods. Keys
+	// in the ate.dev domain and its subdomains are reserved for controllers.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(key, !key.startsWith('ate.dev/') && !key.contains('.ate.dev/'))",message="ate.dev and its subdomains are reserved"
+	// +kubebuilder:validation:XValidation:rule="self.all(key, !format.qualifiedName().validate(key).hasValue())",message="annotation keys must be valid Kubernetes qualified names"
+	Annotations map[string]string `json:"annotations,omitempty"`
+
 	// NodeSelector is a selector which must be true for the pod to fit on a node.
 	//
 	// +optional
@@ -57,20 +83,21 @@ type WorkerPoolSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas"`
 
-	// AteomImage is the ateom container image to deploy as workers.
+	// WorkerImage is the ateom container image to deploy as workers.
 	// +kubebuilder:validation:MinLength=1
 	// +required
-	AteomImage string `json:"ateomImage"`
+	WorkerImage string `json:"workerImage"`
 
-	// Template holds optional pod scheduling and resource settings for worker pods.
+	// Template holds optional metadata, scheduling, and resource settings for worker workloads.
 	//
 	// +optional
 	Template *WorkerPoolPodTemplate `json:"template,omitempty"`
 
 	// SandboxClass selects the sandbox runtime family for this pool, which drives
-	// the worker pod shape (KVM/vhost device mounts and node placement) and which
-	// SandboxConfigs are eligible. The concrete binary is still selected by
-	// AteomImage. Defaults to gvisor.
+	// the worker pod shape (KVM/vhost device mounts and node placement). The
+	// concrete binary is still selected by WorkerImage. Defaults to gvisor.
+	// The sandbox binaries themselves come from the SandboxConfig each
+	// ActorTemplate names (required).
 	//
 	// See Also: TODOs in ActorTemplate SandboxClass
 	//
@@ -78,14 +105,6 @@ type WorkerPoolSpec struct {
 	// +kubebuilder:validation:Enum=gvisor;microvm
 	// +kubebuilder:default=gvisor
 	SandboxClass SandboxClass `json:"sandboxClass,omitempty"`
-
-	// SandboxConfigName names a cluster-scoped SandboxConfig to use for fetching
-	// sandbox binaries. It overrides the cluster-wide default SandboxConfig for
-	// this pool's SandboxClass. The referenced config's SandboxClass must match
-	// this pool's SandboxClass. If empty, the default SandboxConfig for the
-	// SandboxClass is used.
-	// +optional
-	SandboxConfigName string `json:"sandboxConfigName,omitempty"`
 }
 
 type WorkerPoolStatus struct {
@@ -93,6 +112,15 @@ type WorkerPoolStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Replicas int32 `json:"replicas"`
+
+	// ReadyReplicas is the number of ready worker pods.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// Selector is the label selector for the worker pods.
+	// +optional
+	Selector string `json:"selector,omitempty"`
 }
 
 // WorkerPool is the Schema for the workerpools API
@@ -101,9 +129,10 @@ type WorkerPoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced,shortName=workerpool
 // +kubebuilder:subresource:status
-// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.replicas`
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type WorkerPool struct {
 	metav1.TypeMeta `json:",inline"`

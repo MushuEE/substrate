@@ -16,7 +16,7 @@
 
 package v1alpha1
 
-type ActorTemplateExpansion interface{}
+type CSIDriverConfigExpansion interface{}
 
 type SandboxConfigExpansion interface{}
 

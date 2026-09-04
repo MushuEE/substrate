@@ -74,6 +74,23 @@ var (
 		"File that contains the CA pool state for "+podidentitysigner.Name,
 	)
 
+	workersPerSigner = pflag.Int(
+		"workers-per-signer",
+		1,
+		"Number of concurrent worker goroutines per signer.",
+	)
+
+	kubeAPIQPS = pflag.Float32(
+		"kube-api-qps",
+		0,
+		"Sustained queries per second allowed against the Kubernetes API. 0 keeps the client-go default.",
+	)
+	kubeAPIBurst = pflag.Int(
+		"kube-api-burst",
+		0,
+		"Burst queries allowed against the Kubernetes API. 0 keeps the client-go default.",
+	)
+
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
 )
 
@@ -104,6 +121,18 @@ func main() {
 		}
 	}
 
+	if *kubeAPIQPS < 0 || *kubeAPIBurst < 0 {
+		slog.ErrorContext(ctx, "Invalid rate limits: --kube-api-qps and --kube-api-burst must not be negative",
+			slog.Any("kube-api-qps", *kubeAPIQPS), slog.Int("kube-api-burst", *kubeAPIBurst))
+		os.Exit(1)
+	}
+	if *kubeAPIQPS > 0 {
+		kconfig.QPS = *kubeAPIQPS
+	}
+	if *kubeAPIBurst > 0 {
+		kconfig.Burst = *kubeAPIBurst
+	}
+
 	kc, err := kubernetes.NewForConfig(kconfig)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error creating Kubernetes client", slog.Any("err", err))
@@ -121,32 +150,22 @@ func main() {
 	go hasher.Run(ctx)
 
 	// Create a signer for servicedns.ate.dev/identity
-	serviceDNSCAPoolBytes, err := os.ReadFile(*serviceDNSCAPoolFile)
+	serviceDNSCAPool, err := localca.NewRefreshingPool(*serviceDNSCAPoolFile)
 	if err != nil {
-		slog.ErrorContext(ctx, "Error reading servicedns.ate.dev/identity CA pool state", slog.Any("err", err))
-		os.Exit(1)
-	}
-	serviceDNSCAPool, err := localca.Unmarshal(serviceDNSCAPoolBytes)
-	if err != nil {
-		slog.ErrorContext(ctx, "Error unmarshing servicedns.ate.dev/identity CA pool state", slog.Any("err", err))
+		slog.ErrorContext(ctx, "Error loading servicedns.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
 	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool, clock.RealClock{}), kc, hasher)
-	go serviceDNSSignerController.Run(ctx)
+	go serviceDNSSignerController.Run(ctx, *workersPerSigner)
 
 	// Create a signer for podidentity.podcert.ate.dev/identity
-	podIdentityCAPoolBytes, err := os.ReadFile(*podCAPoolFile)
+	podIdentityCAPool, err := localca.NewRefreshingPool(*podCAPoolFile)
 	if err != nil {
-		slog.ErrorContext(ctx, "Error reading podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
-		os.Exit(1)
-	}
-	podIdentityCAPool, err := localca.Unmarshal(podIdentityCAPoolBytes)
-	if err != nil {
-		slog.ErrorContext(ctx, "Error unmarshing podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
+		slog.ErrorContext(ctx, "Error loading podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
 	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(kc, podIdentityCAPool, clock.RealClock{}), kc, hasher)
-	go podIdentitySignerController.Run(ctx)
+	go podIdentitySignerController.Run(ctx, *workersPerSigner)
 
 	// TODO: Reload when the file changes.
 

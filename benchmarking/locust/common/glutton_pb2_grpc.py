@@ -55,10 +55,20 @@ class GluttonStub:
                 request_serializer=glutton__pb2.WriteRAMRequest.SerializeToString,
                 response_deserializer=glutton__pb2.WriteRAMResponse.FromString,
                 _registered_method=True)
+        self.ReadRAM = channel.unary_unary(
+                '/glutton.Glutton/ReadRAM',
+                request_serializer=glutton__pb2.ReadRAMRequest.SerializeToString,
+                response_deserializer=glutton__pb2.ReadRAMResponse.FromString,
+                _registered_method=True)
         self.WriteDisk = channel.unary_unary(
                 '/glutton.Glutton/WriteDisk',
                 request_serializer=glutton__pb2.WriteDiskRequest.SerializeToString,
                 response_deserializer=glutton__pb2.WriteDiskResponse.FromString,
+                _registered_method=True)
+        self.ReadDisk = channel.unary_unary(
+                '/glutton.Glutton/ReadDisk',
+                request_serializer=glutton__pb2.ReadDiskRequest.SerializeToString,
+                response_deserializer=glutton__pb2.ReadDiskResponse.FromString,
                 _registered_method=True)
         self.OpenFD = channel.unary_unary(
                 '/glutton.Glutton/OpenFD',
@@ -91,9 +101,25 @@ class GluttonServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReadRAM(self, request, context):
+        """Walks RAM previously allocated by WriteRAM: reads one byte per 4KiB
+        page across the requested size, so every touched page must be resident
+        before the response returns.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def WriteDisk(self, request, context):
         """Tells glutton to write to disk using the specified mode. Data
         written will be random bytes.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadDisk(self, request, context):
+        """Tells glutton to read from disk using the specified mode.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -132,10 +158,20 @@ def add_GluttonServicer_to_server(servicer, server):
                     request_deserializer=glutton__pb2.WriteRAMRequest.FromString,
                     response_serializer=glutton__pb2.WriteRAMResponse.SerializeToString,
             ),
+            'ReadRAM': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadRAM,
+                    request_deserializer=glutton__pb2.ReadRAMRequest.FromString,
+                    response_serializer=glutton__pb2.ReadRAMResponse.SerializeToString,
+            ),
             'WriteDisk': grpc.unary_unary_rpc_method_handler(
                     servicer.WriteDisk,
                     request_deserializer=glutton__pb2.WriteDiskRequest.FromString,
                     response_serializer=glutton__pb2.WriteDiskResponse.SerializeToString,
+            ),
+            'ReadDisk': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadDisk,
+                    request_deserializer=glutton__pb2.ReadDiskRequest.FromString,
+                    response_serializer=glutton__pb2.ReadDiskResponse.SerializeToString,
             ),
             'OpenFD': grpc.unary_unary_rpc_method_handler(
                     servicer.OpenFD,
@@ -193,6 +229,33 @@ class Glutton:
             _registered_method=True)
 
     @staticmethod
+    def ReadRAM(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/glutton.Glutton/ReadRAM',
+            glutton__pb2.ReadRAMRequest.SerializeToString,
+            glutton__pb2.ReadRAMResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def WriteDisk(request,
             target,
             options=(),
@@ -209,6 +272,33 @@ class Glutton:
             '/glutton.Glutton/WriteDisk',
             glutton__pb2.WriteDiskRequest.SerializeToString,
             glutton__pb2.WriteDiskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadDisk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/glutton.Glutton/ReadDisk',
+            glutton__pb2.ReadDiskRequest.SerializeToString,
+            glutton__pb2.ReadDiskResponse.FromString,
             options,
             channel_credentials,
             insecure,

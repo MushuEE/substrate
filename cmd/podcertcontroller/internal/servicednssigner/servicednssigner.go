@@ -17,7 +17,6 @@ package servicednssigner
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -40,12 +39,12 @@ const CTBPrefix = "servicedns.podcert.ate.dev:identity:"
 
 type Impl struct {
 	kc     kubernetes.Interface
-	caPool *localca.Pool
+	caPool localca.Pool
 
 	clock clock.PassiveClock
 }
 
-func NewImpl(kc kubernetes.Interface, caPool *localca.Pool, clock clock.PassiveClock) *Impl {
+func NewImpl(kc kubernetes.Interface, caPool localca.Pool, clock clock.PassiveClock) *Impl {
 	return &Impl{
 		kc:     kc,
 		caPool: caPool,
@@ -59,14 +58,19 @@ func (h *Impl) SignerName() string {
 	return Name
 }
 
-func (h *Impl) DesiredClusterTrustBundles() []*certsv1beta1.ClusterTrustBundle {
+func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
+	trustAnchors, err := h.caPool.TrustAnchors()
+	if err != nil {
+		return nil, fmt.Errorf("while retrieving CA pool trust anchors: %w", err)
+	}
+
 	wantTrustBundle := bytes.Buffer{}
-	for _, ca := range h.caPool.CAs {
+	for _, anchor := range trustAnchors {
 		block := pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
-			Bytes: ca.RootCertificate.Raw,
+			Bytes: anchor.Raw,
 		})
 		_, _ = wantTrustBundle.Write(block)
 	}
@@ -86,7 +90,7 @@ func (h *Impl) DesiredClusterTrustBundles() []*certsv1beta1.ClusterTrustBundle {
 
 	return []*certsv1beta1.ClusterTrustBundle{
 		wantCTB,
-	}
+	}, nil
 }
 
 func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
@@ -113,6 +117,10 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 			continue
 		}
 
+		if len(svc.Spec.Selector) == 0 {
+			continue
+		}
+
 		// Find the set of pods that the service selects.
 		matchedPods, err := h.kc.CoreV1().Pods(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: svc.Spec.Selector}),
@@ -133,6 +141,13 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 				dnsNames = append(dnsNames, name)
 			}
 		}
+	}
+
+	// This is returned as a transient error to allow retries.
+	// Without this, ate-apiserver can have a servicedns cert without DNS name
+	// while the covering Service is being created, and cache it for 24 hours.
+	if len(dnsNames) == 0 {
+		return fmt.Errorf("pod %s/%s is not (yet) selected by any Service; refusing to issue a serving cert with no DNS SANs", pcr.ObjectMeta.Namespace, pcr.Spec.PodName)
 	}
 
 	// TODO: Encode the OIDC issuer of the cluster into the certificate.
@@ -163,16 +178,13 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		DNSNames:              dnsNames,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		// AuthorityKeyID is automatically set to the SubjectKeyID of the parent
+		// certificate.
 	}
 
-	subjectCertDER, err := x509.CreateCertificate(rand.Reader, template, h.caPool.CAs[0].RootCertificate, subjectPublicKey, h.caPool.CAs[0].SigningKey)
+	chainDER, err := h.caPool.CreateCertificate(template, subjectPublicKey)
 	if err != nil {
-		return fmt.Errorf("while signing subject cert: %w", err)
-	}
-
-	chainDER := [][]byte{subjectCertDER}
-	for _, intermed := range h.caPool.CAs[0].IntermediateCertificates {
-		chainDER = append(chainDER, intermed.Raw)
+		return fmt.Errorf("while signing certificate: %w", err)
 	}
 
 	chainPEM := &bytes.Buffer{}

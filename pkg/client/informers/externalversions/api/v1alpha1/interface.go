@@ -22,12 +22,12 @@ import (
 
 // Interface provides access to all the informers in this group version.
 type Interface interface {
-	// ActorTemplates returns a ActorTemplateInformer.
-	ActorTemplates() ActorTemplateInformer
+	// CSIDriverConfigs returns a CSIDriverConfigInformer.
+	CSIDriverConfigs() TypedCSIDriverConfigInformer
 	// SandboxConfigs returns a SandboxConfigInformer.
-	SandboxConfigs() SandboxConfigInformer
+	SandboxConfigs() TypedSandboxConfigInformer
 	// WorkerPools returns a WorkerPoolInformer.
-	WorkerPools() WorkerPoolInformer
+	WorkerPools() TypedWorkerPoolInformer
 }
 
 type version struct {
@@ -41,17 +41,17 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// ActorTemplates returns a ActorTemplateInformer.
-func (v *version) ActorTemplates() ActorTemplateInformer {
-	return &actorTemplateInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+// CSIDriverConfigs returns a TypedCSIDriverConfigInformer.
+func (v *version) CSIDriverConfigs() TypedCSIDriverConfigInformer {
+	return &cSIDriverConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// SandboxConfigs returns a SandboxConfigInformer.
-func (v *version) SandboxConfigs() SandboxConfigInformer {
+// SandboxConfigs returns a TypedSandboxConfigInformer.
+func (v *version) SandboxConfigs() TypedSandboxConfigInformer {
 	return &sandboxConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// WorkerPools returns a WorkerPoolInformer.
-func (v *version) WorkerPools() WorkerPoolInformer {
+// WorkerPools returns a TypedWorkerPoolInformer.
+func (v *version) WorkerPools() TypedWorkerPoolInformer {
 	return &workerPoolInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

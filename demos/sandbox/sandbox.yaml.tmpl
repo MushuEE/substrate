@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Worker pool for the sandbox demo. The ActorTemplate is not a CRD: it lives
+# in sandbox-template.yaml.tmpl and is created through the ate API with
+# `kubectl ate create actor-template`.
+
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -26,24 +30,22 @@ metadata:
     workload: sandbox
 spec:
   replicas: 2
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
----
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: sandbox-template
-  namespace: ate-demo-sandbox
-spec:
-  workerSelector:
-    matchLabels:
-      workload: sandbox
-  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
-  containers:
-  - name: sandbox
-    image: ko://github.com/agent-substrate/substrate/demos/sandbox
-    command: ["/ko-app/sandbox"]
-    env:
-    - name: PORT
-      value: "80"
-  snapshotsConfig:
-    location: gs://${BUCKET_NAME}/ate-demo-sandbox/
+  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  template:
+    # Per-worker resources: these size the worker POD and advertise its
+    # scheduling capacity (the per-actor ceiling). The sandbox itself is sized by
+    # the ActorTemplate's resources in sandbox-template.yaml.tmpl, not by these
+    # (see internal/sizing).
+    #
+    # Capacity comes from the limits (workerCapacity reads limits only), while the
+    # kube-scheduler packs nodes by the requests — so the CPU request is set well
+    # below the limit to keep the pool placeable on a small node without changing
+    # what an actor is allowed to use. Memory is not compressible, so its request
+    # matches the limit.
+    resources:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+      requests:
+        cpu: 500m
+        memory: 2Gi

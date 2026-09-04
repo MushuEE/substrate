@@ -23,7 +23,7 @@ benchmarking/ # Load-testing tools and workloads
 tools/        # Standalone Go tools (go run ./tools/<name>) for Dev/CI
 ```
 
-**Where to put new Go code — quick rules:**
+**Where to put new Go code, quick rules:**
 
 | Situation | Location |
 |---|---|
@@ -57,13 +57,30 @@ Agent Substrate uses a `Makefile` for its build and test tasks.
 - **Copyright Headers**: All files must contain appropriate copyright and license headers. See templates in `hack/boilerplate/`.
 - **Modularity**: Submit small, focused Pull Requests that touch a limited part of the codebase for easier reviews and rebasing.
 - **Go Modules**: Ensure `go.mod` is clean. Run `go mod tidy` if adding or removing dependencies.
+- **Comments**: Keep them brief and to the point. Comment the final state of the code, not the path taken to it — a problem that only existed partway through writing the change is noise to the next reader, as is a pointer to a scratch or planning file that isn't in the repository.
+- **Spelling**: American English. `golangci-lint` runs `misspell` with `locale: US`, so British spellings fail lint.
+
+## Commit Messages
+
+- **Describe the change and why it was needed**: The message is read on `main` long after the PR branch is gone, so it should stand on its own.
+- **No issue or PR references**: Leave out `#1234`, `Fixes #1234`, and GitHub URLs. GitHub renders them as cross-references on the linked thread, and rebases or force-pushes repeat them. Put that context in the pull request description instead, where it belongs to the review rather than to the permanent history.
+
+## Metrics
+
+`docs/metrics/registry/metrics.yaml` is an [OpenTelemetry Weaver](https://github.com/open-telemetry/weaver) registry. It defines every metric instrument the ate system components emit, and the permitted values of each label. Read it to find an instrument or its labels.
+
+If you add or rename an instrument, or add a metric label, update it and run `hack/verify/metrics.sh`. `make verify` runs the same check.
+
+`docs/metrics/substrate.yaml` holds the rules Weaver cannot express: the cardinality rules, the known exceptions, and the subsystems that emit no metrics. Read `blind_spots` before you attribute a fault to a component.
+
+See the [metric registry](docs/observability.md#the-metric-registry) section of the observability guide.
 
 ## Testing Instructions
 
 1. Write tests for all new code. We will not merge code that lacks tests.
 2. Ensure changes do not break existing tests.
 3. Run `make verify` locally before requesting a code review to catch common issues like missed copyright headers or formatting drift.
-4. For end-to-end tests involving the actual infrastructure, ensure you have a running cluster (setup via `hack/ate-dev-env.sh.example` and `go run ./tools/setup-gcp --all`).
+4. For end-to-end tests involving the actual infrastructure, ensure you have a running cluster (setup via `hack/ate-dev-env.sh.example` and `go run ./tools/setup-gcp bootstrap`).
 
 ## Security Considerations
 
@@ -72,6 +89,6 @@ However! Take care to respect security best practices when writing code in order
 The following is what Substrate currently offers.
 Keep this up to date when updating AGENTS.md.
 
-- **Workload Isolation**: The project uses `gVisor` (`runsc`) for sandboxing and security isolation of workloads on pods. A temporary gVisor patch might be required (check the README instructions).
+- **Workload Isolation**: The project uses `gVisor` (`runsc`) for sandboxing and security isolation of workloads on pods.
 
 For future plans for security, reference `docs/roadmap.md`.

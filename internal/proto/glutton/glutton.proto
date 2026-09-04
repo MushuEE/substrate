@@ -26,9 +26,17 @@ service Glutton {
   // will be random bytes.
   rpc WriteRAM(WriteRAMRequest) returns (WriteRAMResponse) {}
 
+  // Walks RAM previously allocated by WriteRAM: reads one byte per 4KiB
+  // page across the requested size, so every touched page must be resident
+  // before the response returns.
+  rpc ReadRAM(ReadRAMRequest) returns (ReadRAMResponse) {}
+
   // Tells glutton to write to disk using the specified mode. Data
   // written will be random bytes.
   rpc WriteDisk(WriteDiskRequest) returns (WriteDiskResponse) {}
+
+  // Tells glutton to read from disk using the specified mode.
+  rpc ReadDisk(ReadDiskRequest) returns (ReadDiskResponse) {}
 
   // Tells glutton to make sure it has the specified number of file
   // descriptors open. It will open or close file descriptors to
@@ -50,19 +58,51 @@ enum WriteMode {
 
   // Write on top of the existing data
   WRITE_MODE_OVERWRITE = 1;
+
+  // Write on top of the existing data at a per-key cursor that advances
+  // past each write and wraps at the end, so repeated writes walk the
+  // whole array instead of re-dirtying the same prefix. RAM only.
+  WRITE_MODE_OVERWRITE_ROTATE = 2;
+}
+
+// ReadMode selects how much of the file ReadDisk sends back.
+enum ReadMode {
+  // Return the file's bytes in ReadDiskResponse.data alongside its digest.
+  READ_MODE_DATA = 0;
+
+  // Return only size and sha256; ReadDiskResponse.data is empty. The digest
+  // is the same one READ_MODE_DATA returns, so either mode can verify.
+  READ_MODE_DIGEST_ONLY = 1;
 }
 
 message WriteRAMRequest {
   // name of the array to be written to
   string key = 1;
 
-  // size of bytes to be written
-  int32 size = 2;
+  // size of bytes to be written, with an optional unit suffix (e.g. "2Gi")
+  string size = 2;
 
   WriteMode write_mode = 3;
 }
 
 message WriteRAMResponse {
+}
+
+message ReadRAMRequest {
+  // name of the array to be read
+  string key = 1;
+
+  // size of bytes to walk, with an optional unit suffix (e.g. "2Gi");
+  // empty walks the whole array
+  string size = 2;
+}
+
+message ReadRAMResponse {
+  // total size of bytes walked
+  int64 size = 1;
+
+  // XOR of the sampled bytes, so the reads are observable
+  uint32 checksum = 2;
 }
 
 message WriteDiskRequest {
@@ -76,6 +116,29 @@ message WriteDiskRequest {
 }
 
 message WriteDiskResponse {
+  // size of the file after the write
+  int64 size = 1;
+
+  // sha256 of the whole file after the write
+  bytes sha256 = 2;
+}
+
+message ReadDiskRequest {
+  // name of the file to be read from
+  string key = 1;
+
+  ReadMode read_mode = 2;
+}
+
+message ReadDiskResponse {
+  // total size of bytes read
+  int64 size = 1;
+
+  // sha256 of bytes read
+  bytes sha256 = 2;
+
+  // data read from the file. Empty under READ_MODE_DIGEST_ONLY.
+  bytes data = 3;
 }
 
 message OpenFDRequest {

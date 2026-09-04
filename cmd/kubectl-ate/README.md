@@ -64,7 +64,9 @@ These flags can be appended to any command:
 | Flag | Short | Description | Default |
 |---|---|---|---|
 | `--kubeconfig` | | Path to your kubeconfig file | `~/.kube/config` |
+| `--context` | | Name of the kubeconfig context to use | current context |
 | `--endpoint` | | Manual gRPC endpoint override (e.g., `localhost:8080`) | |
+| `--token-file` | | Path to a bearer token for ate-api authentication, or `-` for stdin | Kubernetes ServiceAccount token |
 | `--output` | `-o` | Output format (`table`, `json`, `yaml`) | `table` |
 | `--trace` | | Enable on-demand tracing for the request | `false` |
 
@@ -88,11 +90,17 @@ kubectl ate get actor <actor-name> --atespace <atespace> -o yaml
 
 # List all physical workers and see which actors are assigned to them
 kubectl ate get workers
+
+# Filter workers by Kubernetes namespace, assigned-actor atespace, or
+# worker pool labels (same flags as `top workers`)
+kubectl ate get workers -n <namespace>
+kubectl ate get workers -a <atespace>
+kubectl ate get workers -l <label-selector>
 ```
 
 > **Note:** `get actors` requires either `--atespace <name>` / `-a <name>` (one atespace) or `-A`/`--all-atespaces` (all atespaces) — there is no default atespace. Getting a single actor always requires `--atespace`/`-a`, since an actor is addressed by `(atespace, name)`. `-a` (lower-case) scopes to one atespace; `-A` (upper-case) spans all.
 
-> **Note:** Actors and workers are not Kubernetes CRDs — they live in the Substrate control plane (valkey/redis), not `etcd`. `kubectl get actor` and `kubectl get worker` will not return anything; only `kubectl ate get …` queries the control plane. `kubectl get actortemplate` and `kubectl get workerpool` *do* work, because those are CRDs.
+> **Note:** Actors, workers, and actor templates are not Kubernetes CRDs — they live in the Substrate control plane's PostgreSQL database, not `etcd`. `kubectl get actor`, `kubectl get worker`, and `kubectl get actortemplate` will not return anything; only `kubectl ate get …` queries the control plane (see [Actor Templates](#actor-templates)). `kubectl get workerpool` *does* work, because pools are CRDs.
 
 #### `kubectl ate get actor` output columns
 
@@ -100,8 +108,8 @@ kubectl ate get workers
 |---|---|
 | `ATESPACE` | The atespace the actor belongs to. Part of the actor's identity; folded into the storage key as `actor:<atespace>:<name>`. |
 | `NAME` | The actor's name. User-provided for application actors; UUID for the golden actor that each template materialises during `ResumeGoldenActor`. |
-| `TEMPLATE` | The `ActorTemplate` the actor was created from, as `<namespace>/<name>` (the template namespace is distinct from `ATESPACE`). |
-| `STATUS` | One of `STATUS_RESUMING`, `STATUS_RUNNING`, `STATUS_SUSPENDING`, `STATUS_SUSPENDED`. |
+| `TEMPLATE` | The `ActorTemplate` the actor was created from, displayed as `<atespace>/<name>`. |
+| `STATE` | One of `ACTOR_STATE_RESUMING`, `ACTOR_STATE_RUNNING`, `ACTOR_STATE_SUSPENDING`, `ACTOR_STATE_SUSPENDED`. |
 | `ATEOM POD` | The worker pod (namespace/name) currently hosting the actor. Empty while suspended. |
 | `ATEOM IP` | The pod IP of that worker. Empty while suspended. |
 | `VERSION` | Monotonic integer that increments on every state transition (resume / suspend / checkpoint). Useful for distinguishing snapshots. |
@@ -135,7 +143,7 @@ kubectl ate get atespace <atespace>
 kubectl ate delete atespace <atespace>
 ```
 
-> **Note:** `create actor … -a <atespace>` requires the atespace to already exist, otherwise it fails with `FailedPrecondition`. `delete atespace` only removes an **empty** atespace; delete its actors first (cascade delete is not yet supported).
+> **Note:** `create actor … -a <atespace>` requires the atespace to already exist, otherwise it fails with `FailedPrecondition`. `delete atespace` only removes an **empty** atespace; delete its actors and snapshot tags first (cascade delete is not yet supported).
 
 #### `kubectl ate get atespace` output columns
 
@@ -144,15 +152,51 @@ kubectl ate delete atespace <atespace>
 | `NAME` | The atespace name. Globally unique — atespaces are global-scoped. |
 | `AGE` | Time elapsed since the atespace was created. |
 
+### Actor Templates
+
+An **actor template** describes what an actor runs: containers, volumes,
+snapshot policy, sandbox runtime, and worker selection. Templates live in an
+atespace and are immutable — there is no update; delete and recreate to change
+one.
+
+```bash
+# Create a template from a manifest (protojson-shaped ateapipb.ActorTemplate,
+# a single YAML/JSON document; use -f - for stdin). The metadata's atespace
+# must already exist.
+kubectl ate create actor-template -f template.yaml
+
+# List templates, or get one (also: -o yaml prints the re-applyable manifest).
+kubectl ate get actor-templates -a <atespace>
+kubectl ate get actor-template <name> -a <atespace> -o yaml
+
+# Delete a template. This also deletes its golden actor and golden snapshot.
+kubectl ate delete actor-template <name> -a <atespace>
+```
+
+See
+[`demos/counter/counter-template.yaml.tmpl`](../../demos/counter/counter-template.yaml.tmpl)
+for a complete manifest example.
+
+#### `kubectl ate get actor-templates` output columns
+
+| Column | Meaning |
+|---|---|
+| `ATESPACE` | The atespace the template belongs to. |
+| `NAME` | The template's name. |
+| `SANDBOX CLASS` | The sandbox runtime family (`SANDBOX_CLASS_GVISOR` or `SANDBOX_CLASS_MICROVM`). |
+| `GOLDEN SNAPSHOT` | The golden snapshot's name once it exists (actors can be created); empty while the golden build is still running. |
+| `ERROR` | `ERROR` when the golden build failed; `-o yaml` shows the full message. |
+| `AGE` | Time elapsed since the template was created. |
+
 ### Actor Lifecycle
 Manage the execution state of your workloads.
 *(Note: Actors are identified by a user-provided name, which must be a valid DNS-1123 label)*
 
 ```bash
-# Create a new actor deriving from a specific ActorTemplate.
-# -a/--atespace is required and the atespace must already exist
-# (kubectl ate create atespace <atespace>).
-kubectl ate create actor my-actor --template=ate-demo-counter/counter -a <atespace>
+# Create a new actor deriving from an ActorTemplate. The template name is
+# resolved in the actor's atespace. -a/--atespace is required and the
+# atespace must already exist (kubectl ate create atespace <atespace>).
+kubectl ate create actor my-actor --template-ref=<template-name> -a <atespace>
 
 # Resume an actor (assigns it to a free worker and restores its state)
 kubectl ate resume actor my-actor -a <atespace>
@@ -160,8 +204,32 @@ kubectl ate resume actor my-actor -a <atespace>
 # Suspend an actor (snapshots its state to storage and frees the worker)
 kubectl ate suspend actor my-actor -a <atespace>
 
-# Delete an actor.
+# Delete an actor (by default, requires the actor to be SUSPENDED or CRASHED).
 kubectl ate delete actor my-actor -a <atespace>
+
+# Delete an actor from any state (e.g. RUNNING, PAUSED), terminating workloads and detaching volumes.
+kubectl ate delete actor my-actor -a <atespace> --any-state
+```
+
+### Actor Snapshots
+
+Suspending an actor creates a durable snapshot. Tags give snapshots stable,
+Atespace-owned names; published tags may be used from other Atespaces.
+
+```bash
+# List snapshots, or resolve one canonical snapshot or tag.
+kubectl ate get snapshots -a <atespace>
+kubectl ate get snapshot <snapshot-name> -a <atespace>
+kubectl ate get snapshot <tag-name> -a <atespace> --tag
+
+# Tag a snapshot, then publish or unpublish the tag.
+kubectl ate create snapshot-tag <tag-name> -a <atespace> --snapshot <snapshot-name>
+kubectl ate update snapshot-tag <tag-name> -a <atespace> --scope published
+kubectl ate update snapshot-tag <tag-name> -a <atespace> --scope atespace
+
+# Create an actor from a tag and remove the tag when it is no longer needed.
+kubectl ate create actor <actor-name> -a <atespace> --template-ref <template-name> --snapshot-tag <tag-atespace/tag-name>
+kubectl ate delete snapshot-tag <tag-name> -a <atespace>
 ```
 
 ### Logs
@@ -169,29 +237,33 @@ kubectl ate delete actor my-actor -a <atespace>
 `kubectl ate logs` requires a resource-type subcommand; running `kubectl ate logs <actor-name>` on its own prints help. The only supported resource type is `actors`:
 
 ```bash
-# Stream logs for an actor (follows by default; aggregated across worker
-# reassignments so the same actor is queryable as it teleports between pods).
-kubectl ate logs actors my-actor
+# Print the logs an actor has produced on its current worker.
+# -a/--atespace is required, since an actor is addressed by (atespace, name).
+kubectl ate logs actors my-actor -a <atespace>
+
+# Follow the logs with -f. The stream is aggregated across worker
+# reassignments, so the same actor stays queryable as it teleports between pods.
+kubectl ate logs actors my-actor -a <atespace> -f
+
+# Show only one container's logs with -c/--container.
+kubectl ate logs actors my-actor -a <atespace> -c my-container
 ```
 
-Logs are streamable only while the actor is bound to a worker (i.e., `STATUS_RUNNING`). For history across worker migrations, route through a centralized log backend (Cloud Logging, Loki, etc.); see `docs/observability.md`.
+Logs are streamable only while the actor is bound to a worker (i.e., `ACTOR_STATE_RUNNING`). For history across worker migrations, route through a centralized log backend (Cloud Logging, Loki, etc.); see `docs/observability.md`.
 
 ### Administration & Setup
-Commands for bootstrapping the Substrate control plane and debugging local environments.
+Commands for bootstrapping the Substrate control plane.
 
 ```bash
-# Generate a new CA pool and push it directly to a Kubernetes Secret
+# Generate a new Actor ID CA pool and push it directly to a Kubernetes Secret
 kubectl ate admin make-ca-pool \
-  --name workerpool-ca-certs \
+  --name actor-id-ca-pool \
   --secret-namespace ate-system \
   --ca-id "1"
 
 # Generate a new JWT authority pool and push it to a Kubernetes Secret
 kubectl ate admin make-jwt-pool \
-  --name session-id-jwt-pool \
+  --name actor-id-jwt-pool \
   --secret-namespace ate-system \
   --key-id "1"
-
-# DANGEROUS: Completely flush all Actor and Worker tracking state from Redis
-kubectl ate admin debug-flush-redis
 ```

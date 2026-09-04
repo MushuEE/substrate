@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +42,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -47,6 +49,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/proto/glutton"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/version"
@@ -79,7 +82,7 @@ func main() {
 
 	tp, err := serverboot.InitTracing(ctx, serverboot.TracingOptions{
 		ServiceName: "glutton",
-		Sampler:     sdktrace.ParentBased(sdktrace.NeverSample()),
+		Sampling:    serverboot.ResolveTraceSampling(ctx, serverboot.ParentNeverSampling()),
 	})
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to initialize tracing", err)
@@ -108,8 +111,8 @@ func main() {
 	}
 
 	go serverboot.StartMetricsServer(ctx, serverboot.MetricsServerOptions{
-		Addr:         *metricsListenAddr,
-		EnableReadyz: true,
+		Addr:      *metricsListenAddr,
+		Readiness: &serverboot.Readiness{},
 	})
 
 	slog.InfoContext(ctx, "glutton starting",
@@ -119,6 +122,7 @@ func main() {
 		slog.String("mode", *mode),
 	)
 
+	var handler http.Handler
 	switch *mode {
 	case "grpc":
 		srv := grpc.NewServer(
@@ -126,33 +130,74 @@ func main() {
 		)
 		glutton.RegisterGluttonServer(srv, svc)
 		reflection.Register(srv)
-		if err := srv.Serve(lis); err != nil {
-			serverboot.Fatal(ctx, "Failed to serve", err)
-		}
+		// The readiness probe is an HTTP GET, so gRPC mode serves it next to
+		// the gRPC handler on the same listener.
+		handler = splitGRPC(srv, readyzMux())
 	case "http":
-		// HTTP/1.1 mode: a single /ping route that consumes
-		// proto.Marshal(PingRequest) and returns proto.Marshal(PingResponse).
-		// Only Ping is exposed in HTTP mode; the other RPCs remain gRPC-only
-		// (re-exposable as additional routes if/when needed).
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ping", httpPingHandler(svc))
 		// otelhttp at the mux level + per-handler span follows
 		// docs/dev/best-practices/tracing.md: extract incoming context,
 		// then name the span after the operation in each handler.
-		httpSrv := &http.Server{Handler: otelhttp.NewHandler(mux, "/")}
-		if err := httpSrv.Serve(lis); err != nil {
-			serverboot.Fatal(ctx, "Failed to serve", err)
-		}
+		handler = otelhttp.NewHandler(newMux(svc), "/")
 	default:
 		serverboot.Fatal(ctx, "Invalid --mode", fmt.Errorf("must be grpc or http: %q", *mode))
 	}
+	if err := newServer(handler).Serve(lis); err != nil {
+		serverboot.Fatal(ctx, "Failed to serve", err)
+	}
 }
 
-// httpPingHandler accepts a POST whose body is proto.Marshal(PingRequest) and
-// returns proto.Marshal(PingResponse) (same Ping handler the gRPC server
-// uses, so the per-call stats stay comparable across protocols).
-func httpPingHandler(svc *gluttonService) http.HandlerFunc {
+// newServer enables unencrypted HTTP/2 so gRPC works on the plaintext
+// listener, alongside HTTP/1.1 for the readyz probe.
+func newServer(handler http.Handler) *http.Server {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	return &http.Server{Handler: handler, Protocols: protocols}
+}
+
+// splitGRPC serves gRPC and plain HTTP on one listener: requests with a
+// gRPC content-type go to grpcSrv, everything else to rest. All glutton
+// RPCs are unary, which is what grpc.Server.ServeHTTP supports.
+func splitGRPC(grpcSrv, rest http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcSrv.ServeHTTP(w, r)
+			return
+		}
+		rest.ServeHTTP(w, r)
+	})
+}
+
+// readyzMux serves the readiness probe both modes need: ateom blocks
+// RestoreWorkload until /readyz returns 200, so ResumeActor cannot report
+// success before this listener is reachable.
+func readyzMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+// newMux builds the HTTP-mode route table on top of the readiness probe.
+func newMux(svc *gluttonService) *http.ServeMux {
+	mux := readyzMux()
+	mux.HandleFunc("/ping", protoRoute("Ping", svc.Ping))
+	mux.HandleFunc("/writedisk", protoRoute("WriteDisk", svc.WriteDisk))
+	mux.HandleFunc("/readdisk", protoRoute("ReadDisk", svc.ReadDisk))
+	mux.HandleFunc("/writeram", protoRoute("WriteRAM", svc.WriteRAM))
+	mux.HandleFunc("/readram", protoRoute("ReadRAM", svc.ReadRAM))
+	return mux
+}
+
+// protoRoute wraps a protobuf handler with POST-only routing, protobuf
+// unmarshaling, status code mapping, and server-timing headers.
+func protoRoute[Req any, Resp proto.Message, PtrReq interface {
+	*Req
+	proto.Message
+}](spanName string, handler func(context.Context, PtrReq) (Resp, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -162,16 +207,28 @@ func httpPingHandler(svc *gluttonService) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		var req glutton.PingRequest
-		if err := proto.Unmarshal(body, &req); err != nil {
+		var req Req
+		ptrReq := PtrReq(&req)
+		if err := proto.Unmarshal(body, ptrReq); err != nil {
 			http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		ctx, span := otel.Tracer("glutton").Start(r.Context(), "Ping")
+		ctx, span := otel.Tracer("glutton").Start(r.Context(), spanName)
 		defer span.End()
-		resp, err := svc.Ping(ctx, &req)
+		resp, err := handler(ctx, ptrReq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			if st, ok := status.FromError(err); ok {
+				switch st.Code() {
+				case codes.InvalidArgument:
+					http.Error(w, st.Message(), http.StatusBadRequest)
+				case codes.NotFound:
+					http.Error(w, st.Message(), http.StatusNotFound)
+				default:
+					http.Error(w, st.Message(), http.StatusInternalServerError)
+				}
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 		out, err := proto.Marshal(resp)
@@ -179,6 +236,11 @@ func httpPingHandler(svc *gluttonService) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Glutton does not run ateinterceptors, so without this the serve path has no
+		// server-side timing at all. Mirrors the control-plane gRPC trailer so boomer's
+		// elapsedFromMD logic (source=server) works identically over HTTP.
+		w.Header().Set(ateinterceptors.ServerElapsedTrailer,
+			strconv.FormatInt(time.Since(start).Microseconds(), 10))
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		_, _ = w.Write(out)
 	}
@@ -195,13 +257,18 @@ type gluttonService struct {
 
 	// TODO: split this into per-resource locks (ram, fds, peers). A single
 	// global mutex serializes unrelated operations across all three.
-	mu    sync.Mutex
-	ram   map[string][]byte
-	fds   []*os.File
-	peers map[string]*peerGossip
+	mu  sync.Mutex
+	ram map[string][]byte
+	// ramCursor is each array's next WRITE_MODE_OVERWRITE_ROTATE offset.
+	// Absent means 0; invalidated whenever the array is reallocated.
+	ramCursor map[string]int
+	fds       []*os.File
+	peers     map[string]*peerGossip
 
 	ramWriteBytes  metric.Int64Counter
+	ramReadBytes   metric.Int64Counter
 	diskWriteBytes metric.Int64Counter
+	diskReadBytes  metric.Int64Counter
 	pingsReceived  metric.Int64Counter
 	gossipSent     metric.Int64Counter
 	gossipLatency  metric.Float64Histogram
@@ -216,9 +283,10 @@ type peerGossip struct {
 
 func newGluttonService(dir string) (*gluttonService, error) {
 	s := &gluttonService{
-		dataDir: dir,
-		ram:     make(map[string][]byte),
-		peers:   make(map[string]*peerGossip),
+		dataDir:   dir,
+		ram:       make(map[string][]byte),
+		ramCursor: make(map[string]int),
+		peers:     make(map[string]*peerGossip),
 	}
 
 	m := otel.Meter(meterName)
@@ -232,6 +300,14 @@ func newGluttonService(dir string) (*gluttonService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create glutton.ram.write.bytes counter: %w", err)
 	}
+	s.ramReadBytes, err = m.Int64Counter(
+		"glutton.ram.read.bytes",
+		metric.WithUnit("By"),
+		metric.WithDescription("Total bytes walked by ReadRAM over the process lifetime."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create glutton.ram.read.bytes counter: %w", err)
+	}
 	s.diskWriteBytes, err = m.Int64Counter(
 		"glutton.disk.write.bytes",
 		metric.WithUnit("By"),
@@ -239,6 +315,14 @@ func newGluttonService(dir string) (*gluttonService, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create glutton.disk.write.bytes counter: %w", err)
+	}
+	s.diskReadBytes, err = m.Int64Counter(
+		"glutton.disk.read.bytes",
+		metric.WithUnit("By"),
+		metric.WithDescription("Total bytes read from disk via ReadDisk over the process lifetime."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create glutton.disk.read.bytes counter: %w", err)
 	}
 	s.pingsReceived, err = m.Int64Counter(
 		"glutton.ping.requests",
@@ -315,10 +399,14 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 	if req.GetKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
-	if req.GetSize() < 0 {
+	sizeBytes, err := parseBytes(req.GetSize())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "size: %v", err)
+	}
+	if sizeBytes < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must be non-negative")
 	}
-	size := int(req.GetSize())
+	size := int(sizeBytes)
 
 	switch req.GetWriteMode() {
 	case glutton.WriteMode_WRITE_MODE_TRUNCATE:
@@ -328,6 +416,7 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 		}
 		s.mu.Lock()
 		s.ram[req.GetKey()] = buf
+		delete(s.ramCursor, req.GetKey())
 		s.mu.Unlock()
 	case glutton.WriteMode_WRITE_MODE_OVERWRITE:
 		s.mu.Lock()
@@ -335,18 +424,89 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 		if size > len(existing) {
 			existing = make([]byte, size)
 			s.ram[req.GetKey()] = existing
+			delete(s.ramCursor, req.GetKey())
 		}
 		if _, err := rand.Read(existing[:size]); err != nil {
 			s.mu.Unlock()
 			return nil, status.Errorf(codes.Internal, "generate random bytes: %v", err)
 		}
 		s.mu.Unlock()
+	case glutton.WriteMode_WRITE_MODE_OVERWRITE_ROTATE:
+		if err := s.rotateRAM(req.GetKey(), size); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown write_mode %v", req.GetWriteMode())
 	}
 
 	s.ramWriteBytes.Add(ctx, int64(size))
 	return &glutton.WriteRAMResponse{}, nil
+}
+
+// rotateRAM re-randomizes size bytes starting at the key's cursor, wrapping
+// at the end of the array, then advances the cursor past the write. Repeated
+// rotates therefore walk the whole array instead of re-dirtying the same
+// prefix. The cursor lives in process memory, so it rides along in snapshots
+// and the walk keeps advancing across suspend/resume cycles.
+func (s *gluttonService) rotateRAM(key string, size int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing := s.ram[key]
+	if len(existing) == 0 {
+		return status.Errorf(codes.NotFound, "rotate needs an existing array %q; fill with TRUNCATE first", key)
+	}
+	if size > len(existing) {
+		size = len(existing)
+	}
+	start := s.ramCursor[key]
+	head := existing[start:min(start+size, len(existing))]
+	if _, err := rand.Read(head); err != nil {
+		return status.Errorf(codes.Internal, "generate random bytes: %v", err)
+	}
+	if wrapped := size - len(head); wrapped > 0 {
+		if _, err := rand.Read(existing[:wrapped]); err != nil {
+			return status.Errorf(codes.Internal, "generate random bytes: %v", err)
+		}
+	}
+	s.ramCursor[key] = (start + size) % len(existing)
+	return nil
+}
+
+// pageSize is the stride of the ReadRAM walk: one byte per 4KiB page is
+// enough to force every page resident without the cost of reading them all.
+const pageSize = 4096
+
+// Walk RAM previously written by WriteRAM, reading one byte per page so
+// every touched page must be resident before the response returns. After a
+// demand-paged restore this converts restore-time laziness into measurable
+// read latency.
+func (s *gluttonService) ReadRAM(ctx context.Context, req *glutton.ReadRAMRequest) (*glutton.ReadRAMResponse, error) {
+	if req.GetKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "key is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	arr, ok := s.ram[req.GetKey()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no RAM array %q", req.GetKey())
+	}
+	walk := int64(len(arr))
+	if req.GetSize() != "" {
+		n, err := parseBytes(req.GetSize())
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "size: %v", err)
+		}
+		if n < 0 {
+			return nil, status.Error(codes.InvalidArgument, "size must be non-negative")
+		}
+		walk = min(n, walk)
+	}
+	var sum uint32
+	for i := int64(0); i < walk; i += pageSize {
+		sum ^= uint32(arr[i])
+	}
+	s.ramReadBytes.Add(ctx, walk)
+	return &glutton.ReadRAMResponse{Size: walk, Checksum: sum}, nil
 }
 
 // Write to disk using the specified mode. Data written will be random bytes.
@@ -363,10 +523,10 @@ func (s *gluttonService) WriteDisk(ctx context.Context, req *glutton.WriteDiskRe
 	var flag int
 	switch req.GetWriteMode() {
 	case glutton.WriteMode_WRITE_MODE_TRUNCATE:
-		flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+		flag = os.O_RDWR | os.O_CREATE | os.O_TRUNC
 	case glutton.WriteMode_WRITE_MODE_OVERWRITE:
 		// No O_TRUNC: writes go from offset 0 but any bytes beyond size remain.
-		flag = os.O_WRONLY | os.O_CREATE
+		flag = os.O_RDWR | os.O_CREATE
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown write_mode %v", req.GetWriteMode())
 	}
@@ -377,12 +537,68 @@ func (s *gluttonService) WriteDisk(ctx context.Context, req *glutton.WriteDiskRe
 	}
 	defer f.Close()
 
-	if err := streamRandomBytes(f, int64(req.GetSize())); err != nil {
+	h := sha256.New()
+	size := int64(req.GetSize())
+	if err := streamRandomBytes(io.MultiWriter(f, h), size); err != nil {
 		return nil, status.Errorf(codes.Internal, "write %s: %v", path, err)
 	}
 
+	// OVERWRITE has no O_TRUNC, bytes from a larger, earlier write will persist.
+	// The cursor is already at size, so folding the remainder into the
+	// same digest completes it without re-reading the prefix.
+	if req.GetWriteMode() == glutton.WriteMode_WRITE_MODE_OVERWRITE {
+		tail, err := io.Copy(h, f)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "hash tail %s: %v", path, err)
+		}
+		size += tail
+	}
+
 	s.diskWriteBytes.Add(ctx, int64(req.GetSize()))
-	return &glutton.WriteDiskResponse{}, nil
+	return &glutton.WriteDiskResponse{Size: size, Sha256: h.Sum(nil)}, nil
+}
+
+func (s *gluttonService) ReadDisk(ctx context.Context, req *glutton.ReadDiskRequest) (*glutton.ReadDiskResponse, error) {
+	if !diskKeyRE.MatchString(req.GetKey()) {
+		return nil, status.Errorf(codes.InvalidArgument, "key %q must match %s", req.GetKey(), diskKeyRE)
+	}
+
+	path := filepath.Join(s.dataDir, req.GetKey())
+
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, status.Errorf(codes.NotFound, "file %q not found", req.GetKey())
+		}
+		return nil, status.Errorf(codes.Internal, "open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+
+	if req.GetReadMode() == glutton.ReadMode_READ_MODE_DIGEST_ONLY {
+		n, err := io.Copy(h, f)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read %s: %v", path, err)
+		}
+		s.diskReadBytes.Add(ctx, n)
+		return &glutton.ReadDiskResponse{
+			Size:   n,
+			Sha256: h.Sum(nil),
+		}, nil
+	}
+
+	data, err := io.ReadAll(io.TeeReader(f, h))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read %s: %v", path, err)
+	}
+
+	s.diskReadBytes.Add(ctx, int64(len(data)))
+	return &glutton.ReadDiskResponse{
+		Size:   int64(len(data)),
+		Sha256: h.Sum(nil),
+		Data:   data,
+	}, nil
 }
 
 // Make sure it has the specified number of file descriptors open. It will open or

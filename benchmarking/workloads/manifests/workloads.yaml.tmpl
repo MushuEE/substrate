@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Worker pool for the benchmark workloads. The ActorTemplates are not CRDs:
+# they live in the *-template.yaml.tmpl files next to this one and are
+# created through the ate API by workloads/deploy.sh with
+# `kubectl ate create actor-template`.
+
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -28,50 +33,5 @@ metadata:
     workload: benchmark-ateom
 spec:
   replicas: ${WORKER_COUNT}
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
-
----
-
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: sleep
-  namespace: benchmark-workloads
-spec:
-  pauseImage: "gcr.io/gke-release/pause@sha256:bcbd57ba5653580ec647b16d8163cdd1112df3609129b01f912a8032e48265da"
-  containers:
-  - name: sleep
-    image: busybox@sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
-    command: ["/bin/sleep", "1000000"]
-  workerSelector:
-    matchLabels:
-      workload: benchmark-ateom
-  snapshotsConfig:
-    location: gs://${BUCKET_NAME}/benchmark-workloads/sleep/
-
----
-
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: glutton
-  namespace: benchmark-workloads
-spec:
-  pauseImage: "gcr.io/gke-release/pause@sha256:bcbd57ba5653580ec647b16d8163cdd1112df3609129b01f912a8032e48265da"
-  containers:
-  - name: glutton
-    image: ko://github.com/agent-substrate/substrate/cmd/benchmarking/glutton
-    # Port 80 is the only inbound port nftables forwards from the worker pod
-    # into the actor sandbox (see cmd/ateom-gvisor/main.go). HTTP/1.1 mode
-    # lets the atenet router (which forwards HTTP/1.1 upstream) reach Ping.
-    command:
-    - "/ko-app/glutton"
-    - "--grpc-listen-addr=:80"
-    - "--metrics-listen-addr=:9090"
-    - "--data-dir=/tmp/glutton"
-    - "--mode=http"
-  workerSelector:
-    matchLabels:
-      workload: benchmark-ateom
-  snapshotsConfig:
-    location: gs://${BUCKET_NAME}/benchmark-workloads/glutton/
+  sandboxClass: ${SANDBOX_CLASS}
+  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-${SANDBOX_CLASS}

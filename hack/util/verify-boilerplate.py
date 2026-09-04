@@ -37,7 +37,7 @@ ASLV2_HEADER = [
 ]
 
 def match_copyright(line):
-    match = re.search(r"Copyright\s+(\d{4})\s+Google LLC", line)
+    match = re.search(r"Copyright\s+(\d{4})\s+(?:Google LLC|The Agent Substrate Authors)", line)
     if not match:
         return False
     year = int(match.group(1))
@@ -100,6 +100,8 @@ def main():
     failed_files = []
 
     for filepath in files:
+        if os.path.isdir(filepath):
+            continue
         _, ext = os.path.splitext(filepath)
         filename = os.path.basename(filepath)
 
@@ -118,8 +120,8 @@ def main():
         if "vendor" in filepath:
             continue
 
-        # exclude top-level LICENSES directory
-        if filepath.startswith("LICENSES/"):
+        # exclude top-level _LICENSES directory
+        if filepath.startswith("_LICENSES/"):
             continue
 
         # exclude github config

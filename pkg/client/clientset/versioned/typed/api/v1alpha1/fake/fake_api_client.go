@@ -26,8 +26,8 @@ type FakeApiV1alpha1 struct {
 	*testing.Fake
 }
 
-func (c *FakeApiV1alpha1) ActorTemplates(namespace string) v1alpha1.ActorTemplateInterface {
-	return newFakeActorTemplates(c, namespace)
+func (c *FakeApiV1alpha1) CSIDriverConfigs() v1alpha1.CSIDriverConfigInterface {
+	return newFakeCSIDriverConfigs(c)
 }
 
 func (c *FakeApiV1alpha1) SandboxConfigs() v1alpha1.SandboxConfigInterface {

@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 	"net/url"
@@ -28,6 +29,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
 	"github.com/agent-substrate/substrate/internal/localca"
+	"github.com/agent-substrate/substrate/internal/substratex509"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -40,12 +42,12 @@ const CTBPrefix = "podidentity.podcert.ate.dev:identity:"
 
 type Impl struct {
 	kc     kubernetes.Interface
-	caPool *localca.Pool
+	caPool localca.Pool
 
 	clock clock.PassiveClock
 }
 
-func NewImpl(kc kubernetes.Interface, caPool *localca.Pool, clock clock.PassiveClock) *Impl {
+func NewImpl(kc kubernetes.Interface, caPool localca.Pool, clock clock.PassiveClock) *Impl {
 	return &Impl{
 		kc:     kc,
 		caPool: caPool,
@@ -59,14 +61,19 @@ func (h *Impl) SignerName() string {
 	return Name
 }
 
-func (h *Impl) DesiredClusterTrustBundles() []*certsv1beta1.ClusterTrustBundle {
+func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
+	trustAnchors, err := h.caPool.TrustAnchors()
+	if err != nil {
+		return nil, fmt.Errorf("while retrieving CA pool trust anchors: %w", err)
+	}
+
 	wantTrustBundle := bytes.Buffer{}
-	for _, ca := range h.caPool.CAs {
+	for _, anchor := range trustAnchors {
 		block := pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
-			Bytes: ca.RootCertificate.Raw,
+			Bytes: anchor.Raw,
 		})
 		_, _ = wantTrustBundle.Write(block)
 	}
@@ -86,7 +93,7 @@ func (h *Impl) DesiredClusterTrustBundles() []*certsv1beta1.ClusterTrustBundle {
 
 	return []*certsv1beta1.ClusterTrustBundle{
 		wantCTB,
-	}
+	}, nil
 }
 
 func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
@@ -122,22 +129,45 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 	}
 
 	template := &x509.Certificate{
+		// Some golang certificate handling code assumes that if the parent and
+		// template Subject fields compare equal, we are doing a self-signing
+		// operation [1].
+		//
+		// I'm not sure if this is correct, but for defense in depth include
+		// some random content in the subject.
+		//
+		// [1] https://cs.opensource.google/go/go/+/refs/tags/go1.27.0:src/crypto/x509/x509.go;l=1871
+		Subject: pkix.Name{
+			CommonName: rand.Text(),
+		},
 		BasicConstraintsValid: true,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		URIs:                  []*url.URL{spiffeURI},
 		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		// AuthorityKeyID is automatically set to the SubjectKeyID of the parent
+		// certificate.
 	}
 
-	subjectCertDER, err := x509.CreateCertificate(rand.Reader, template, h.caPool.CAs[0].RootCertificate, subjectPublicKey, h.caPool.CAs[0].SigningKey)
+	// Fields are sourced from the PCR spec (attested by kube-apiserver) rather
+	// than the Pod object, which lacks the ServiceAccount and Node UIDs.
+	podIdentity := &substratex509.PodIdentity{
+		Namespace:          pcr.ObjectMeta.Namespace,
+		ServiceAccountName: pcr.Spec.ServiceAccountName,
+		ServiceAccountUID:  string(pcr.Spec.ServiceAccountUID),
+		PodName:            pcr.Spec.PodName,
+		PodUID:             string(pcr.Spec.PodUID),
+		NodeName:           string(pcr.Spec.NodeName),
+		NodeUID:            string(pcr.Spec.NodeUID),
+	}
+	if err := substratex509.AddPodIdentityToCertificate(podIdentity, template); err != nil {
+		return fmt.Errorf("while adding pod identity to certificate: %w", err)
+	}
+
+	chainDER, err := h.caPool.CreateCertificate(template, subjectPublicKey)
 	if err != nil {
-		return fmt.Errorf("while signing subject cert: %w", err)
-	}
-
-	chainDER := [][]byte{subjectCertDER}
-	for _, intermed := range h.caPool.CAs[0].IntermediateCertificates {
-		chainDER = append(chainDER, intermed.Raw)
+		return fmt.Errorf("while signing certificate: %w", err)
 	}
 
 	chainPEM := &bytes.Buffer{}

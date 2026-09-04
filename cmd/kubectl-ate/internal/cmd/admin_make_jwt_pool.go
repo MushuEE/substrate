@@ -29,7 +29,7 @@ var keyID string
 
 var makeJwtPoolCmd = &cobra.Command{
 	Use:   "make-jwt-pool",
-	Short: "Make a new secret that contains a JWT authority pool to be used by the session ID broker",
+	Short: "Make a new secret that contains a JWT authority pool to be used by the actor ID broker",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
@@ -48,8 +48,9 @@ var makeJwtPoolCmd = &cobra.Command{
 			return fmt.Errorf("while generating JWT authority: %w", err)
 		}
 
-		pool := &localjwtauthority.Pool{
-			Authorities: []*localjwtauthority.Authority{authority},
+		pool := &localjwtauthority.ConcretePool{
+			Authorities:      []*localjwtauthority.Authority{authority},
+			ActiveForSigning: keyID,
 		}
 
 		poolBytes, err := localjwtauthority.Marshal(pool)

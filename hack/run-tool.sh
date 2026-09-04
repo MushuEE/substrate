@@ -32,8 +32,11 @@ shift
 
 ROOT="$(git rev-parse --show-toplevel)"
 case "${TOOL_NAME}" in
-  "client-gen"|"informer-gen"|"lister-gen")
+  "client-gen"|"informer-gen"|"lister-gen"|"validation-gen")
     TOOL_DIR="${ROOT}/hack/tools/code-generator"
+    ;;
+  "golangci-lint-kube-api-linter")
+    TOOL_DIR="${ROOT}/hack/tools/kube-api-linter"
     ;;
   *)
     TOOL_DIR="${ROOT}/hack/tools/${TOOL_NAME}"

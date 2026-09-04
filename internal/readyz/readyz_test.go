@@ -16,6 +16,8 @@ package readyz
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,7 +27,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/ateattr"
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestURL(t *testing.T) {
@@ -157,6 +163,72 @@ func TestWait_ContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Wait returned nil, expected cancellation error")
 	}
+	// A cancelled probe is ateom draining, not the actor failing. Tagging it
+	// would attribute a node drain to the workload.
+	if errors.Is(err, ateerrors.ReasonWorkloadNotReady) {
+		t.Errorf("Wait tagged a cancellation with %v: %v", ateerrors.ReasonWorkloadNotReady, err)
+	}
+}
+
+func TestOverallTimeout(t *testing.T) {
+	tests := []struct {
+		name  string
+		probe *ateompb.Readyz
+		want  time.Duration
+	}{
+		{
+			name:  "unset falls back to the default",
+			probe: &ateompb.Readyz{},
+			want:  DefaultOverallTimeout,
+		},
+		{
+			name:  "explicit value is honored",
+			probe: &ateompb.Readyz{TimeoutSeconds: 300},
+			want:  300 * time.Second,
+		},
+		{
+			// A zero deadline could never be met, so it means "unset"
+			// rather than "fail immediately".
+			name:  "negative falls back to the default",
+			probe: &ateompb.Readyz{TimeoutSeconds: -1},
+			want:  DefaultOverallTimeout,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := overallTimeout(tt.probe); got != tt.want {
+				t.Errorf("overallTimeout = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWait_GivesUpAtProbeTimeout(t *testing.T) {
+	// Nothing ever binds this port, so the poll loop runs until the
+	// probe's own deadline rather than the package default.
+	port := pickFreePort(t)
+	probe := &ateompb.Readyz{
+		HttpGet:        &ateompb.HTTPGetAction{Port: int32(port)},
+		TimeoutSeconds: 1,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := Wait(ctx, "main", probe, "127.0.0.1")
+	if err == nil {
+		t.Fatalf("Wait returned nil, expected a timeout error")
+	}
+	if !errors.Is(err, ateerrors.ReasonWorkloadNotReady) {
+		t.Errorf("Wait error = %v, want it to carry %v", err, ateerrors.ReasonWorkloadNotReady)
+	}
+	elapsed := time.Since(start)
+	if elapsed < time.Second {
+		t.Errorf("Wait gave up after %v, before the probe's 1s timeout", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Wait took %v; the probe timeout was ignored in favor of the %v default", elapsed, DefaultOverallTimeout)
+	}
 }
 
 func TestWaitAll_SkipsContainersWithoutProbe(t *testing.T) {
@@ -198,4 +270,39 @@ func pickFreePort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 	return port
+}
+
+// WaitAll is an ateom RPC boundary, so the reason has to reach atelet as an
+// ErrorInfo detail. A %w-wrapped Reason does not: errors.As cannot cross a
+// process, and the interceptor flattens a statusless error to a bare
+// codes.Internal, which reads back as UNKNOWN.
+func TestWaitAll_ReasonSurvivesTheRPCBoundary(t *testing.T) {
+	port := pickFreePort(t)
+	containers := []*ateompb.Container{{
+		Name:   "main",
+		Readyz: &ateompb.Readyz{HttpGet: &ateompb.HTTPGetAction{Port: int32(port)}, TimeoutSeconds: 1},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := WaitAll(ctx, containers, "127.0.0.1")
+	if err == nil {
+		t.Fatal("WaitAll returned nil, expected a timeout error")
+	}
+
+	// What the interceptor does to a handler error, then what atelet reads.
+	overWire := fmt.Errorf("while calling ateom.RunWorkload: %w", asHandlerReturns(err))
+	if got := ateattr.FailureReason(overWire); got != string(ateerrors.ReasonWorkloadNotReady) {
+		t.Errorf("after the RPC hop FailureReason = %q, want %q", got, ateerrors.ReasonWorkloadNotReady)
+	}
+}
+
+// asHandlerReturns mimics ateinterceptors: a status error in the chain is
+// forwarded whole, anything else collapses to codes.Internal with only a message.
+func asHandlerReturns(err error) error {
+	var statusErr interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &statusErr) {
+		return statusErr.GRPCStatus().Err()
+	}
+	return status.Error(codes.Internal, err.Error())
 }
