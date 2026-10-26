@@ -174,14 +174,14 @@ func (e *Env) koRunner() (*ko.Runner, error) {
 // push to, so the image is pinned from REPO/name:TAG like every ko image.
 // That only works if the release published it there, which
 // `ate-setup publish release-images` does.
-func (e *Env) dockerfileImage(ctx context.Context, name, contextDir string) (string, error) {
-	if ref, ok := e.dockerfileImages[name]; ok {
+func (e *Env) dockerfileImage(ctx context.Context, img images.DockerfileImage) (string, error) {
+	if ref, ok := e.dockerfileImages[img.Name]; ok {
 		return ref, nil
 	}
 	var ref string
 	var err error
 	if !e.Cfg.Images.IsPrebuilt() {
-		ref, err = images.BuildDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, name, e.Cfg.Path(contextDir), e.Cfg.KODefaultPlatforms, e.Cfg.DockerBuildFlags)
+		ref, err = images.BuildDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, img.Name, e.Cfg.Path(img.Context), e.Cfg.KODefaultPlatforms, e.Cfg.DockerBuildFlags)
 	} else {
 		resolver, rErr := e.imageResolver()
 		if rErr != nil {
@@ -191,10 +191,10 @@ func (e *Env) dockerfileImage(ctx context.Context, name, contextDir string) (str
 		if !ok {
 			return "", fmt.Errorf("image resolver is %T, not a pre-built resolver", resolver)
 		}
-		ref, err = prebuilt.Pin(ctx, name)
+		ref, err = prebuilt.Pin(ctx, img.Name)
 		if err != nil {
 			return "", fmt.Errorf("%s is built from a Dockerfile, not with ko, so a release has to publish it "+
-				"alongside the other images (ate-setup publish release-images): %w", name, err)
+				"alongside the other images (ate-setup publish release-images): %w", img.Name, err)
 		}
 	}
 	if err != nil {
@@ -203,7 +203,7 @@ func (e *Env) dockerfileImage(ctx context.Context, name, contextDir string) (str
 	if e.dockerfileImages == nil {
 		e.dockerfileImages = make(map[string]string)
 	}
-	e.dockerfileImages[name] = ref
+	e.dockerfileImages[img.Name] = ref
 	return ref, nil
 }
 

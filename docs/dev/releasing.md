@@ -39,7 +39,7 @@ To preview the notes before tagging, run the dry run with the tag you plan to pu
 
 A release publishes `ate-idp-server`, `ateapi`, `atecontroller`, `atelet`, `atenet`, `ateworker-gvisor`, `ateworker-microvm`, `kubernetes-secrets` (the Kubernetes Secrets credential provider), `objectstore-plugin`, and `podcertcontroller` (`images.ReleaseComponents` in [`cmd/ate-setup/internal/images`](../../cmd/ate-setup/internal/images/images.go)), plus `envoy-dataplane` from [`cmd/dataplane/envoy`](../../cmd/dataplane/envoy), as `ghcr.io/agent-substrate/substrate/<image>:<tag>`. The object storage plugin ships with releases until it moves out of this repository.
 
-The ko images are an allowlist, `released` in `images.go`. A new component is not published until a pull request adds it there, so publishing an image is always an explicit, reviewed change.
+Both lists are allowlists in `images.go`: `released` for the ko images and `releasedDockerfiles` for the images built from a Dockerfile. A new image is not published until a pull request adds it there, so publishing an image is always an explicit, reviewed change.
 
 It leaves out the demos and the benchmarking fakes. The release images are therefore not a complete install of the default configuration, and the notes give no install command: an install has to take the images releases leave out from another registry, or build them from source. `ate-setup --image-repo` looks those images up like any other; if one is missing, the error says releases do not publish it.
 

@@ -1200,7 +1200,7 @@ func TestDockerfileImagePrebuiltNotPublished(t *testing.T) {
 		}),
 	}
 
-	_, err := e.dockerfileImage(t.Context(), envoyDataplaneImage, envoyDataplaneDockefile)
+	_, err := e.dockerfileImage(t.Context(), images.EnvoyDataplane)
 	if err == nil {
 		t.Fatal("dockerfileImage() error = nil, want one")
 	}

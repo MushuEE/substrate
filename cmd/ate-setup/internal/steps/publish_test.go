@@ -125,7 +125,7 @@ func TestPublishReleaseImagesRejectsANonReleaseTag(t *testing.T) {
 // releases leave out.
 func TestReleaseImageRefs(t *testing.T) {
 	refs := releaseImageRefs("example.com/substrate/", "v1")
-	if want := len(images.ReleaseComponents()) + 1; len(refs) != want {
+	if want := len(images.ReleaseComponents()) + len(images.ReleaseDockerfileImages()); len(refs) != want {
 		t.Fatalf("releaseImageRefs() returned %d refs, want %d", len(refs), want)
 	}
 	for _, want := range []string{

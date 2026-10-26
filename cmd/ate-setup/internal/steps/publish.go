@@ -169,22 +169,24 @@ type PublishReleaseOptions struct {
 }
 
 // releaseImageRefs returns the tagged reference of every image a release
-// publishes to repo: one per images.ReleaseComponents entry, plus
-// envoy-dataplane.
+// publishes to repo: one per images.ReleaseComponents and
+// images.ReleaseDockerfileImages entry.
 func releaseImageRefs(repo, tag string) []string {
 	repo = strings.TrimSuffix(repo, "/")
-	pkgs := images.ReleaseComponents()
-	refs := make([]string, 0, len(pkgs)+1)
-	for _, pkg := range pkgs {
+	var refs []string
+	for _, pkg := range images.ReleaseComponents() {
 		refs = append(refs, repo+"/"+images.ImageName(pkg)+":"+tag)
 	}
-	return append(refs, repo+"/"+envoyDataplaneImage+":"+tag)
+	for _, img := range images.ReleaseDockerfileImages() {
+		refs = append(refs, repo+"/"+img.Name+":"+tag)
+	}
+	return refs
 }
 
 // PublishReleaseImages builds and pushes every image a release publishes, the
-// ko images in images.ReleaseComponents plus envoy-dataplane, which is built
-// from its Dockerfile with docker buildx, all tagged with the build version,
-// and writes their pushed references to w. The version has to be a release
+// ko images in images.ReleaseComponents and the images.ReleaseDockerfileImages
+// built with docker buildx, all tagged with the build version, and writes
+// their pushed references to w. The version has to be a release
 // tag.
 //
 // If the registry already holds every image for the tag on every platform,
@@ -245,12 +247,14 @@ func (e *Env) PublishReleaseImages(ctx context.Context, w io.Writer, opts Publis
 	for _, label := range labels {
 		dockerFlags = append(dockerFlags, "--label="+label)
 	}
-	envoy, err := images.PublishDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, envoyDataplaneImage, tag,
-		e.Cfg.Path(envoyDataplaneDockefile), e.Cfg.KODefaultPlatforms, dockerFlags)
-	if err != nil {
-		return err
+	for _, img := range images.ReleaseDockerfileImages() {
+		ref, err := images.PublishDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, img.Name, tag,
+			e.Cfg.Path(img.Context), e.Cfg.KODefaultPlatforms, dockerFlags)
+		if err != nil {
+			return err
+		}
+		refs = append(refs, ref)
 	}
-	refs = append(refs, envoy)
 
 	incomplete, err := images.CheckPublished(ctx, tagged, platforms)
 	if err != nil {
