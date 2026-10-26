@@ -146,8 +146,8 @@ to publish the new image under the same repository and tag as the rest, and
 until it does, an install has to build it or take it from a registry that
 holds it.
 
-Releases publish only `images.ReleaseComponents`, an allowlist: a component is
-published only once it is added to it, so a new entry in `images.Components`
+Releases publish `images.ReleaseComponents`, an allowlist, plus
+`envoy-dataplane`: a component is published only once it is added to it, so a new entry in `images.Components`
 stays out of releases until someone adds it on purpose. See
 [`docs/dev/releasing.md`](../../docs/dev/releasing.md#release-images) for what
 releases cover. Under `--image-repo`, a component that is not on the allowlist

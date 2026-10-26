@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
@@ -168,22 +169,23 @@ type PublishReleaseOptions struct {
 }
 
 // releaseImageRefs returns the tagged reference of every image a release
-// publishes to repo: one per images.ReleaseComponents entry.
+// publishes to repo: one per images.ReleaseComponents entry, plus
+// envoy-dataplane.
 func releaseImageRefs(repo, tag string) []string {
 	repo = strings.TrimSuffix(repo, "/")
 	pkgs := images.ReleaseComponents()
-	refs := make([]string, 0, len(pkgs))
+	refs := make([]string, 0, len(pkgs)+1)
 	for _, pkg := range pkgs {
 		refs = append(refs, repo+"/"+images.ImageName(pkg)+":"+tag)
 	}
-	return refs
+	return append(refs, repo+"/"+envoyDataplaneImage+":"+tag)
 }
 
 // PublishReleaseImages builds and pushes every image a release publishes, the
-// ko images in images.ReleaseComponents, all tagged with the build version,
+// ko images in images.ReleaseComponents plus envoy-dataplane, which is built
+// from its Dockerfile with docker buildx, all tagged with the build version,
 // and writes their pushed references to w. The version has to be a release
-// tag. Releases do not publish envoy-dataplane, the one Dockerfile-built
-// image, so nothing here needs docker.
+// tag.
 //
 // If the registry already holds every image for the tag on every platform,
 // nothing is built unless opts.Overwrite is set, so rerunning a release never
@@ -239,6 +241,16 @@ func (e *Env) PublishReleaseImages(ctx context.Context, w io.Writer, opts Publis
 	if err != nil {
 		return err
 	}
+	dockerFlags := slices.Clone(e.Cfg.DockerBuildFlags)
+	for _, label := range labels {
+		dockerFlags = append(dockerFlags, "--label="+label)
+	}
+	envoy, err := images.PublishDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, envoyDataplaneImage, tag,
+		e.Cfg.Path(envoyDataplaneDockefile), e.Cfg.KODefaultPlatforms, dockerFlags)
+	if err != nil {
+		return err
+	}
+	refs = append(refs, envoy)
 
 	incomplete, err := images.CheckPublished(ctx, tagged, platforms)
 	if err != nil {

@@ -1188,9 +1188,9 @@ func TestRenderAtenetEgressManifestPrebuilt(t *testing.T) {
 	}
 }
 
-// An install from release images that needs envoy-dataplane fails with a
-// message saying releases do not publish it and how to proceed, rather than a
-// bare registry error.
+// An install from an image repository that lacks envoy-dataplane fails with a
+// message saying a release has to publish it, rather than a bare registry
+// error.
 func TestDockerfileImagePrebuiltNotPublished(t *testing.T) {
 	src := images.Source{Repo: "example.com/substrate", Tag: "v1.2.3"}
 	e := &Env{
@@ -1205,8 +1205,8 @@ func TestDockerfileImagePrebuiltNotPublished(t *testing.T) {
 		t.Fatal("dockerfileImage() error = nil, want one")
 	}
 	for _, want := range []string{
-		"envoy-dataplane is built from a Dockerfile, and releases do not publish it",
-		"--atenet-dataplane=agentgateway",
+		"envoy-dataplane is built from a Dockerfile, not with ko, so a release has to publish it",
+		"ate-setup publish release-images",
 		"resolving example.com/substrate/envoy-dataplane:v1.2.3 to a digest: MANIFEST_UNKNOWN",
 	} {
 		if !strings.Contains(err.Error(), want) {
