@@ -83,7 +83,7 @@ is the build, the Go toolchain, and write access to a registry.
 needs an image `REPO` lacks fails naming it.
 
 The images a release publishes to `ghcr.io/agent-substrate/substrate`, with
-`publish release-images`, are not a complete install; see
+`publish release-images`, leave out the demos and the benchmarking fakes; see
 [`docs/dev/releasing.md`](../../docs/dev/releasing.md#release-images). When an
 image releases do not publish is missing from `REPO`, the error says so.
 

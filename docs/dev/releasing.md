@@ -41,7 +41,7 @@ A release publishes `ate-idp-server`, `ateapi`, `atecontroller`, `atelet`, `aten
 
 Both lists are allowlists in `images.go`: `released` for the ko images and `releasedDockerfiles` for the images built from a Dockerfile. A new image is not published until a pull request adds it there, so publishing an image is always an explicit, reviewed change.
 
-It leaves out the demos and the benchmarking fakes. The release images are therefore not a complete install of the default configuration, and the notes give no install command: an install has to take the images releases leave out from another registry, or build them from source. `ate-setup --image-repo` looks those images up like any other; if one is missing, the error says releases do not publish it.
+It leaves out the demos and the benchmarking fakes, which an install deploys only when asked to. An install that needs them has to take them from another registry, or build them from source. `ate-setup --image-repo` looks those images up like any other; if one is missing, the error says releases do not publish it.
 
 Tags that begin `vX.Y.Z` start the workflow. `ate-setup` refuses any version that is not `vX.Y.Z` or `vX.Y.Z-PRERELEASE` before building, so a tag like `v1.2.3foo` publishes nothing.
 

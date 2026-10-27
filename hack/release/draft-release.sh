@@ -147,9 +147,8 @@ if ! notes="$(api "generating notes" "repos/${REPO}/releases/generate-notes" \
 fi
 
 # Only the upstream release workflow publishes images (see
-# .github/workflows/release.yaml), so only its notes say where they are. The
-# notes give no install command because the release images are not a complete
-# install; docs/dev/releasing.md lists what they cover.
+# .github/workflows/release.yaml), so only its notes say where they are.
+# docs/dev/releasing.md lists what they cover.
 if [[ "${REPO}" == "${UPSTREAM_REPO}" ]]; then
   notes+=$'\n\n## Images\n\n'
   notes+="Container images for this release are published as \`${RELEASE_IMAGE_REPO}/<image>:${tag}\`"

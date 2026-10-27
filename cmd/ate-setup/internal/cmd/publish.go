@@ -60,8 +60,7 @@ comes from VERSION, else git describe, and has to be a release tag
 
   VERSION=TAG ate-setup publish release-images --ko-docker-repo REPO
 
-The release images are not a complete install; docs/dev/releasing.md lists
-what they cover.
+docs/dev/releasing.md lists what the release images cover.
 
 If REPO already holds every image for the tag on every platform, nothing is
 built unless --overwrite is set. After pushing, every image is checked for
