@@ -21,6 +21,7 @@ tag they share:
 ```
 ate-setup deploy ate-system \
   --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=IDS \
   --image-repo registry.example.com/substrate \
   --image-tag vX.Y.Z
 ```
