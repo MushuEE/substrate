@@ -236,6 +236,7 @@ func (e *Env) PublishReleaseImages(ctx context.Context, w io.Writer, opts Publis
 	labels := []string{
 		images.SourceLabel + "=" + images.SourceURL,
 		images.RevisionLabel + "=" + revision,
+		images.VersionLabel + "=" + tag,
 	}
 	// The Dockerfile images are slower to build and likelier to fail, so they
 	// go first: a failure there publishes nothing under the tag. They ignore
