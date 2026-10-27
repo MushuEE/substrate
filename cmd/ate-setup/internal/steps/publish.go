@@ -186,8 +186,7 @@ func releaseImageRefs(repo, tag string) []string {
 // PublishReleaseImages builds and pushes every image a release publishes, the
 // ko images in images.ReleaseComponents and the images.ReleaseDockerfileImages
 // built with docker buildx, all tagged with the build version, and writes
-// their pushed references to w. The version has to be a release
-// tag.
+// their pushed references to w. The version has to be a release tag.
 //
 // If the registry already holds every image for the tag on every platform,
 // nothing is built unless opts.Overwrite is set, so rerunning a release never

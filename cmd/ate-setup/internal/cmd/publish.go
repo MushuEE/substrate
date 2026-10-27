@@ -54,8 +54,9 @@ var publishReleaseImagesCmd = &cobra.Command{
 	Short: "Build and push the release images, tagged with the release version",
 	Long: `Build and push the images a release publishes (images.ReleaseComponents, and
 images.ReleaseDockerfileImages, which need docker buildx) to KO_DOCKER_REPO, all
-tagged with the build version, and print their pushed references. The version comes from VERSION, else git describe, and has to be a
-release tag (vMAJOR.MINOR.PATCH[-PRERELEASE]).
+tagged with the build version, and print their pushed references. The version
+comes from VERSION, else git describe, and has to be a release tag
+(vMAJOR.MINOR.PATCH[-PRERELEASE]).
 
   VERSION=TAG ate-setup publish release-images --ko-docker-repo REPO
 

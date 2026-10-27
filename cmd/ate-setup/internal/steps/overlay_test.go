@@ -1135,8 +1135,7 @@ func TestApplyOtelEndpointOverride(t *testing.T) {
 // A pre-built install renders the envoy router, egress, and system manifests
 // without building anything: envoy-dataplane is pinned from the image
 // repository like every ko image, so neither docker nor KO_DOCKER_REPO is
-// needed. Releases do not publish it, so this holds for a repository someone
-// published it to.
+// needed.
 func TestRenderAtenetEgressManifestPrebuilt(t *testing.T) {
 	const digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	src := images.Source{Repo: "example.com/substrate", Tag: "v1.2.3"}

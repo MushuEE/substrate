@@ -259,8 +259,9 @@ through `ListActors`. The tolerances are preserved: no `ate-api-server`, or an a
 that cannot be reached, skips cleanup rather than failing, because `delete all`
 runs this for every demo.
 
-**`docker buildx imagetools inspect` output is parsed as JSON**, not piped
-through `jq -r '.manifest.digest'`. Build output still goes to stderr so the
+**The pushed digest comes from `docker buildx build --metadata-file`**, not
+from piping `docker buildx imagetools inspect` of the tag through
+`jq -r '.manifest.digest'`. Build output still goes to stderr so the
 stdout/stderr split matches under CI log capture.
 
 ## Errors and diagnostics
