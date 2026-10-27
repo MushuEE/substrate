@@ -172,8 +172,8 @@ func (e *Env) koRunner() (*ko.Runner, error) {
 // KO_DOCKER_REPO. A pre-built install builds nothing: --image-repo installs
 // images someone else published, and needs neither docker nor a registry to
 // push to, so the image is pinned from REPO/name:TAG like every ko image.
-// That only works if the release published it there, which
-// `ate-setup publish release-images` does.
+// That only works if the repository holds it and can be read: releases
+// publish it, but older releases and other mirrors may not.
 func (e *Env) dockerfileImage(ctx context.Context, img images.DockerfileImage) (string, error) {
 	if ref, ok := e.dockerfileImages[img.Name]; ok {
 		return ref, nil
@@ -193,8 +193,9 @@ func (e *Env) dockerfileImage(ctx context.Context, img images.DockerfileImage) (
 		}
 		ref, err = prebuilt.Pin(ctx, img.Name)
 		if err != nil {
-			return "", fmt.Errorf("%s is built from a Dockerfile, not with ko, so a release has to publish it "+
-				"alongside the other images (ate-setup publish release-images): %w", img.Name, err)
+			return "", fmt.Errorf("%s is built from a Dockerfile, and the image repository has no readable copy; "+
+				"build it from source by dropping --image-repo, or choose --atenet-dataplane=agentgateway, "+
+				"which does not use it: %w", img.Name, err)
 		}
 	}
 	if err != nil {

@@ -23,7 +23,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
@@ -238,14 +237,14 @@ func (e *Env) PublishReleaseImages(ctx context.Context, w io.Writer, opts Publis
 		images.SourceLabel + "=" + images.SourceURL,
 		images.RevisionLabel + "=" + revision,
 	}
-	refs, err := runner.BuildTagged(ctx, tag, labels, pkgs...)
-	if err != nil {
-		return err
-	}
-	dockerFlags := slices.Clone(e.Cfg.DockerBuildFlags)
+	// The Dockerfile images are slower to build and likelier to fail, so they
+	// go first: a failure there publishes nothing under the tag. They ignore
+	// DOCKER_BUILD_FLAGS, so a release restores no build cache.
+	var dockerFlags []string
 	for _, label := range labels {
 		dockerFlags = append(dockerFlags, "--label="+label)
 	}
+	var refs []string
 	for _, img := range images.ReleaseDockerfileImages() {
 		ref, err := images.PublishDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, img.Name, tag,
 			e.Cfg.Path(img.Context), e.Cfg.KODefaultPlatforms, dockerFlags)
@@ -254,6 +253,11 @@ func (e *Env) PublishReleaseImages(ctx context.Context, w io.Writer, opts Publis
 		}
 		refs = append(refs, ref)
 	}
+	koRefs, err := runner.BuildTagged(ctx, tag, labels, pkgs...)
+	if err != nil {
+		return err
+	}
+	refs = append(refs, koRefs...)
 
 	incomplete, err := images.CheckPublished(ctx, tagged, platforms)
 	if err != nil {

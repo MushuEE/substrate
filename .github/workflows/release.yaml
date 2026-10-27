@@ -83,9 +83,12 @@ jobs:
     # ko cross-compiles Go for arm64, and the envoy-dataplane Dockerfile
     # cross-compiles its Rust module, so the job needs no QEMU. buildx builds
     # envoy-dataplane for both platforms. ko, buildx, and ate-setup's registry
-    # checks read the credentials docker login stores.
+    # checks read the credentials docker login stores. BuildKit is pinned by
+    # digest because it builds a published image with the ghcr.io login.
     - name: Set up buildx
       uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      with:
+        driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
     - name: Log in to ghcr.io
       env:
         TOKEN: ${{ github.token }}
@@ -132,11 +135,14 @@ jobs:
         # These jobs can write packages or releases, so they restore no cache
         # that another workflow could have written.
         cache: false
-    # Host networking and plain HTTP let buildx push to the registry service.
+    # The same BuildKit as the images job. Host networking and plain HTTP let
+    # buildx push to the registry service.
     - name: Set up buildx
       uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       with:
-        driver-opts: network=host
+        driver-opts: |
+          image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          network=host
         buildkitd-config-inline: |
           [registry."localhost:5000"]
             http = true

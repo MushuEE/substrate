@@ -60,7 +60,7 @@ VERSION=v0.3.0 KO_DEFAULTPLATFORMS=linux/amd64,linux/arm64 \
   go run ./cmd/ate-setup publish release-images --ko-docker-repo <registry path>
 ```
 
-The images are built from the work tree, so it must hold the tag and nothing else. The build needs Go, `ko` (which `ate-setup` runs from `hack/tools/ko`), and `docker buildx` for `envoy-dataplane`.
+The images are built from the work tree, so it must hold the tag and nothing else. The build needs Go, `ko` (which `ate-setup` runs from `hack/tools/ko`), and `docker buildx` for `envoy-dataplane`. A multi-platform push needs a builder that supports it, such as one made with `docker buildx create --driver docker-container --use`; the default `docker` driver supports it only with the containerd image store.
 
 ## Release binaries
 
