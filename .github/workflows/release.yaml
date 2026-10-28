@@ -58,17 +58,21 @@ jobs:
   images:
     if: github.repository == 'MushuEE/substrate' && !inputs.dry_run_images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # TRIAL: a registry inside the job instead of GHCR.
+    services:
+      registry:
+        image: registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+        ports: ['5000:5000']
     permissions:
       contents: read
-      packages: write
       # attest-build-provenance signs with the job's OIDC token.
       id-token: write
       attestations: write
     # Read by ate-setup publish release-images.
     env:
       VERSION: ${{ inputs.tag || github.ref_name }}
-      KO_DOCKER_REPO: ghcr.io/mushuee/substrate
+      KO_DOCKER_REPO: localhost:5000/substrate
       KO_DEFAULTPLATFORMS: linux/amd64,linux/arm64
       # inputs.overwrite is empty on a tag push; this makes the value explicit.
       ATE_PUBLISH_OVERWRITE: ${{ inputs.overwrite == true }}
@@ -100,11 +104,12 @@ jobs:
     - name: Set up buildx
       uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       with:
-        driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
-    - name: Log in to ghcr.io
-      env:
-        TOKEN: ${{ github.token }}
-      run: .github/scripts/release/ghcr-login.sh
+        driver-opts: |
+          image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          network=host
+        buildkitd-config-inline: |
+          [registry."localhost:5000"]
+            http = true
     # Publishing replaces the digests that operators of a published release
     # install by tag, so nothing is published once the release is. This runs
     # whether or not overwrite is set: without it, an incomplete set (an image
@@ -137,6 +142,12 @@ jobs:
         name: release-images
         path: bin/release-images.txt
         if-no-files-found: error
+    # TRIAL: the registry dies with the job, so the rerun and negative checks run here.
+    - name: Trial checks
+      if: hashFiles('bin/release-images.txt') != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: .github/scripts/release/trial-checks.sh
   # The same build and checks against a registry that exists only for the
   # duration of this job. Runs only when started manually with dry_run_images.
   images-dry-run:

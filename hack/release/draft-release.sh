@@ -41,7 +41,7 @@ SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
 SEMVER_PRE='^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$'
 # Where the upstream release workflow publishes images (KO_DOCKER_REPO in
 # .github/workflows/release.yaml).
-RELEASE_IMAGE_REPO='ghcr.io/mushuee/substrate'
+RELEASE_IMAGE_REPO='localhost:5000/substrate'
 
 usage() {
   echo "usage: $0 [--dry-run] <tag>" >&2
