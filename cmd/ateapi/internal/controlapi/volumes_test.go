@@ -16,14 +16,19 @@ package controlapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/agent-substrate/substrate/internal/volume"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/volume"
 	storagev1 "k8s.io/api/storage/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +38,7 @@ import (
 
 type fakeStorageClassLister struct {
 	storageClasses map[string]*storagev1.StorageClass
+	getErr         error
 }
 
 func (f *fakeStorageClassLister) List(selector k8slabels.Selector) (ret []*storagev1.StorageClass, err error) {
@@ -40,6 +46,9 @@ func (f *fakeStorageClassLister) List(selector k8slabels.Selector) (ret []*stora
 }
 
 func (f *fakeStorageClassLister) Get(name string) (*storagev1.StorageClass, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	sc, ok := f.storageClasses[name]
 	if !ok {
 		return nil, k8serrors.NewNotFound(storagev1.Resource("storageclass"), name)
@@ -49,41 +58,96 @@ func (f *fakeStorageClassLister) Get(name string) (*storagev1.StorageClass, erro
 
 var _ storagev1listers.StorageClassLister = (*fakeStorageClassLister)(nil)
 
-func TestInitialActorVolumes_PendingState(t *testing.T) {
-	tmpl := &ateapipb.ActorTemplate{
-		Volumes: []*ateapipb.Volume{
+func TestActorVolumesStorageClassErrors(t *testing.T) {
+	ctx := context.Background()
+	tmpl := &ateapi.ActorTemplate{
+		Volumes: []*ateapi.Volume{{
+			Name: "data-vol",
+			External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
+				StorageClassName: "standard",
+			}},
+		}},
+	}
+	volumes := []*ateapi.ExternalVolumeStatus{{
+		Name:       "data-vol",
+		VolumeType: "mock-standard",
+	}}
+
+	for _, tt := range []struct {
+		name     string
+		getErr   error
+		wantCode codes.Code
+	}{
+		{
+			name:     "missing StorageClass",
+			wantCode: codes.FailedPrecondition,
+		},
+		{
+			name:     "StorageClass lookup fails",
+			getErr:   errors.New("storage class cache unavailable"),
+			wantCode: codes.Internal,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			lister := &fakeStorageClassLister{getErr: tt.getErr}
+			t.Run("initial", func(t *testing.T) {
+				_, err := initialExternalVolumes(ctx, lister, tmpl)
+				if got := apierror.Code(err); got != tt.wantCode {
+					t.Fatalf("initialExternalVolumes() code = %v, want %v; error = %v", got, tt.wantCode, err)
+				}
+				if !strings.Contains(err.Error(), `StorageClass "standard"`) {
+					t.Errorf("initialExternalVolumes() error does not name the StorageClass: %v", err)
+				}
+			})
+			t.Run("create", func(t *testing.T) {
+				res, err := createActorVolumes(ctx, &mockPluginRegistry{}, lister, "actor-uid-123", tmpl, volumes)
+				if got := apierror.Code(err); got != tt.wantCode {
+					t.Fatalf("createActorVolumes() code = %v, want %v; error = %v", got, tt.wantCode, err)
+				}
+				if !strings.Contains(err.Error(), `StorageClass "standard"`) {
+					t.Errorf("createActorVolumes() error does not name the StorageClass: %v", err)
+				}
+				if diff := cmp.Diff(volumes, res, protocmp.Transform()); diff != "" {
+					t.Errorf("createActorVolumes() did not preserve pending volumes (-want +got):\n%s", diff)
+				}
+			})
+		})
+	}
+}
+
+func TestInitialActorVolumes(t *testing.T) {
+	tmpl := &ateapi.ActorTemplate{
+		Volumes: []*ateapi.Volume{
 			{
 				Name: "data-vol-1",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "standard",
-				},
+				}},
 			},
 			{
 				Name: "scratch-vol",
 			},
 			{
 				Name:       "durable-vol",
-				DurableDir: &ateapipb.DurableDirVolumeSource{},
+				DurableDir: &ateapi.DurableDirVolumeSource{},
 			},
 			{
 				Name: "data-vol-2",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "fast",
-				},
+				}},
 			},
 		},
 	}
 
-	want := []*ateapipb.ExternalVolume{
+	want := []*ateapi.ExternalVolumeStatus{
 		{
-			VolumeName: "data-vol-1",
+			Name:       "data-vol-1",
 			VolumeType: "mock-standard",
-			Status:     ateapipb.ExternalVolume_STATUS_PENDING,
 		},
 		{
-			VolumeName: "data-vol-2",
+			Name:       "data-vol-2",
 			VolumeType: "mock-fast",
-			Status:     ateapipb.ExternalVolume_STATUS_PENDING,
 		},
 	}
 
@@ -99,145 +163,137 @@ func TestInitialActorVolumes_PendingState(t *testing.T) {
 			},
 		},
 	}
-	initVols, err := initialActorVolumes(context.Background(), scLister, tmpl)
+	initVols, err := initialExternalVolumes(context.Background(), scLister, tmpl)
 	if err != nil {
-		t.Fatalf("initialActorVolumes failed: %v", err)
+		t.Fatalf("initialExternalVolumes failed: %v", err)
 	}
 	if diff := cmp.Diff(want, initVols, protocmp.Transform()); diff != "" {
-		t.Errorf("initialActorVolumes mismatch (-want +got):\n%s", diff)
+		t.Errorf("initialExternalVolumes mismatch (-want +got):\n%s", diff)
 	}
 }
 
 func TestCreateActorVolumes(t *testing.T) {
 	ctx := context.Background()
 
-	standardTmpl := &ateapipb.ActorTemplate{
-		Volumes: []*ateapipb.Volume{
+	standardTmpl := &ateapi.ActorTemplate{
+		Volumes: []*ateapi.Volume{
 			{
 				Name: "data-vol",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "standard",
-				},
+				}},
 			},
 		},
 	}
 
-	multiVolTmpl := &ateapipb.ActorTemplate{
-		Volumes: []*ateapipb.Volume{
+	multiVolTmpl := &ateapi.ActorTemplate{
+		Volumes: []*ateapi.Volume{
 			{
 				Name: "vol1",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "standard",
-				},
+				}},
 			},
 			{
 				Name: "vol2",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "standard",
-				},
+				}},
 			},
 			{
 				Name: "vol3",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{
 					StorageClassName: "standard",
-				},
+				}},
 			},
 		},
 	}
 
 	tests := []struct {
-		name         string
-		tmpl         *ateapipb.ActorTemplate
-		inputVolumes []*ateapipb.ExternalVolume
-		wantErr      bool
-		wantRes      []*ateapipb.ExternalVolume
+		name           string
+		tmpl           *ateapi.ActorTemplate
+		inputVolumes   []*ateapi.ExternalVolumeStatus
+		storageClasses map[string]*storagev1.StorageClass
+		wantErr        bool
+		wantRes        []*ateapi.ExternalVolumeStatus
 	}{
 		{
 			name: "partial failure returns error and preserves succeeded, failed, and remaining volumes",
 			tmpl: multiVolTmpl,
-			inputVolumes: []*ateapipb.ExternalVolume{
-				{
-					VolumeName: "vol1",
-					VolumeType: "mock-standard",
-					Status:     ateapipb.ExternalVolume_STATUS_PENDING,
-				},
-				{
-					VolumeName: "vol2",
-					Status:     ateapipb.ExternalVolume_STATUS_DELETING,
-				},
-				{
-					VolumeName: "vol3",
-					Status:     ateapipb.ExternalVolume_STATUS_PENDING,
-				},
+			inputVolumes: []*ateapi.ExternalVolumeStatus{
+				{Name: "vol1", VolumeType: "mock-standard"},
+				// Its type differs from its StorageClass's provisioner, so creating it fails.
+				{Name: "vol2", VolumeType: "mock-fast"},
+				{Name: "vol3", VolumeType: "mock-standard"},
 			},
 			wantErr: true,
-			wantRes: []*ateapipb.ExternalVolume{
+			wantRes: []*ateapi.ExternalVolumeStatus{
 				{
-					VolumeName:      "vol1",
+					Name:            "vol1",
 					StorageVolumeId: "mock-vol-substrate-actor-uid-123-vol1",
 					VolumeType:      "mock-standard",
-					Status:          ateapipb.ExternalVolume_STATUS_CREATED,
 				},
-				{
-					VolumeName: "vol2",
-					Status:     ateapipb.ExternalVolume_STATUS_DELETING,
-				},
-				{
-					VolumeName: "vol3",
-					Status:     ateapipb.ExternalVolume_STATUS_PENDING,
-				},
+				{Name: "vol2", VolumeType: "mock-fast"},
+				{Name: "vol3", VolumeType: "mock-standard"},
 			},
 		},
 		{
-			name: "created volume status succeeds",
+			name: "volume with a storage volume id is not created again",
 			tmpl: standardTmpl,
-			inputVolumes: []*ateapipb.ExternalVolume{
+			inputVolumes: []*ateapi.ExternalVolumeStatus{
 				{
-					VolumeName:      "data-vol",
+					Name:            "data-vol",
 					StorageVolumeId: "existing-vol-id",
-					Status:          ateapipb.ExternalVolume_STATUS_CREATED,
 				},
 			},
 			wantErr: false,
-			wantRes: []*ateapipb.ExternalVolume{
+			wantRes: []*ateapi.ExternalVolumeStatus{
 				{
-					VolumeName:      "data-vol",
+					Name:            "data-vol",
 					StorageVolumeId: "existing-vol-id",
-					Status:          ateapipb.ExternalVolume_STATUS_CREATED,
-				},
-			},
-		},
-		{
-			name: "unspecified volume status returns error",
-			tmpl: standardTmpl,
-			inputVolumes: []*ateapipb.ExternalVolume{
-				{
-					VolumeName: "data-vol",
-					Status:     ateapipb.ExternalVolume_STATUS_UNSPECIFIED,
-				},
-			},
-			wantErr: true,
-			wantRes: []*ateapipb.ExternalVolume{
-				{
-					VolumeName: "data-vol",
-					Status:     ateapipb.ExternalVolume_STATUS_UNSPECIFIED,
 				},
 			},
 		},
 		{
 			name: "volume not found in template returns error",
-			tmpl: &ateapipb.ActorTemplate{},
-			inputVolumes: []*ateapipb.ExternalVolume{
-				{
-					VolumeName: "missing-vol",
-					Status:     ateapipb.ExternalVolume_STATUS_PENDING,
-				},
+			tmpl: &ateapi.ActorTemplate{},
+			inputVolumes: []*ateapi.ExternalVolumeStatus{
+				{Name: "missing-vol"},
 			},
 			wantErr: true,
-			wantRes: []*ateapipb.ExternalVolume{
+			wantRes: []*ateapi.ExternalVolumeStatus{
+				{Name: "missing-vol"},
+			},
+		},
+		{
+			name: "storage class parameters are propagated to volume context",
+			tmpl: standardTmpl,
+			inputVolumes: []*ateapi.ExternalVolumeStatus{
 				{
-					VolumeName: "missing-vol",
-					Status:     ateapipb.ExternalVolume_STATUS_PENDING,
+					Name:       "data-vol",
+					VolumeType: "mock-standard",
+				},
+			},
+			storageClasses: map[string]*storagev1.StorageClass{
+				"standard": {
+					ObjectMeta:  metav1.ObjectMeta{Name: "standard"},
+					Provisioner: "mock-standard",
+					Parameters: map[string]string{
+						"type":                      "pd-ssd",
+						"csi.storage.k8s.io/fstype": "ext4",
+					},
+				},
+			},
+			wantErr: false,
+			wantRes: []*ateapi.ExternalVolumeStatus{
+				{
+					Name:            "data-vol",
+					StorageVolumeId: "mock-vol-substrate-actor-uid-123-data-vol",
+					VolumeType:      "mock-standard",
+					VolumeContext: map[string]string{
+						"type":                      "pd-ssd",
+						"csi.storage.k8s.io/fstype": "ext4",
+					},
 				},
 			},
 		},
@@ -252,8 +308,9 @@ func TestCreateActorVolumes(t *testing.T) {
 					"mock-fast":     plugin,
 				},
 			}
-			scLister := &fakeStorageClassLister{
-				storageClasses: map[string]*storagev1.StorageClass{
+			scs := tt.storageClasses
+			if scs == nil {
+				scs = map[string]*storagev1.StorageClass{
 					"standard": {
 						ObjectMeta:  metav1.ObjectMeta{Name: "standard"},
 						Provisioner: "mock-standard",
@@ -262,8 +319,9 @@ func TestCreateActorVolumes(t *testing.T) {
 						ObjectMeta:  metav1.ObjectMeta{Name: "fast"},
 						Provisioner: "mock-fast",
 					},
-				},
+				}
 			}
+			scLister := &fakeStorageClassLister{storageClasses: scs}
 			res, err := createActorVolumes(ctx, registry, scLister, "actor-uid-123", tt.tmpl, tt.inputVolumes)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("createActorVolumes() error = %v, wantErr %v", err, tt.wantErr)
@@ -272,6 +330,40 @@ func TestCreateActorVolumes(t *testing.T) {
 				t.Errorf("createActorVolumes() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// emptyIDVolumePlugin provisions volumes without returning an ID.
+type emptyIDVolumePlugin struct {
+	volume.VolumePluginControlPlane
+}
+
+func (emptyIDVolumePlugin) CreateVolume(context.Context, volume.CreateVolumeRequest) (volume.CreateVolumeResponse, error) {
+	return volume.CreateVolumeResponse{}, nil
+}
+
+func TestCreateActorVolumesRejectsEmptyPluginID(t *testing.T) {
+	tmpl := &ateapi.ActorTemplate{
+		Volumes: []*ateapi.Volume{{
+			Name:     "data-vol",
+			External: &ateapi.ExternalVolumeSource{Template: &ateapi.ExternalVolumeTemplate{StorageClassName: "standard"}},
+		}},
+	}
+	registry := &mockPluginRegistry{
+		plugins: map[string]volume.VolumePluginControlPlane{"mock-standard": emptyIDVolumePlugin{}},
+	}
+	scLister := &fakeStorageClassLister{storageClasses: map[string]*storagev1.StorageClass{
+		"standard": {ObjectMeta: metav1.ObjectMeta{Name: "standard"}, Provisioner: "mock-standard"},
+	}}
+	input := []*ateapi.ExternalVolumeStatus{{Name: "data-vol", VolumeType: "mock-standard"}}
+
+	res, err := createActorVolumes(context.Background(), registry, scLister, "actor-uid-123", tmpl, input)
+	if got := apierror.Code(err); got != codes.Internal {
+		t.Fatalf("createActorVolumes() code = %v, want %v; error = %v", got, codes.Internal, err)
+	}
+	// The volume stays unprovisioned, so a retry creates it again.
+	if diff := cmp.Diff(input, res, protocmp.Transform()); diff != "" {
+		t.Errorf("createActorVolumes() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -291,24 +383,24 @@ func TestDeleteActorVolumes(t *testing.T) {
 	tests := []struct {
 		name        string
 		actorUID    string
-		volumes     []*ateapipb.ExternalVolume
+		volumes     []*ateapi.ExternalVolumeStatus
 		wantDeleted []string
 		wantErr     bool
 	}{
 		{
 			name:     "uses storage volume ID when present",
 			actorUID: "uid-abc",
-			volumes: []*ateapipb.ExternalVolume{
-				{VolumeName: "vol1", StorageVolumeId: "storage-vol-123", VolumeType: "mock"},
+			volumes: []*ateapi.ExternalVolumeStatus{
+				{Name: "vol1", StorageVolumeId: "storage-vol-123", VolumeType: "mock"},
 			},
 			wantDeleted: []string{"storage-vol-123"},
 			wantErr:     false,
 		},
 		{
-			name:     "falls back to actorVolumeID when storage volume ID is empty regardless of status",
+			name:     "falls back to actorVolumeID when storage volume ID is empty",
 			actorUID: "uid-abc",
-			volumes: []*ateapipb.ExternalVolume{
-				{VolumeName: "vol1", StorageVolumeId: "", Status: ateapipb.ExternalVolume_STATUS_CREATED, VolumeType: "mock"},
+			volumes: []*ateapi.ExternalVolumeStatus{
+				{Name: "vol1", StorageVolumeId: "", VolumeType: "mock"},
 			},
 			wantDeleted: []string{"substrate-uid-abc-vol1"},
 			wantErr:     false,
@@ -345,4 +437,252 @@ func (m *mockPluginRegistry) GetPlugin(ctx context.Context, name string) (volume
 		return nil, fmt.Errorf("plugin %q not found in mock registry", name)
 	}
 	return p, nil
+}
+
+type detachCall struct {
+	VolumeID string
+	Node     string
+}
+
+type mockDetachVolumePlugin struct {
+	volume.VolumePluginControlPlane
+	detachCalls []detachCall
+	detachErrs  map[string]error
+}
+
+func (m *mockDetachVolumePlugin) DetachVolume(ctx context.Context, volumeID, node string) error {
+	m.detachCalls = append(m.detachCalls, detachCall{VolumeID: volumeID, Node: node})
+	if m.detachErrs != nil {
+		if err, ok := m.detachErrs[volumeID]; ok {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestDetachActorVolumes(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name            string
+		actor           *ateapi.Actor
+		template        *ateapi.ActorTemplate
+		plugin          *mockDetachVolumePlugin
+		pluginRegistry  *mockPluginRegistry
+		wantDetachCalls []detachCall
+		wantErr         bool
+		wantErrContains string
+	}{
+		{
+			name: "success with multiple mounted volumes",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "mock"},
+						{Name: "vol2", StorageVolumeId: "storage-vol-2", VolumeType: "mock"},
+					}},
+				},
+			},
+			template: &ateapi.ActorTemplate{
+				Volumes: []*ateapi.Volume{
+					{Name: "vol1"},
+					{Name: "vol2"},
+				},
+				Containers: []*ateapi.Container{
+					{
+						VolumeMounts: []*ateapi.VolumeMount{
+							{Name: "vol1"},
+							{Name: "vol2"},
+						},
+					},
+				},
+			},
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-1", Node: "node-1"},
+				{VolumeID: "storage-vol-2", Node: "node-1"},
+			},
+		},
+		{
+			name: "skips unmounted volume in template",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "mounted-vol", StorageVolumeId: "storage-vol-mounted", VolumeType: "mock"},
+						{Name: "unmounted-vol", StorageVolumeId: "storage-vol-unmounted", VolumeType: "mock"},
+					}},
+				},
+			},
+			template: &ateapi.ActorTemplate{
+				Volumes: []*ateapi.Volume{
+					{Name: "mounted-vol"},
+					{Name: "unmounted-vol"},
+				},
+				Containers: []*ateapi.Container{
+					{
+						VolumeMounts: []*ateapi.VolumeMount{
+							{Name: "mounted-vol"},
+						},
+					},
+				},
+			},
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-mounted", Node: "node-1"},
+			},
+		},
+		{
+			name: "skips volume with empty StorageVolumeId",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "", VolumeType: "mock"},
+						{Name: "vol2", StorageVolumeId: "storage-vol-2", VolumeType: "mock"},
+					}},
+				},
+			},
+			template: &ateapi.ActorTemplate{
+				Volumes: []*ateapi.Volume{
+					{Name: "vol1"},
+					{Name: "vol2"},
+				},
+				Containers: []*ateapi.Container{
+					{
+						VolumeMounts: []*ateapi.VolumeMount{
+							{Name: "vol1"},
+							{Name: "vol2"},
+						},
+					},
+				},
+			},
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-2", Node: "node-1"},
+			},
+		},
+		{
+			name: "nil template falls back to detaching all actor volumes",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "mock"},
+						{Name: "vol2", StorageVolumeId: "storage-vol-2", VolumeType: "mock"},
+					}},
+				},
+			},
+			template: nil,
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-1", Node: "node-1"},
+				{VolumeID: "storage-vol-2", Node: "node-1"},
+			},
+		},
+		{
+			name: "codes.NotFound from plugin is treated as already detached",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "mock"},
+					}},
+				},
+			},
+			plugin: &mockDetachVolumePlugin{
+				detachErrs: map[string]error{
+					"storage-vol-1": status.Error(codes.NotFound, "volume not found"),
+				},
+			},
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-1", Node: "node-1"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "partial failure attempts all volumes and joins errors",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "mock"},
+						{Name: "vol2", StorageVolumeId: "storage-vol-2", VolumeType: "mock"},
+					}},
+				},
+			},
+			plugin: &mockDetachVolumePlugin{
+				detachErrs: map[string]error{
+					"storage-vol-1": status.Error(codes.Internal, "disk detach failed"),
+				},
+			},
+			wantDetachCalls: []detachCall{
+				{VolumeID: "storage-vol-1", Node: "node-1"},
+				{VolumeID: "storage-vol-2", Node: "node-1"},
+			},
+			wantErr:         true,
+			wantErrContains: "failed to detach volume \"storage-vol-1\"",
+		},
+		{
+			name: "unknown plugin returns error",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "node-1",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "unknown-plugin"},
+					}},
+				},
+			},
+			wantErr:         true,
+			wantErrContains: "failed to get volume plugin for \"unknown-plugin\"",
+		},
+		{
+			name: "no assigned node skips detach",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{Name: "actor-1", Atespace: "default"},
+				Status: &ateapi.ActorStatus{
+					AssignedNode: "",
+					ExternalVolumes: &ateapi.ExternalVolumes{Volumes: []*ateapi.ExternalVolumeStatus{
+						{Name: "vol1", StorageVolumeId: "storage-vol-1", VolumeType: "mock"},
+					}},
+				},
+			},
+			wantDetachCalls: nil,
+			wantErr:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := tt.plugin
+			if plugin == nil {
+				plugin = &mockDetachVolumePlugin{}
+			}
+			registry := tt.pluginRegistry
+			if registry == nil {
+				registry = &mockPluginRegistry{
+					plugins: map[string]volume.VolumePluginControlPlane{
+						"mock": plugin,
+					},
+				}
+			}
+
+			err := detachActorVolumes(ctx, registry, tt.actor, tt.template, "test")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("detachActorVolumes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Fatalf("detachActorVolumes() error = %v, want error containing %q", err, tt.wantErrContains)
+				}
+			}
+			if diff := cmp.Diff(tt.wantDetachCalls, plugin.detachCalls); diff != "" {
+				t.Errorf("detachCalls mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package actorlog provides structured JSON logging for actor sandboxes shared
-// by the gVisor and micro-VM ateom runtimes. It forwards an actor container's
+// by the gVisor and micro-VM worker runtimes. It forwards an actor container's
 // stdout/stderr to the worker pod's stdout, annotated with the ate.* identity
 // labels from internal/ateattr, and emits synthetic actor lifecycle events.
 //
@@ -38,8 +38,8 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // SyncedWriter wraps an io.Writer and synchronizes writes across goroutines.
@@ -73,15 +73,20 @@ const (
 	labelsKeyGCE   = "logging.googleapis.com/labels"
 )
 
+// labelsKeyFor returns the label group's spelling for this environment, so
+// going vendor-neutral later means changing one function.
+func labelsKeyFor(isOnGCE bool) string {
+	if isOnGCE {
+		return labelsKeyGCE
+	}
+	return labelsKeyPlain
+}
+
 // NewActorLogger creates a new ActorLogger wrapping the provided destination writer.
 func NewActorLogger(w io.Writer, isOnGCE bool) *ActorLogger {
-	labelsKey := labelsKeyPlain
-	if isOnGCE {
-		labelsKey = labelsKeyGCE
-	}
 	return &ActorLogger{
 		writer:    w,
-		labelsKey: labelsKey,
+		labelsKey: labelsKeyFor(isOnGCE),
 	}
 }
 

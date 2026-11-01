@@ -28,12 +28,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	atelisters "go.ate.dev/substrate/pkg/client/listers/ate/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"k8s.io/apimachinery/pkg/labels"
@@ -178,9 +179,9 @@ func startTLSServer(t *testing.T, serverCert tls.Certificate, clientCAs *x509.Ce
 	return lis.Addr().String()
 }
 
-func driverConfig(endpoint string, tlsCfg *v1alpha1.CSIDriverTLSConfig) *v1alpha1.CSIDriverConfig {
-	return &v1alpha1.CSIDriverConfig{
-		Spec: v1alpha1.CSIDriverConfigSpec{
+func driverConfig(endpoint string, tlsCfg *atev1.CSIDriverTLSConfig) *atev1.CSIDriverConfig {
+	return &atev1.CSIDriverConfig{
+		Spec: atev1.CSIDriverConfigSpec{
 			DriverName:         mockDriverName,
 			ControllerEndpoint: endpoint,
 			TLS:                tlsCfg,
@@ -193,7 +194,7 @@ func driverConfig(endpoint string, tlsCfg *v1alpha1.CSIDriverTLSConfig) *v1alpha
 // and a real call both succeeded.
 func dialPlugin(t *testing.T, addr, serverName string, paths tlsPaths) (*Plugin, error) {
 	t.Helper()
-	cfg := driverConfig("tcp://"+addr, &v1alpha1.CSIDriverTLSConfig{
+	cfg := driverConfig("tcp://"+addr, &atev1.CSIDriverTLSConfig{
 		Enabled:        true,
 		UsePodIdentity: true,
 		ServerName:     serverName,
@@ -202,20 +203,20 @@ func dialPlugin(t *testing.T, addr, serverName string, paths tlsPaths) (*Plugin,
 }
 
 // mockLister serves a single CSIDriverConfig under mockDriverName.
-type mockLister struct{ cfg *v1alpha1.CSIDriverConfig }
+type mockLister struct{ cfg *atev1.CSIDriverConfig }
 
-func (m *mockLister) List(labels.Selector) ([]*v1alpha1.CSIDriverConfig, error) {
-	return []*v1alpha1.CSIDriverConfig{m.cfg}, nil
+func (m *mockLister) List(labels.Selector) ([]*atev1.CSIDriverConfig, error) {
+	return []*atev1.CSIDriverConfig{m.cfg}, nil
 }
 
-func (m *mockLister) Get(name string) (*v1alpha1.CSIDriverConfig, error) {
+func (m *mockLister) Get(name string) (*atev1.CSIDriverConfig, error) {
 	if name != mockDriverName {
 		return nil, fmt.Errorf("no CSIDriverConfig named %q", name)
 	}
 	return m.cfg, nil
 }
 
-var _ listersv1alpha1.CSIDriverConfigLister = (*mockLister)(nil)
+var _ atelisters.CSIDriverConfigLister = (*mockLister)(nil)
 
 func TestMTLSSucceeds(t *testing.T) {
 	t.Parallel()
@@ -271,11 +272,11 @@ func TestResolveTLSConfigDisabled(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
-		cfg  *v1alpha1.CSIDriverConfig
+		cfg  *atev1.CSIDriverConfig
 	}{
 		{"nil config", nil},
 		{"no TLS block", driverConfig("", nil)},
-		{"TLS disabled", driverConfig("", &v1alpha1.CSIDriverTLSConfig{Enabled: false})},
+		{"TLS disabled", driverConfig("", &atev1.CSIDriverTLSConfig{Enabled: false})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := resolveTLSConfig(tc.cfg, defaultTLSPaths)
@@ -291,10 +292,22 @@ func TestResolveTLSConfigDisabled(t *testing.T) {
 
 func TestResolveTLSConfigRejectsManualCerts(t *testing.T) {
 	t.Parallel()
-	cfg := driverConfig("", &v1alpha1.CSIDriverTLSConfig{Enabled: true, UsePodIdentity: false})
+	cfg := driverConfig("", &atev1.CSIDriverTLSConfig{Enabled: true, UsePodIdentity: false})
 
 	if _, err := resolveTLSConfig(cfg, defaultTLSPaths); err == nil {
 		t.Fatal("resolveTLSConfig accepted usePodIdentity=false; manual certificates are unsupported")
+	}
+}
+
+func TestResolveTLSConfigRejectsEmptyServerName(t *testing.T) {
+	t.Parallel()
+	cfg := driverConfig("", &atev1.CSIDriverTLSConfig{Enabled: true, UsePodIdentity: true})
+	_, err := resolveTLSConfig(cfg, defaultTLSPaths)
+	if err == nil {
+		t.Fatal("resolveTLSConfig accepted empty serverName when TLS is enabled")
+	}
+	if want := "tls.serverName is required when TLS is enabled"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("resolveTLSConfig error = %v, want substring %q", err, want)
 	}
 }
 
@@ -304,7 +317,7 @@ func TestResolveTLSConfigFields(t *testing.T) {
 	ca := newTestCA(t)
 	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
 
-	got, err := resolveTLSConfig(driverConfig("", &v1alpha1.CSIDriverTLSConfig{
+	got, err := resolveTLSConfig(driverConfig("", &atev1.CSIDriverTLSConfig{
 		Enabled:        true,
 		UsePodIdentity: true,
 		ServerName:     serverName,
@@ -363,4 +376,47 @@ func TestMTLSPicksUpCARotation(t *testing.T) {
 		t.Fatalf("connection after CA rotation failed: %v", err)
 	}
 	plugin2.client.Close()
+}
+
+func TestCAPoolCache_HitAndFileChange(t *testing.T) {
+	t.Parallel()
+	ca := newTestCA(t)
+
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "trust-bundle.pem")
+	writeFile(t, caPath, ca.certPEM())
+
+	cache := newCAPoolCache(caPath)
+
+	pool1, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+
+	// 2nd call should return the exact cached instance (pointer equality).
+	pool2, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+	if pool1 != pool2 {
+		t.Errorf("expected cached cert pool pointer equality on unchanged file, got %p != %p", pool1, pool2)
+	}
+
+	// Modify the file.
+	writeFile(t, caPath, ca.certPEM())
+	// The cache intentionally keys on mtime and size; make the file change
+	// observable on filesystems whose timestamp granularity is coarse.
+	modifiedAt := time.Now().Add(time.Second)
+	if err := os.Chtimes(caPath, modifiedAt, modifiedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3rd call should detect file change and return a newly parsed pool.
+	pool3, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+	if pool1 == pool3 {
+		t.Errorf("expected new cert pool after file modification, got same pointer %p", pool3)
+	}
 }

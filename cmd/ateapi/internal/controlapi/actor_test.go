@@ -16,741 +16,106 @@ package controlapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-func TestValidateCreateActorRequest(t *testing.T) {
-	// This test verifies validation of user input for creation.  Since status
-	// is scrubbed on input, we don't need to test the status field here, other
-	// than that it is optional. TestValidateActorUpdate covers status
-	// validation and updates.
-	validReq := func(actor *ateapipb.Actor, mods ...func(actor *ateapipb.CreateActorRequest)) *ateapipb.CreateActorRequest {
-		req := &ateapipb.CreateActorRequest{
-			Actor: actor,
-		}
-		for _, m := range mods {
-			m(req)
-		}
-		return req
-	}
-	withStatus := withActorStatus
-	withMetadata := withActorMetadata
-	withActorTemplate := withActorActorTemplate
-	withSourceSnapshotTag := withActorSourceSnapshotTag
-	withWorkerSelector := withActorWorkerSelector
-
-	tests := []struct {
-		name string
-		req  *ateapipb.CreateActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		validReq(validActor()),
-		nil,
-	}, {
-		"valid with status",
-		validReq(validActor(withStatus())),
-		nil, // ignored on input
-	}, {
-		"missing actor",
-		&ateapipb.CreateActorRequest{Actor: nil},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.metadata",
-		validReq(validActor(func(a *ateapipb.Actor) { a.Metadata = nil })),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata"), "")},
-	}, {
-		"missing actor.metadata.atespace",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "" }))),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata", "atespace"), "")},
-	}, {
-		"invalid actor.metadata.atespace",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "NS1" }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.metadata.name",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "" }))),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata", "name"), "")},
-	}, {
-		"invalid actor.metadata.name",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "ID1" }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"valid actor.actor_template",
-		validReq(validActor(withActorTemplate("as", "tmpl"))),
-		nil,
-	}, {
-		"missing actor.actor_template",
-		validReq(validActor(func(a *ateapipb.Actor) { a.ActorTemplate = nil })),
-		field.ErrorList{field.Required(field.NewPath("actor", "actor_template"), "")},
-	}, {
-		"missing actor.actor_template.atespace",
-		validReq(validActor(withActorTemplate("", "tmpl"))),
-		field.ErrorList{field.Required(field.NewPath("actor", "actor_template", "atespace"), "")},
-	}, {
-		"invalid actor.actor_template.atespace",
-		validReq(validActor(withActorTemplate("invalid value", "tmpl"))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "actor_template", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.actor_template.name",
-		validReq(validActor(withActorTemplate("as", ""))),
-		field.ErrorList{field.Required(field.NewPath("actor", "actor_template", "name"), "")},
-	}, {
-		"invalid actor.actor_template.name",
-		validReq(validActor(withActorTemplate("as", "invalid value"))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "actor_template", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"valid worker_selector",
-		validReq(validActor(withWorkerSelector(map[string]string{"tier": "1"}))),
-		nil,
-	}, {
-		"worker_selector with nil match_labels",
-		validReq(validActor(func(a *ateapipb.Actor) { a.WorkerSelector = &ateapipb.Selector{} })),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "worker_selector"), nil, "one of").WithOrigin("union")},
-	}, {
-		"worker_selector with empty match_labels",
-		validReq(validActor(withWorkerSelector(map[string]string{}))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "worker_selector"), nil, "one of").WithOrigin("union")},
-	}, {
-		"worker_selector with exactly max match_labels",
-		validReq(validActor(withWorkerSelector(selectorLabelsOfSize(10)))),
-		nil,
-	}, {
-		"too many worker_selector.match_labels",
-		validReq(validActor(withWorkerSelector(selectorLabelsOfSize(11)))),
-		field.ErrorList{field.TooMany(field.NewPath("actor", "worker_selector", "match_labels"), 11, 10).WithOrigin("maxProperties")},
-	}, {
-		"invalid worker_selector label key",
-		validReq(validActor(withWorkerSelector(map[string]string{"bad key!": "1"}))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "worker_selector", "match_labels"), "bad key!", "").WithOrigin("format=k8s-label-key")},
-	}, {
-		"invalid worker_selector label value",
-		validReq(validActor(withWorkerSelector(map[string]string{"tier": "not valid!"}))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "worker_selector", "match_labels").Key("tier"), "not valid!", "").WithOrigin("format=k8s-label-value")},
-	}, {
-		"valid actor.source_snapshot_tag",
-		validReq(validActor(withSourceSnapshotTag("as", "tag"))),
-		nil,
-	}, {
-		"missing actor.source_snapshot_tag.atespace",
-		validReq(validActor(withSourceSnapshotTag("", "tag"))),
-		field.ErrorList{field.Required(field.NewPath("actor", "source_snapshot_tag", "atespace"), "")},
-	}, {
-		"invalid actor.source_snapshot_tag.atespace",
-		validReq(validActor(withSourceSnapshotTag("invalid value", "tag"))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "source_snapshot_tag", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.source_snapshot_tag.name",
-		validReq(validActor(withSourceSnapshotTag("as", ""))),
-		field.ErrorList{field.Required(field.NewPath("actor", "source_snapshot_tag", "name"), "")},
-	}, {
-		"invalid actor.source_snapshot_tag.name",
-		validReq(validActor(withSourceSnapshotTag("as", "invalid value"))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "source_snapshot_tag", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateCreateActorRequest(context.Background(), tt.req), tt.want)
+func TestValidateActorStatusCrash(t *testing.T) {
+	crashPath := field.NewPath("status", "crash")
+	withCrash := func(mutate ...func(*ateapi.ActorCrash)) func(*ateapi.Actor) {
+		return withActorStatus(func(s *ateapi.ActorStatus) {
+			s.State = ateapi.ActorState_ACTOR_STATE_CRASHED
+			s.Crash = &ateapi.ActorCrash{
+				Message:   crashMessageWorkerDraining,
+				CrashTime: &timestamppb.Timestamp{Seconds: 867},
+			}
+			for _, m := range mutate {
+				m(s.Crash)
+			}
 		})
 	}
-}
-
-func TestValidateActorUpdate(t *testing.T) {
-	// This test validates input and output fields, including status.  It also
-	// tests updates to all fields.  This is where the majority of validation
-	// test cases should live.
-	validInput := validActor
-	withStatus := withActorStatus
-	validOutput := func(mods ...func(*ateapipb.Actor)) *ateapipb.Actor {
-		allMods := []func(*ateapipb.Actor){withStatus()} // this needs to go first
-		allMods = append(allMods, mods...)
-		a := validActor(allMods...)
-		return a
-	}
-	withMetadata := withActorMetadata
-	withWorkerSelector := withActorWorkerSelector
-	withActorTemplate := withActorActorTemplate
-	withSourceSnapshotTag := withActorSourceSnapshotTag
-	withWorkerAssignment := withActorWorkerAssignment
 
 	tests := []struct {
 		name   string
-		oldVal *ateapipb.Actor
-		newVal *ateapipb.Actor
+		oldVal *ateapi.Actor
+		newVal *ateapi.Actor
 		want   field.ErrorList
-	}{{
-		"valid",
-		validInput(),
-		validOutput(),
-		nil,
-	}, {
-		"missing actor.metadata",
-		validInput(),
-		validOutput(func(a *ateapipb.Actor) { a.Metadata = nil }),
-		field.ErrorList{field.Required(field.NewPath("metadata"), "")},
-	}, {
-		"missing actor.metadata.atespace",
-		validInput(),
-		validOutput(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "" })),
-		field.ErrorList{
-			field.Required(field.NewPath("metadata", "atespace"), ""),
-			field.Invalid(field.NewPath("metadata", "atespace"), nil, "").WithOrigin("immutable"),
+	}{
+		{
+			name:   "set crash",
+			oldVal: validActor(withActorStatus()),
+			newVal: validActor(withCrash()),
 		},
-	}, {
-		"invalid actor.metadata.atespace",
-		validInput(),
-		validOutput(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "invalid value" })),
-		field.ErrorList{field.Invalid(field.NewPath("metadata", "atespace"), nil, "").WithOrigin("immutable")},
-	}, {
-		"missing actor.metadata.name",
-		validInput(),
-		validOutput(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "" })),
-		field.ErrorList{
-			field.Required(field.NewPath("metadata", "name"), ""),
-			field.Invalid(field.NewPath("metadata", "name"), nil, "").WithOrigin("immutable"),
+		{
+			name:   "set empty crash",
+			oldVal: validActor(withActorStatus()),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) { *c = ateapi.ActorCrash{} })),
 		},
-	}, {
-		"invalid actor.metadata.name",
-		validInput(),
-		validOutput(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "invalid value" })),
-		field.ErrorList{field.Invalid(field.NewPath("metadata", "name"), nil, "").WithOrigin("immutable")},
-	}, {
-		"change actor.actor_template is allowed",
-		validInput(withActorTemplate("as1", "nm1")),
-		validOutput(withActorTemplate("as2", "nm2")),
-		nil,
-	}, {
-		"clear actor.actor_template",
-		validInput(withActorTemplate("as", "nm")),
-		validOutput(func(a *ateapipb.Actor) { a.ActorTemplate = nil }),
-		field.ErrorList{field.Required(field.NewPath("actor_template"), "")},
-	}, {
-		"add actor.source_snapshot_tag",
-		validInput(),
-		validOutput(withSourceSnapshotTag("as", "nm")),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"clear actor.source_snapshot_tag",
-		validInput(withSourceSnapshotTag("as", "nm")),
-		validOutput(func(a *ateapipb.Actor) { a.SourceSnapshotTag = nil }),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"change actor.source_snapshot_tag",
-		validInput(withSourceSnapshotTag("as1", "nm1")),
-		validOutput(withSourceSnapshotTag("as2", "nm2")),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"set valid worker_selector",
-		validInput(),
-		validOutput(withWorkerSelector(map[string]string{"tier": "1"})),
-		nil,
-	}, {
-		"clear worker_selector",
-		validInput(withWorkerSelector(map[string]string{"tier": "1"})),
-		validOutput(),
-		nil,
-	}, {
-		"modify worker_selector",
-		validInput(withWorkerSelector(map[string]string{"tier": "1"})),
-		validOutput(withWorkerSelector(map[string]string{"tier": "2"})),
-		nil,
-	}, {
-		"invalid worker_selector with nil match_labels",
-		validInput(),
-		validOutput(func(a *ateapipb.Actor) { a.WorkerSelector = &ateapipb.Selector{} }),
-		field.ErrorList{field.Invalid(field.NewPath("worker_selector"), nil, "one of").WithOrigin("union")},
-	}, {
-		"invalid worker_selector label key",
-		validInput(),
-		validOutput(withWorkerSelector(map[string]string{"bad key": "2"})),
-		field.ErrorList{field.Invalid(field.NewPath("worker_selector", "match_labels"), nil, "").WithOrigin("format=k8s-label-key")},
-	}, {
-		"invalid worker_selector label value",
-		validInput(),
-		validOutput(withWorkerSelector(map[string]string{"tier": "bad value"})),
-		field.ErrorList{field.Invalid(field.NewPath("worker_selector", "match_labels").Key("tier"), nil, "").WithOrigin("format=k8s-label-value")},
-	}, {
-		"too many worker_selector.match_labels",
-		validInput(),
-		validOutput(withWorkerSelector(selectorLabelsOfSize(11))),
-		field.ErrorList{field.TooMany(field.NewPath("worker_selector", "match_labels"), 11, 10).WithOrigin("maxProperties")},
-	}, {
-		"add actor.source_snapshot_tag",
-		validInput(),
-		validOutput(withSourceSnapshotTag("as", "nm")),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"clear actor.source_snapshot_tag",
-		validInput(withSourceSnapshotTag("as", "nm")),
-		validOutput(func(a *ateapipb.Actor) { a.SourceSnapshotTag = nil }),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"change actor.source_snapshot_tag",
-		validInput(withSourceSnapshotTag("as1", "nm1")),
-		validOutput(withSourceSnapshotTag("as2", "nm2")),
-		field.ErrorList{field.Invalid(field.NewPath("source_snapshot_tag"), nil, "").WithOrigin("immutable")},
-	}, {
-		"unspecified actor.status",
-		validInput(withStatus()),
-		validOutput(func(a *ateapipb.Actor) { a.Status = nil }),
-		field.ErrorList{field.Required(field.NewPath("status"), "")},
-	}, {
-		"unspecified actor.status.state",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = 0 })),
-		field.ErrorList{field.Required(field.NewPath("status", "state"), "")},
-	}, {
-		"change actor.status.state",
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = ateapipb.ActorState_ACTOR_STATE_PAUSED })),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = ateapipb.ActorState_ACTOR_STATE_CRASHED })),
-		nil,
-	}, {
-		"negative actor.status.state",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = -1 })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "state"), nil, "").WithOrigin("minimum")},
-	}, {
-		"just out of bounds actor.status.state",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = 9 })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "state"), nil, "").WithOrigin("maximum")},
-	}, {
-		"invalid actor.status.state",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.State = 1234567890 })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "state"), nil, "").WithOrigin("maximum")},
-	}, {
-		"set valid actor.status.worker_assignment, IPv4",
-		validInput(withStatus()),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) { wa.WorkerPodIp = "1.2.3.4" }))),
-		nil,
-	}, {
-		"set valid actor.status.worker_assignment, IPv6",
-		validInput(withStatus()),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) { wa.WorkerPodIp = "1234::5678" }))),
-		nil,
-	}, {
-		"clear actor.status.worker_assignment",
-		validInput(withStatus(withWorkerAssignment())),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.WorkerAssignment = nil })),
-		nil,
-	}, {
-		"modify actor.status.worker_assignment",
-		validInput(withStatus(withWorkerAssignment())),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) { wa.WorkerPod = "pod2" }))),
-		field.ErrorList{field.Invalid(field.NewPath("status", "worker_assignment"), nil, "").WithOrigin("update")},
-	}, {
-		"empty actor.status.worker_assignment",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.WorkerAssignment = &ateapipb.WorkerAssignment{} })),
-		field.ErrorList{
-			field.Required(field.NewPath("status", "worker_assignment", "worker"), ""),
-			field.Required(field.NewPath("status", "worker_assignment", "worker_namespace"), ""),
-			field.Required(field.NewPath("status", "worker_assignment", "worker_pool"), ""),
-			field.Required(field.NewPath("status", "worker_assignment", "worker_pod"), ""),
-			field.Required(field.NewPath("status", "worker_assignment", "worker_pod_uid"), ""),
-			field.Required(field.NewPath("status", "worker_assignment", "worker_pod_ip"), ""),
+		{
+			name:   "clear crash",
+			oldVal: validActor(withCrash()),
+			newVal: validActor(withActorStatus()),
 		},
-	}, {
-		"invalid actor.status.worker_assignment",
-		validInput(),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) {
-			wa.Worker = &ateapipb.ObjectRef{Atespace: "not-allowed", Name: "bad value"}
-			wa.WorkerNamespace = "invalid namespace"
-			wa.WorkerPool = "invalid pool"
-			wa.WorkerPod = "invalid pod"
-			wa.WorkerPodUid = "invalid UUID"
-			wa.WorkerPodIp = "invalid IP"
-		}))),
-		field.ErrorList{
-			field.Forbidden(field.NewPath("status", "worker_assignment", "worker", "atespace"), ""),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker", "name"), nil, "").WithOrigin("format=k8s-short-name"),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_namespace"), nil, "").WithOrigin("format=k8s-short-name"),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pool"), nil, "").WithOrigin("format=k8s-long-name"),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pod"), nil, "").WithOrigin("format=k8s-long-name"),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pod_uid"), nil, "").WithOrigin("format=k8s-uuid"),
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pod_ip"), nil, "").WithOrigin("format=ip-strict"),
+		{
+			name:   "replace crash",
+			oldVal: validActor(withCrash()),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) {
+				c.Message = crashMessageWorkerDraining
+				c.CrashTime = &timestamppb.Timestamp{Seconds: 5309}
+			})),
 		},
-	}, {
-		// because we have manual IP format validation, let's be sure
-		"invalid actor.status.worker_assignment_worker_pod_ip: leading 0s",
-		validInput(),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) { wa.WorkerPodIp = "001.002.003.004" }))),
-		field.ErrorList{
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pod_ip"), nil, "").WithOrigin("format=ip-strict"),
+		{
+			name:   "message at max length",
+			oldVal: validActor(withActorStatus()),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("x", 4096) })),
 		},
-	}, {
-		// because we have manual IP format validation, let's be sure
-		"invalid actor.status.worker_assignment_worker_pod_ip: non-canonical",
-		validInput(),
-		validOutput(withStatus(withWorkerAssignment(func(wa *ateapipb.WorkerAssignment) { wa.WorkerPodIp = "0012::0034" }))),
-		field.ErrorList{
-			field.Invalid(field.NewPath("status", "worker_assignment", "worker_pod_ip"), nil, "").WithOrigin("format=ip-strict"),
+		{
+			name:   "message too long",
+			oldVal: validActor(withActorStatus()),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("x", 4097) })),
+			want:   field.ErrorList{field.TooLong(crashPath.Child("message"), nil, 4096).WithOrigin("maxLength")},
 		},
-	}, {
-		"valid actor.status.in_progress_snapshot_name",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.InProgressSnapshotName = "snap-1" })),
-		nil,
-	}, {
-		"invalid actor.status.in_progress_snapshot_name",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.InProgressSnapshotName = "SNAP 1" })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "in_progress_snapshot_name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"valid actor.status.latest_snapshot",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LatestSnapshot = &ateapipb.ObjectRef{Atespace: "as", Name: "snap-1"}
-		})),
-		nil,
-	}, {
-		"missing actor.status.latest_snapshot.atespace",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LatestSnapshot = &ateapipb.ObjectRef{Name: "snap-1"}
-		})),
-		field.ErrorList{field.Required(field.NewPath("status", "latest_snapshot", "atespace"), "")},
-	}, {
-		"valid actor.status.local_snapshot_info.snapshot_name",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{SnapshotName: "snap-1"}
-		})),
-		nil,
-	}, {
-		"invalid actor.status.local_snapshot_info.snapshot_name",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{SnapshotName: "SNAP 1"}
-		})),
-		field.ErrorList{field.Invalid(field.NewPath("status", "local_snapshot_info", "snapshot_name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"invalid actor.status.local_snapshot_info.node_vms entry",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{NodeVmsWithLocalSnapshots: []string{"node-1", "NOT A NODE"}}
-		})),
-		field.ErrorList{field.Invalid(field.NewPath("status", "local_snapshot_info", "node_vms_with_local_snapshots").Index(1), nil, "").WithOrigin("format=k8s-long-name")},
-	}, {
-		"too many actor.status.local_snapshot_info.node_vms entries",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			nodes := make([]string, 257)
-			for i := range nodes {
-				nodes[i] = fmt.Sprintf("node-%d", i)
-			}
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{NodeVmsWithLocalSnapshots: nodes}
-		})),
-		field.ErrorList{field.TooMany(field.NewPath("status", "local_snapshot_info", "node_vms_with_local_snapshots"), 257, 256).WithOrigin("maxItems")},
-	}, {
-		"duplicate actor.status.local_snapshot_info.node_vms entry",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{NodeVmsWithLocalSnapshots: []string{"node-1", "node-1"}}
-		})),
-		field.ErrorList{field.Duplicate(field.NewPath("status", "local_snapshot_info", "node_vms_with_local_snapshots").Index(1), nil)},
-	}, {
-		"valid actor.status.local_snapshot_info.content_scope",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA}
-		})),
-		nil,
-	}, {
-		"negative actor.status.local_snapshot_info.content_scope",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{ContentScope: ateapipb.SnapshotContentScope(-1)}
-		})),
-		field.ErrorList{field.Invalid(field.NewPath("status", "local_snapshot_info", "content_scope"), nil, "").WithOrigin("minimum")},
-	}, {
-		"invalid actor.status.local_snapshot_info.content_scope",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{ContentScope: ateapipb.SnapshotContentScope(3)}
-		})),
-		field.ErrorList{field.Invalid(field.NewPath("status", "local_snapshot_info", "content_scope"), nil, "").WithOrigin("maximum")},
-	}, {
-		"negative actor.status.in_progress_snapshot_source_actor_version",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.InProgressSnapshotSourceActorVersion = -1 })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "in_progress_snapshot_source_actor_version"), nil, "").WithOrigin("minimum")},
-	}, {
-		"too many actor_volumes",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			vols := make([]*ateapipb.ExternalVolume, 33)
-			for i := range vols {
-				vols[i] = &ateapipb.ExternalVolume{VolumeName: fmt.Sprintf("vol-%d", i), VolumeType: "substrate.io/mock"}
-			}
-			s.ActorVolumes = vols
-		})),
-		field.ErrorList{field.TooMany(field.NewPath("status", "actor_volumes"), 33, 32).WithOrigin("maxItems")},
-	}, {
-		// Set-once fields permit the nil->set transition, so a volume added
-		// in an update validates like one added at creation.
-		"adding a volume on update is allowed",
-		validInput(withStatus()),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.ActorVolumes = []*ateapipb.ExternalVolume{{VolumeName: "vol-a", VolumeType: "substrate.io/mock"}}
-		})),
-		nil,
-	}, {
-		"duplicate actor_volumes volume_name",
-		validInput(withStatus()),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.ActorVolumes = []*ateapipb.ExternalVolume{
-				{VolumeName: "vol-a", VolumeType: "substrate.io/mock"},
-				{VolumeName: "vol-a", VolumeType: "substrate.io/mock"},
-			}
-		})),
-		field.ErrorList{field.Duplicate(field.NewPath("status", "actor_volumes").Index(1), nil)},
-	}, {
-		"provisioning transition on an existing volume is valid",
-		validInput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.ActorVolumes = []*ateapipb.ExternalVolume{{VolumeName: "vol-a", VolumeType: "substrate.io/mock", Status: ateapipb.ExternalVolume_STATUS_PENDING}}
-		})),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.ActorVolumes = []*ateapipb.ExternalVolume{{
-				VolumeName:      "vol-a",
-				VolumeType:      "substrate.io/mock",
-				StorageVolumeId: "csi-426d29b7",
-				Status:          ateapipb.ExternalVolume_STATUS_CREATED,
-				VolumeContext:   map[string]string{"attachment": "iqn.2026-08.io.ate:vol-a"},
-			}}
-		})),
-		nil,
-	}, {
-		"invalid actor.status.in_progress_local_snapshot_name",
-		validInput(),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.InProgressLocalSnapshotName = "BAD NAME" })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "in_progress_local_snapshot_name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"set actor.status.source_snapshot",
-		validInput(withStatus()),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.SourceSnapshot = &ateapipb.ActorSourceSnapshotStatus{
-				Snapshot:    &ateapipb.ObjectRef{Atespace: "as", Name: "snap-1"},
-				SnapshotUid: "9d1f7b06-3c58-4a2e-8b40-5f7c1e9a2d63",
-			}
-		})),
-		nil,
-	}, {
-		"clear actor.status.source_snapshot",
-		validInput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.SourceSnapshot = &ateapipb.ActorSourceSnapshotStatus{
-				Snapshot:    &ateapipb.ObjectRef{Atespace: "as", Name: "snap-1"},
-				SnapshotUid: "9d1f7b06-3c58-4a2e-8b40-5f7c1e9a2d63",
-			}
-		})),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) { s.SourceSnapshot = nil })),
-		field.ErrorList{field.Invalid(field.NewPath("status", "source_snapshot"), nil, "").WithOrigin("update")},
-	}, {
-		"change actor.status.source_snapshot",
-		validInput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.SourceSnapshot = &ateapipb.ActorSourceSnapshotStatus{
-				Snapshot:    &ateapipb.ObjectRef{Atespace: "as", Name: "snap-1"},
-				SnapshotUid: "9d1f7b06-3c58-4a2e-8b40-5f7c1e9a2d63",
-			}
-		})),
-		validOutput(withStatus(func(s *ateapipb.ActorStatus) {
-			s.SourceSnapshot = &ateapipb.ActorSourceSnapshotStatus{
-				Snapshot:    &ateapipb.ObjectRef{Atespace: "as", Name: "snap-2"},
-				SnapshotUid: "9d1f7b06-3c58-4a2e-8b40-5f7c1e9a2d63",
-			}
-		})),
-		field.ErrorList{field.Invalid(field.NewPath("status", "source_snapshot"), nil, "").WithOrigin("update")},
-	}}
+		{
+			name:   "truncated crash message fits",
+			oldVal: validActor(withActorStatus()),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) {
+				c.Message = newActorCrash(ateattr.OperationSuspend, strings.Repeat("x", 2*maxCrashMessageBytes)).GetMessage()
+			})),
+		},
+		{
+			// Unchanged fields are not revalidated on update, so a crash stored
+			// before a limit was tightened does not block later status writes.
+			name:   "unchanged overlong crash is not revalidated",
+			oldVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("x", 4097) })),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("x", 4097) })),
+		},
+		{
+			name:   "changed overlong crash is revalidated",
+			oldVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("x", 4097) })),
+			newVal: validActor(withCrash(func(c *ateapi.ActorCrash) { c.Message = strings.Repeat("y", 4097) })),
+			want:   field.ErrorList{field.TooLong(crashPath.Child("message"), nil, 4096).WithOrigin("maxLength")},
+		},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateActorUpdate(context.Background(), nil, tt.newVal, tt.oldVal, true), tt.want)
-		})
-	}
-}
-
-func TestValidateGetActorRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.GetActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		&ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"}},
-		nil,
-	}, {
-		"missing actor",
-		&ateapipb.GetActorRequest{},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.atespace",
-		&ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Name: "id1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "atespace"), "")},
-	}, {
-		"invalid actor.atespace",
-		&ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.name",
-		&ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "name"), "")},
-	}, {
-		"invalid actor.name",
-		&ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "name"), "ID1", "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateGetActorRequest(context.Background(), tt.req), tt.want)
-		})
-	}
-}
-
-func TestValidateListActorsRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.ListActorsRequest
-		want field.ErrorList
-	}{{
-		"valid, atespace scoped",
-		&ateapipb.ListActorsRequest{Atespace: "ns1"},
-		nil,
-	}, {
-		// Empty atespace means "all atespaces" (kubectl ate get actors -A).
-		"valid, empty atespace means all atespaces",
-		&ateapipb.ListActorsRequest{},
-		nil,
-	}, {
-		"invalid atespace",
-		&ateapipb.ListActorsRequest{Atespace: "NS1"},
-		field.ErrorList{field.Invalid(field.NewPath("atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"valid, positive page_size",
-		&ateapipb.ListActorsRequest{Atespace: "ns1", PageSize: 10},
-		nil,
-	}, {
-		"negative page_size",
-		&ateapipb.ListActorsRequest{Atespace: "ns1", PageSize: -1},
-		field.ErrorList{field.Invalid(field.NewPath("page_size"), int32(-1), "").WithOrigin("minimum")},
-	}, {
-		"valid page_token",
-		&ateapipb.ListActorsRequest{Atespace: "ns1", PageToken: strings.Repeat("x", 256)},
-		nil,
-	}, {
-		"too-large page_token",
-		&ateapipb.ListActorsRequest{Atespace: "ns1", PageToken: strings.Repeat("x", 257)},
-		field.ErrorList{field.TooLongCharacters(field.NewPath("page_token"), "", 256).WithOrigin("maxLength")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateListActorsRequest(context.Background(), tt.req), tt.want)
-		})
-	}
-}
-
-func TestValidateUpdateActorRequest(t *testing.T) {
-	// This test verifies validation of user input for update.  Since status
-	// is scrubbed on input, we don't need to test the status field here, other
-	// than that it is optional. TestValidateActorUpdate covers status
-	// validation and updates.
-	validReq := func(actor *ateapipb.Actor, mods ...func(actor *ateapipb.UpdateActorRequest)) *ateapipb.UpdateActorRequest {
-		req := &ateapipb.UpdateActorRequest{
-			Actor: actor,
-		}
-		for _, m := range mods {
-			m(req)
-		}
-		return req
-	}
-	validActor := func(mods ...func(*ateapipb.Actor)) *ateapipb.Actor {
-		allMods := []func(*ateapipb.Actor){
-			func(a *ateapipb.Actor) { // this needs to go first
-				a.Metadata.Uid = "12345678-1234-1234-1234-123456789abc"
-				a.Metadata.Version = 1
-			},
-		}
-		allMods = append(allMods, mods...)
-		a := validActor(allMods...)
-		return a
-	}
-	withStatus := withActorStatus
-	withMetadata := withActorMetadata
-
-	tests := []struct {
-		name string
-		req  *ateapipb.UpdateActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		validReq(validActor()),
-		nil,
-	}, {
-		"valid with status",
-		validReq(validActor(withStatus())),
-		nil, // ignored on input
-	}, {
-		"missing actor",
-		&ateapipb.UpdateActorRequest{Actor: nil},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.metadata",
-		validReq(validActor(func(a *ateapipb.Actor) { a.Metadata = nil })),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata"), "")},
-	}, {
-		"missing actor.metadata.atespace",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "" }))),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata", "atespace"), "")},
-	}, {
-		"invalid actor.metadata.atespace",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Atespace = "NS1" }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.metadata.name",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "" }))),
-		field.ErrorList{field.Required(field.NewPath("actor", "metadata", "name"), "")},
-	}, {
-		"invalid actor.metadata.name",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Name = "ID1" }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.metadata.uid precondition",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Uid = "" }))),
-		nil,
-	}, {
-		"invalid actor.metadata.uid precondition",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Uid = "not-a-uuid" }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "uid"), "not-a-uuid", "").WithOrigin("format=k8s-uuid")},
-	}, {
-		"missing actor.metadata.version precondition",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Version = 0 }))),
-		nil,
-	}, {
-		"negative actor.metadata.version precondition",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) { m.Version = -1 }))),
-		field.ErrorList{field.Invalid(field.NewPath("actor", "metadata", "version"), int64(-1), "").WithOrigin("minimum")},
-	}, {
-		"missing actor.metadata.version and actor.metadata.uid",
-		validReq(validActor(withMetadata(func(m *ateapipb.ResourceMetadata) {
-			m.Uid = ""
-			m.Version = 0
-		}))),
-		nil,
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateUpdateActorRequest(context.Background(), tt.req), tt.want)
+			assertValidateErr(t, apivalidation.ValidateActorUpdate(context.Background(), nil, tt.newVal, tt.oldVal, true), tt.want)
 		})
 	}
 }
@@ -760,94 +125,123 @@ func TestUpdateActor(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		stored   *ateapipb.Actor
-		req      *ateapipb.Actor
-		want     *ateapipb.Actor
+		stored   *ateapi.Actor
+		req      *ateapi.Actor
+		want     *ateapi.Actor
 		wantCode codes.Code
+		// leaseConflict holds the actor lease across the update,
+		// as a running workflow does.
+		leaseConflict bool
 	}{
 		{
 			name:   "sets a worker_selector the stored actor does not have",
-			stored: &ateapipb.Actor{},
-			req: &ateapipb.Actor{
-				ActorTemplate:  &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
-				WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+			stored: &ateapi.Actor{},
+			req: &ateapi.Actor{
+				ActorTemplate:  &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
 			},
-			want: &ateapipb.Actor{WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}},
+			want: &ateapi.Actor{WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}},
 		},
 		{
 			name:   "overwrites an existing worker_selector",
-			stored: &ateapipb.Actor{WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "free"}}},
-			req: &ateapipb.Actor{
-				ActorTemplate:  &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
-				WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+			stored: &ateapi.Actor{WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "free"}}},
+			req: &ateapi.Actor{
+				ActorTemplate:  &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
 			},
-			want: &ateapipb.Actor{WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}},
+			want: &ateapi.Actor{WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}},
 		},
 		{
 			name:   "an omitted worker_selector is cleared",
-			stored: &ateapipb.Actor{WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "free"}}},
-			req: &ateapipb.Actor{
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
+			stored: &ateapi.Actor{WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "free"}}},
+			req: &ateapi.Actor{
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
 			},
-			want: &ateapipb.Actor{},
+			want: &ateapi.Actor{},
 		},
 		{
-			name:   "SourceSnapshotTag immutable field is kept",
-			stored: &ateapipb.Actor{SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
-			req: &ateapipb.Actor{
-				ActorTemplate:     &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
-				SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag1"},
-				WorkerSelector:    &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+			name:   "SourceTag immutable field is kept",
+			stored: &ateapi.Actor{SourceTag: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
+			req: &ateapi.Actor{
+				ActorTemplate:  &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				SourceTag:      &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag1"},
+				WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
 			},
-			want: &ateapipb.Actor{
-				SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag1"},
-				WorkerSelector:    &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+			want: &ateapi.Actor{
+				SourceTag:      &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag1"},
+				WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
 			},
 		},
 		{
 			name:   "changes to status in the request are ignored",
-			stored: &ateapipb.Actor{},
-			req: &ateapipb.Actor{
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
-				Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
+			stored: &ateapi.Actor{},
+			req: &ateapi.Actor{
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
 			},
-			want: &ateapipb.Actor{},
+			want: &ateapi.Actor{},
 		},
 		{
 			name:   "an omitted immutable field is rejected",
-			stored: &ateapipb.Actor{SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
-			req: &ateapipb.Actor{
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
-				// Omitted SourceSnapshotTag
+			stored: &ateapi.Actor{SourceTag: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
+			req: &ateapi.Actor{
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				// Omitted SourceTag
 			},
 			wantCode: codes.InvalidArgument,
 		},
 		{
 			name:   "an immutable field the request rewrites is rejected",
-			stored: &ateapipb.Actor{SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
-			req: &ateapipb.Actor{
-				ActorTemplate:     &ateapipb.ObjectRef{Atespace: "attacker-ns", Name: "attacker-tmpl"},
-				SourceSnapshotTag: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tag2"},
+			stored: &ateapi.Actor{SourceTag: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag1"}},
+			req: &ateapi.Actor{
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "attacker-ns", Name: "attacker-tmpl"},
+				SourceTag:     &ateapi.ObjectRef{Atespace: testAtespace, Name: "tag2"},
 			},
 			wantCode: codes.InvalidArgument,
+		},
+		{
+			name:   "refused while another operation holds the actor",
+			stored: &ateapi.Actor{},
+			req: &ateapi.Actor{
+				ActorTemplate:  &ateapi.ObjectRef{Atespace: templateNS, Name: templateName},
+				WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+			},
+			leaseConflict: true,
+			wantCode:      codes.Aborted,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.stored.Metadata = &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID}
-			tt.stored.ActorTemplate = &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName}
-			tt.stored.Status = &ateapipb.ActorStatus{
-				State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			tt.stored.Metadata = &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID}
+			tt.stored.ActorTemplate = &ateapi.ObjectRef{Atespace: templateNS, Name: templateName}
+			tt.stored.Status = &ateapi.ActorStatus{
+				State: ateapi.ActorState_ACTOR_STATE_SUSPENDED,
 			}
 
 			svc, created := rpcServiceWithActor(t, tt.stored)
+			actorRef := resources.ActorRefFromActor(created)
+
+			if tt.leaseConflict {
+				lease, err := svc.impl.AcquireLease(context.Background(), actorLeaseKey(actorRef))
+				if err != nil {
+					t.Fatalf("AcquireLease() failed: %v", err)
+				}
+				defer lease.Close()
+			}
 
 			tt.req.Metadata = created.GetMetadata()
-			updated, err := svc.UpdateActor(context.Background(), &ateapipb.UpdateActorRequest{Actor: tt.req})
+			updated, err := svc.UpdateActor(context.Background(), &ateapi.UpdateActorRequest{Actor: tt.req})
 
 			if tt.wantCode != codes.OK {
-				if code := status.Code(err); code != tt.wantCode {
+				if code := apierror.Code(err); code != tt.wantCode {
 					t.Errorf("UpdateActor error = %v (code %v), want code %v", err, code, tt.wantCode)
+				}
+				got, err := svc.impl.GetActor(context.Background(), actorRef)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.GetMetadata().GetVersion() != created.GetMetadata().GetVersion() {
+					t.Errorf("a refused update wrote the actor: version %d, want %d", got.GetMetadata().GetVersion(), created.GetMetadata().GetVersion())
 				}
 				return
 			}
@@ -855,10 +249,10 @@ func TestUpdateActor(t *testing.T) {
 				t.Fatalf("UpdateActor failed: %v", err)
 			}
 
-			tt.want.Metadata = &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID, Version: 2}
-			tt.want.ActorTemplate = &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName}
-			tt.want.Status = &ateapipb.ActorStatus{
-				State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			tt.want.Metadata = &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID, Version: 2}
+			tt.want.ActorTemplate = &ateapi.ObjectRef{Atespace: templateNS, Name: templateName}
+			tt.want.Status = &ateapi.ActorStatus{
+				State: ateapi.ActorState_ACTOR_STATE_SUSPENDED,
 			}
 			if diff := cmp.Diff(tt.want, updated, protocmp.Transform(), ignoreUID, ignoreTimestamps); diff != "" {
 				t.Errorf("UpdateActor response mismatch (-want +got):\n%s", diff)
@@ -879,87 +273,73 @@ func TestUpdateActor_RepointTemplate(t *testing.T) {
 
 	storetest.MustCreateAtespace(t, ctx, persistence, testAtespace)
 	// tmpl-a and tmpl-b are volume-compatible; tmpl-c mounts the data volume
-	// elsewhere, tmpl-d declares an extra volume, and tmpl-e runs on a
-	// different sandbox class.
-	dataVolume := &ateapipb.Volume{Name: "data", DurableDir: &ateapipb.DurableDirVolumeSource{}}
-	scratchVolume := &ateapipb.Volume{Name: "scratch", DurableDir: &ateapipb.DurableDirVolumeSource{}}
-	gvisorConfig := &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR, ConfigName: "gvisor-default"}
-	microvmConfig := &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM, ConfigName: "microvm"}
+	// elsewhere, and tmpl-d declares an extra volume.
+	dataVolume := &ateapi.Volume{Name: "data", DurableDir: &ateapi.DurableDirVolumeSource{}}
+	scratchVolume := &ateapi.Volume{Name: "scratch", DurableDir: &ateapi.DurableDirVolumeSource{}}
 	templates := map[string]struct {
-		mountPath     string
-		volumes       []*ateapipb.Volume
-		sandboxConfig *ateapipb.SandboxConfig
+		mountPath string
+		volumes   []*ateapi.Volume
 	}{
-		"tmpl-a": {"/data", []*ateapipb.Volume{dataVolume}, gvisorConfig},
-		"tmpl-b": {"/data", []*ateapipb.Volume{dataVolume}, gvisorConfig},
-		"tmpl-c": {"/mnt/data", []*ateapipb.Volume{dataVolume}, gvisorConfig},
-		"tmpl-d": {"/data", []*ateapipb.Volume{dataVolume, scratchVolume}, gvisorConfig},
-		"tmpl-e": {"/data", []*ateapipb.Volume{dataVolume}, microvmConfig},
+		"tmpl-a": {"/data", []*ateapi.Volume{dataVolume}},
+		"tmpl-b": {"/data", []*ateapi.Volume{dataVolume}},
+		"tmpl-c": {"/mnt/data", []*ateapi.Volume{dataVolume}},
+		"tmpl-d": {"/data", []*ateapi.Volume{dataVolume, scratchVolume}},
 	}
 	for name, tmpl := range templates {
-		if _, err := persistence.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
-			Metadata: &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
-			Containers: []*ateapipb.Container{{
+		if _, err := persistence.CreateActorTemplate(ctx, &ateapi.ActorTemplate{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: name},
+			Containers: []*ateapi.Container{{
 				Name:         "main",
 				Image:        "example.com/app:v1",
-				VolumeMounts: []*ateapipb.VolumeMount{{Name: "data", MountPath: tmpl.mountPath}},
+				VolumeMounts: []*ateapi.VolumeMount{{Name: "data", MountPath: tmpl.mountPath}},
 			}},
-			Volumes:         tmpl.volumes,
-			SnapshotsConfig: &ateapipb.SnapshotsConfig{StorageLocation: "gs://my-bucket/snapshots"},
-			SandboxConfig:   tmpl.sandboxConfig,
+			Volumes:        tmpl.volumes,
+			SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: "gs://my-bucket/snapshots"},
+			Resources:      &ateapi.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		}); err != nil {
 			t.Fatalf("creating template %s: %v", name, err)
 		}
 	}
 
-	created := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
-		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	created := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
 	})
 	svc := &RPCService{impl: newServiceImpl(persistence, nil)}
 
 	// Repointing at a template that does not exist is rejected.
-	_, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	_, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      created.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "absent"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "absent"},
 	}})
-	if got := status.Code(err); got != codes.FailedPrecondition {
+	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("UpdateActor to an absent template = %v, want FailedPrecondition (err: %v)", got, err)
 	}
 
 	// Repointing at a template with different volume mounts is rejected.
-	_, err = svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	_, err = svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      created.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-c"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-c"},
 	}})
-	if got := status.Code(err); got != codes.FailedPrecondition {
+	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("UpdateActor to a template with different mounts = %v, want FailedPrecondition (err: %v)", got, err)
 	}
 
 	// Repointing at a template with different volumes is rejected.
-	_, err = svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	_, err = svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      created.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-d"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-d"},
 	}})
-	if got := status.Code(err); got != codes.FailedPrecondition {
+	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("UpdateActor to a template with different volumes = %v, want FailedPrecondition (err: %v)", got, err)
-	}
-
-	// Repointing at a template naming a different SandboxConfig is rejected.
-	_, err = svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
-		Metadata:      created.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-e"},
-	}})
-	if got := status.Code(err); got != codes.FailedPrecondition {
-		t.Fatalf("UpdateActor to a template with a different sandbox config = %v, want FailedPrecondition (err: %v)", got, err)
 	}
 
 	// Repointing at an existing template with identical volumes and mounts
 	// succeeds.
-	updated, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	updated, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      created.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-b"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-b"},
 	}})
 	if err != nil {
 		t.Fatalf("UpdateActor failed: %v", err)
@@ -969,45 +349,78 @@ func TestUpdateActor_RepointTemplate(t *testing.T) {
 	}
 
 	// When the old template no longer exists there is nothing left to
-	// compare the sandbox config or volume layout against, so the repoint
-	// only requires the new ref to resolve.
-	orphan := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "orphan-actor"},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-gone"},
-		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	// compare the volume layout against, so the repoint only requires the new
+	// ref to resolve.
+	orphan := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "orphan-actor"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-gone"},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
 	})
-	repointed, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	repointed, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      orphan.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-e"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-d"},
 	}})
 	if err != nil {
 		t.Fatalf("UpdateActor from a deleted template failed: %v", err)
 	}
-	if got, want := repointed.GetActorTemplate().GetName(), "tmpl-e"; got != want {
+	if got, want := repointed.GetActorTemplate().GetName(), "tmpl-d"; got != want {
 		t.Errorf("updated actor_template.name = %q, want %q", got, want)
 	}
 
 	// Repointing an actor that is not suspended is rejected, even at a
 	// compatible template.
-	running := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "running-actor"},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
-		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
+	running := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "running-actor"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
 	})
-	_, err = svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	_, err = svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:      running.GetMetadata(),
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-b"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-b"},
 	}})
-	if got := status.Code(err); got != codes.FailedPrecondition {
+	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("UpdateActor repointing a running actor = %v, want FailedPrecondition (err: %v)", got, err)
+	}
+
+	// Repointing a suspended actor is allowed even when it holds a node-local
+	// snapshot.
+	for _, name := range []string{"paused-actor", "uploaded-paused-actor"} {
+		paused := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: name},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		})
+		uploaded := mustActorSnapshotURI(t, &ateapi.ActorTemplate{SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: "gs://my-bucket/snapshots"}}, paused, "pause-snap")
+		paused = mustUpdateActorStatus(t, ctx, persistence, paused, func(s *ateapi.ActorStatus) {
+			snap := newPausedSnapshot(t, 1, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "pause-snap", "node-1")
+			if name == "uploaded-paused-actor" {
+				snap.DurableSnapshot = &ateapi.SnapshotStorage{
+					State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+					Object: &ateapi.ObjectSnapshot{SnapshotUri: uploaded.String()},
+				}
+			}
+			s.AssignedNode = "node-1"
+			s.LastAssignedGeneration = 1
+			s.Snapshots = []*ateapi.Snapshot{snap}
+		})
+		repointedPaused, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
+			Metadata:      paused.GetMetadata(),
+			ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-b"},
+		}})
+		if err != nil {
+			t.Fatalf("UpdateActor repointing %s failed: %v", name, err)
+		}
+		if got, want := repointedPaused.GetActorTemplate().GetName(), "tmpl-b"; got != want {
+			t.Errorf("%s actor_template.name = %q, want %q", name, got, want)
+		}
 	}
 
 	// An update that keeps the template ref is still allowed while running:
 	// the suspended-state gate applies only to repoints.
-	kept, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+	kept, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
 		Metadata:       running.GetMetadata(),
-		ActorTemplate:  &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
-		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}},
+		ActorTemplate:  &ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-a"},
+		WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}},
 	}})
 	if err != nil {
 		t.Fatalf("UpdateActor keeping the template on a running actor failed: %v", err)
@@ -1017,27 +430,233 @@ func TestUpdateActor_RepointTemplate(t *testing.T) {
 	}
 }
 
+// TestUpdateActor_RepointTemplateStorageLocation covers the storage location
+// check on a repoint: an actor that owns an external snapshot may only move to
+// a template storing snapshots under the same location, so deleting the actor
+// still collects everything it wrote. Stored data the check cannot parse is a
+// server fault: the error carries no status, which ServerUnaryInterceptor
+// answers with INTERNAL. With the PerTemplateSnapshotLocation preview gate off,
+// every template resolves to --snapshot-location, so template locations
+// cannot block a repoint.
+func TestUpdateActor_RepointTemplateStorageLocation(t *testing.T) {
+	ctx := context.Background()
+	persistence, cleanup := storetest.SetupTestStore(t)
+	t.Cleanup(cleanup)
+
+	storetest.MustCreateAtespace(t, ctx, persistence, testAtespace)
+	const (
+		sameLocation      = "gs://my-bucket/snapshots"
+		differentLocation = "gs://other-bucket/snapshots"
+	)
+	// same-location-slash spells sameLocation differently but resolves to the
+	// same prefix. corrupt has no bucket, which template validation rejects, so
+	// only a write straight to the store can leave it behind.
+	for name, location := range map[string]string{
+		"same-location":       sameLocation,
+		"same-location-slash": sameLocation + "/",
+		"different-location":  differentLocation,
+		"corrupt":             "gs:///snapshots",
+	} {
+		if _, err := persistence.CreateActorTemplate(ctx, &ateapi.ActorTemplate{
+			Metadata:       &ateapi.ResourceMetadata{Atespace: testAtespace, Name: name},
+			SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: location},
+		}); err != nil {
+			t.Fatalf("creating template %s: %v", name, err)
+		}
+	}
+
+	snapshotOwnedByActor := func(t *testing.T, actor *ateapi.Actor) string {
+		t.Helper()
+		uri, err := resources.NewActorSnapshotURI(sameLocation, testAtespace, actor.GetMetadata().GetUid(), "snap")
+		if err != nil {
+			t.Fatalf("NewActorSnapshotURI: %v", err)
+		}
+		return uri.String()
+	}
+	snapshotOwnedByTag := func(t *testing.T, _ *ateapi.Actor) string {
+		t.Helper()
+		uri, err := resources.NewTagSnapshotURI(sameLocation, testAtespace, "0c6e2f4a-8b1d-4e57-a3f9-2d7c5b8e1a60")
+		if err != nil {
+			t.Fatalf("NewTagSnapshotURI: %v", err)
+		}
+		return uri.String()
+	}
+	tests := []struct {
+		name     string
+		template string
+		snapshot func(*testing.T, *ateapi.Actor) string
+		// pending leaves the snapshot's upload PENDING, as an async suspend does.
+		pending bool
+		// lastAssignedGen overrides status.LastAssignedGeneration when > 0
+		// (e.g. after a reverted or crashed suspend pruned a higher
+		// pending generation).
+		lastAssignedGen int32
+		repointTo       string
+		// gateOff disables the PerTemplateSnapshotLocation preview gate, so
+		// every template resolves to clusterSnapshotLocation.
+		gateOff                 bool
+		clusterSnapshotLocation string
+		wantCode                codes.Code
+	}{
+		{
+			name:      "no external snapshot moves freely",
+			template:  "same-location",
+			repointTo: "different-location",
+			wantCode:  codes.OK,
+		},
+		{
+			name:      "snapshot borrowed from a tag moves freely",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByTag,
+			repointTo: "different-location",
+			wantCode:  codes.OK,
+		},
+		{
+			name:      "owned snapshot moves to the same location spelled differently",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			repointTo: "same-location-slash",
+			wantCode:  codes.OK,
+		},
+		{
+			name:      "owned snapshot cannot move to another location",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			repointTo: "different-location",
+			wantCode:  codes.FailedPrecondition,
+		},
+		{
+			name:      "pending owned upload moves to the same location",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			pending:   true,
+			repointTo: "same-location-slash",
+			wantCode:  codes.OK,
+		},
+		{
+			name:      "pending owned upload cannot move to another location",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			pending:   true,
+			repointTo: "different-location",
+			wantCode:  codes.FailedPrecondition,
+		},
+		{
+			name:            "owned snapshot after reverted later generation cannot move to another location",
+			template:        "same-location",
+			snapshot:        snapshotOwnedByActor,
+			lastAssignedGen: 2,
+			repointTo:       "different-location",
+			wantCode:        codes.FailedPrecondition,
+		},
+		{
+			name:      "snapshot location repoint is checked even when old template is gone",
+			template:  "gone",
+			snapshot:  snapshotOwnedByActor,
+			repointTo: "different-location",
+			wantCode:  codes.FailedPrecondition,
+		},
+		{
+			name:      "invalid storage location on the new template",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			repointTo: "corrupt",
+			wantCode:  codes.Internal,
+		},
+		{
+			name:                    "gate off: owned snapshot moves between template locations, which are ignored",
+			template:                "same-location",
+			snapshot:                snapshotOwnedByActor,
+			repointTo:               "different-location",
+			gateOff:                 true,
+			clusterSnapshotLocation: sameLocation,
+			wantCode:                codes.OK,
+		},
+		{
+			name:                    "gate off: an invalid template location is ignored",
+			template:                "same-location",
+			snapshot:                snapshotOwnedByActor,
+			repointTo:               "corrupt",
+			gateOff:                 true,
+			clusterSnapshotLocation: sameLocation,
+			wantCode:                codes.OK,
+		},
+		{
+			name:      "gate off without --snapshot-location has no location to check",
+			template:  "same-location",
+			snapshot:  snapshotOwnedByActor,
+			repointTo: "different-location",
+			gateOff:   true,
+			wantCode:  codes.FailedPrecondition,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.gateOff {
+				preview.InitForTest(t)
+			}
+			impl := newServiceImpl(persistence, nil)
+			impl.clusterSnapshotLocation = tt.clusterSnapshotLocation
+			svc := &RPCService{impl: impl}
+			actor := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: fmt.Sprintf("actor-%d", i)},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: tt.template},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+			})
+			if tt.snapshot != nil {
+				uri := tt.snapshot(t, actor)
+				storageState := ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+				if tt.pending {
+					storageState = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+				}
+				actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+					s.LastAssignedGeneration = 1
+					if tt.lastAssignedGen > 0 {
+						s.LastAssignedGeneration = tt.lastAssignedGen
+					}
+					s.Snapshots = []*ateapi.Snapshot{
+						newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "snapshot", uri, storageState),
+					}
+				})
+			}
+
+			updated, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: &ateapi.Actor{
+				Metadata:      actor.GetMetadata(),
+				ActorTemplate: &ateapi.ObjectRef{Atespace: testAtespace, Name: tt.repointTo},
+			}})
+			if got := apierror.Code(err); got != tt.wantCode {
+				t.Fatalf("UpdateActor to %s = %v, want %v (err: %v)", tt.repointTo, got, tt.wantCode, err)
+			}
+			if err == nil {
+				if got := updated.GetActorTemplate().GetName(); got != tt.repointTo {
+					t.Errorf("updated actor_template.name = %q, want %q", got, tt.repointTo)
+				}
+			}
+		})
+	}
+}
+
 // TestValidateTemplateVolumesUnchanged exercises the volumes and
 // per-container mount comparison applied when an actor is repointed at a
 // replacement template.
 func TestValidateTemplateVolumesUnchanged(t *testing.T) {
-	dataVolume := &ateapipb.Volume{Name: "data", DurableDir: &ateapipb.DurableDirVolumeSource{}}
-	scratchVolume := &ateapipb.Volume{Name: "scratch", DurableDir: &ateapipb.DurableDirVolumeSource{}}
-	template := func(volumes []*ateapipb.Volume, containers ...*ateapipb.Container) *ateapipb.ActorTemplate {
-		return &ateapipb.ActorTemplate{Volumes: volumes, Containers: containers}
+	dataVolume := &ateapi.Volume{Name: "data", DurableDir: &ateapi.DurableDirVolumeSource{}}
+	scratchVolume := &ateapi.Volume{Name: "scratch", DurableDir: &ateapi.DurableDirVolumeSource{}}
+	template := func(volumes []*ateapi.Volume, containers ...*ateapi.Container) *ateapi.ActorTemplate {
+		return &ateapi.ActorTemplate{Volumes: volumes, Containers: containers}
 	}
-	container := func(name string, mounts ...*ateapipb.VolumeMount) *ateapipb.Container {
-		return &ateapipb.Container{Name: name, Image: "example.com/app:v1", VolumeMounts: mounts}
+	container := func(name string, mounts ...*ateapi.VolumeMount) *ateapi.Container {
+		return &ateapi.Container{Name: name, Image: "example.com/app:v1", VolumeMounts: mounts}
 	}
-	dataMount := &ateapipb.VolumeMount{Name: "data", MountPath: "/data"}
-	scratchMount := &ateapipb.VolumeMount{Name: "scratch", MountPath: "/scratch"}
+	dataMount := &ateapi.VolumeMount{Name: "data", MountPath: "/data"}
+	scratchMount := &ateapi.VolumeMount{Name: "scratch", MountPath: "/scratch"}
 
-	oneVolume := []*ateapipb.Volume{dataVolume}
-	twoVolumes := []*ateapipb.Volume{dataVolume, scratchVolume}
+	oneVolume := []*ateapi.Volume{dataVolume}
+	twoVolumes := []*ateapi.Volume{dataVolume, scratchVolume}
 
 	tests := []struct {
 		name             string
-		oldTmpl, newTmpl *ateapipb.ActorTemplate
+		oldTmpl, newTmpl *ateapi.ActorTemplate
 		wantErr          bool
 	}{{
 		name:    "identical volumes and mounts",
@@ -1060,22 +679,22 @@ func TestValidateTemplateVolumesUnchanged(t *testing.T) {
 	}, {
 		name:    "volume renamed",
 		oldTmpl: template(oneVolume, container("main", dataMount)),
-		newTmpl: template([]*ateapipb.Volume{{Name: "data2", DurableDir: &ateapipb.DurableDirVolumeSource{}}}, container("main", dataMount)),
+		newTmpl: template([]*ateapi.Volume{{Name: "data2", DurableDir: &ateapi.DurableDirVolumeSource{}}}, container("main", dataMount)),
 		wantErr: true,
 	}, {
 		name:    "volume source changed",
 		oldTmpl: template(oneVolume, container("main", dataMount)),
-		newTmpl: template([]*ateapipb.Volume{{Name: "data", Image: &ateapipb.ImageVolumeSource{Reference: "example.com/data@sha256:0f9c04b7387d13ba9d15ec50355f9ad533fee2e5ad25378753a30671f8f9b938"}}}, container("main", dataMount)),
+		newTmpl: template([]*ateapi.Volume{{Name: "data", Image: &ateapi.ImageVolumeSource{Reference: "example.com/data@sha256:0f9c04b7387d13ba9d15ec50355f9ad533fee2e5ad25378753a30671f8f9b938"}}}, container("main", dataMount)),
 		wantErr: true,
 	}, {
 		name:    "volume order changed",
 		oldTmpl: template(twoVolumes, container("main", dataMount)),
-		newTmpl: template([]*ateapipb.Volume{scratchVolume, dataVolume}, container("main", dataMount)),
+		newTmpl: template([]*ateapi.Volume{scratchVolume, dataVolume}, container("main", dataMount)),
 		wantErr: true,
 	}, {
 		name:    "mount path changed",
 		oldTmpl: template(oneVolume, container("main", dataMount)),
-		newTmpl: template(oneVolume, container("main", &ateapipb.VolumeMount{Name: "data", MountPath: "/mnt/data"})),
+		newTmpl: template(oneVolume, container("main", &ateapi.VolumeMount{Name: "data", MountPath: "/mnt/data"})),
 		wantErr: true,
 	}, {
 		name:    "mount added",
@@ -1112,7 +731,7 @@ func TestValidateTemplateVolumesUnchanged(t *testing.T) {
 				t.Fatalf("validateVolumeMountsUnchanged() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if err != nil {
-				if got := status.Code(err); got != codes.FailedPrecondition {
+				if got := apierror.Code(err); got != codes.FailedPrecondition {
 					t.Errorf("status code = %v, want FailedPrecondition", got)
 				}
 			}
@@ -1131,36 +750,37 @@ func TestUpdateActor_DeleteRecreateRace(t *testing.T) {
 
 	// Actor A: what the client reads, and what its uid precondition names.
 	// Freshly created, so it sits at version 1.
-	original := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
-		Status: &ateapipb.ActorStatus{
-			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPod: "pod-a"},
+	original := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+		Status: &ateapi.ActorStatus{
+			State:            ateapi.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapi.WorkerAssignment{WorkerPod: "pod-a"},
 		},
 	})
 
 	// A concurrent client deletes A and recreates the same atespace/name as a
 	// brand new actor B, in the window the handler used to leave open between
 	// its own read and the store's WATCH.
-	var recreated *ateapipb.Actor
+	var recreated *ateapi.Actor
 	var err error
 	racing := &conflictInjectingStore{
 		Interface: persistence,
 		inject: func() {
-			if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(original), func(toUpdate *ateapipb.Actor) error {
-				toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_DELETING
+			// A delete releases the Actor's worker before removing it.
+			if _, err := persistence.MarkActorForDeletion(ctx, actorRef, store.DeletePreconditions{}, func(a *ateapi.Actor) error {
+				a.Status.WorkerAssignment = nil
 				return nil
 			}); err != nil {
-				t.Fatalf("racing writer: mark deleting: %v", err)
+				t.Fatalf("racing writer: mark for deletion: %v", err)
 			}
-			if _, err := persistence.DeleteActor(ctx, actorRef); err != nil {
+			if _, err := persistence.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
 				t.Fatalf("racing writer: DeleteActor: %v", err)
 			}
-			recreated, err = persistence.CreateActor(ctx, &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
-				Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+			recreated, err = persistence.CreateActor(ctx, &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
 			})
 			if err != nil {
 				t.Fatalf("racing writer: recreate CreateActor: %v", err)
@@ -1170,9 +790,9 @@ func TestUpdateActor_DeleteRecreateRace(t *testing.T) {
 	svc := &RPCService{impl: newServiceImpl(racing, nil)}
 
 	// The client asserts "only update the actor with uid A".
-	original.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}
-	_, err = svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: original})
-	if code := status.Code(err); code != codes.Aborted {
+	original.WorkerSelector = &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}
+	_, err = svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: original})
+	if code := apierror.Code(err); code != codes.Aborted {
 		t.Errorf("UpdateActor error = %v (code %v), want code Aborted: the actor holding uid %s was deleted mid-update",
 			err, code, original.GetMetadata().GetUid())
 	}
@@ -1186,9 +806,9 @@ func TestUpdateActor_DeleteRecreateRace(t *testing.T) {
 	}
 	// The stored record must still be actor B as its creator left it. Any of A's
 	// state showing up here is the clobber.
-	if got := stored.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+	if got := stored.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_SUSPENDED {
 		t.Errorf("stored state = %v, want %v: recreated actor was overwritten with the deleted actor's state",
-			got, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+			got, ateapi.ActorState_ACTOR_STATE_SUSPENDED)
 	}
 	if got := stored.GetStatus().GetWorkerAssignment(); got != nil {
 		t.Errorf("stored worker_assignment = %v, want nil: recreated actor inherited the deleted actor's worker", got)
@@ -1209,10 +829,10 @@ func TestUpdateActor_ConcurrentDisjointUpdates(t *testing.T) {
 
 	actorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorID}
 
-	original := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
-		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
+	original := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: testAtespace, Name: testActorID},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
 	})
 
 	// A suspend workflow bumps state (a field that a later update operation will not touch)
@@ -1220,8 +840,8 @@ func TestUpdateActor_ConcurrentDisjointUpdates(t *testing.T) {
 	racing := &conflictInjectingStore{
 		Interface: persistence,
 		inject: func() {
-			if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(original), func(toUpdate *ateapipb.Actor) error {
-				toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDING
+			if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(original), func(toUpdate *ateapi.Actor) error {
+				toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_SUSPENDING
 				return nil
 			}); err != nil {
 				t.Fatalf("racing writer: mark suspending: %v", err)
@@ -1232,9 +852,9 @@ func TestUpdateActor_ConcurrentDisjointUpdates(t *testing.T) {
 
 	// Update operation is changing the worker_selector field, not the actor's state (like the concurrent op)
 	// This update must fail: the racing update bumped the version.
-	original.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}
-	_, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: original})
-	if code := status.Code(err); code != codes.Aborted {
+	original.WorkerSelector = &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}
+	_, err := svc.UpdateActor(ctx, &ateapi.UpdateActorRequest{Actor: original})
+	if code := apierror.Code(err); code != codes.Aborted {
 		t.Errorf("UpdateActor error = %v (code %v), want code Aborted: the guarded version moved under the update", err, code)
 	}
 
@@ -1246,16 +866,16 @@ func TestUpdateActor_ConcurrentDisjointUpdates(t *testing.T) {
 	if got := stored.GetWorkerSelector(); got != nil {
 		t.Errorf("stored worker_selector = %v, want nil: the rejected update was applied anyway", got)
 	}
-	if got := stored.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDING {
-		t.Errorf("stored state = %v, want %v: the concurrent writer's field must survive", got, ateapipb.ActorState_ACTOR_STATE_SUSPENDING)
+	if got := stored.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_SUSPENDING {
+		t.Errorf("stored state = %v, want %v: the concurrent writer's field must survive", got, ateapi.ActorState_ACTOR_STATE_SUSPENDING)
 	}
 }
 
 // validActor returns a minimal Actor which should pass input validation.
-func validActor(mods ...func(*ateapipb.Actor)) *ateapipb.Actor {
-	a := &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1"},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+func validActor(mods ...func(*ateapi.Actor)) *ateapi.Actor {
+	a := &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: "ns1", Name: "id1"},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
 	}
 	for _, m := range mods {
 		m(a)
@@ -1263,18 +883,12 @@ func validActor(mods ...func(*ateapipb.Actor)) *ateapipb.Actor {
 	return a
 }
 
-// withActorMetadata returns a modifier func (see validActor) which sets
-// the actor's resource metadata to a valid value.
-func withActorMetadata(mutate func(*ateapipb.ResourceMetadata)) func(*ateapipb.Actor) {
-	return func(a *ateapipb.Actor) { mutate(a.Metadata) }
-}
-
 // withActorStatus returns a modifier func (see validActor) which sets the
 // actor's status to a valid value.
-func withActorStatus(mods ...func(*ateapipb.ActorStatus)) func(*ateapipb.Actor) {
-	return func(a *ateapipb.Actor) {
-		a.Status = &ateapipb.ActorStatus{
-			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+func withActorStatus(mods ...func(*ateapi.ActorStatus)) func(*ateapi.Actor) {
+	return func(a *ateapi.Actor) {
+		a.Status = &ateapi.ActorStatus{
+			State: ateapi.ActorState_ACTOR_STATE_SUSPENDED,
 		}
 		for _, m := range mods {
 			m(a.Status)
@@ -1282,49 +896,9 @@ func withActorStatus(mods ...func(*ateapipb.ActorStatus)) func(*ateapipb.Actor) 
 	}
 }
 
-// withActorWorkerSelector returns a modifier func (see validActor) which sets
-// the actor's worker_selector to a valid value.
-func withActorWorkerSelector(labels map[string]string) func(*ateapipb.Actor) {
-	return func(a *ateapipb.Actor) {
-		a.WorkerSelector = &ateapipb.Selector{
-			MatchLabels: labels,
-		}
-	}
-}
-
-// withActorActorTemplate returns a modifier func (see validActor) which sets
-// the actor's actor_template to a valid value.
-func withActorActorTemplate(atespace, name string) func(*ateapipb.Actor) {
-	return func(a *ateapipb.Actor) { a.ActorTemplate = &ateapipb.ObjectRef{Atespace: atespace, Name: name} }
-}
-
-// withActorSourceSnapshotTag returns a modifier func (see validActor) which sets
-// the actor's source_snapshot_tag to a valid value.
-func withActorSourceSnapshotTag(atespace, name string) func(*ateapipb.Actor) {
-	return func(a *ateapipb.Actor) { a.SourceSnapshotTag = &ateapipb.ObjectRef{Atespace: atespace, Name: name} }
-}
-
-// withActorWorkerAssignment returns a modifier func (see validActor) which sets
-// the actor's worker_assignment to a valid value.
-func withActorWorkerAssignment(mods ...func(*ateapipb.WorkerAssignment)) func(*ateapipb.ActorStatus) {
-	return func(s *ateapipb.ActorStatus) {
-		s.WorkerAssignment = &ateapipb.WorkerAssignment{
-			Worker:          &ateapipb.ObjectRef{Name: "worker"},
-			WorkerNamespace: "ns",
-			WorkerPool:      "pool",
-			WorkerPod:       "pod",
-			WorkerPodUid:    "12345678-1234-1234-1234-123456789abc",
-			WorkerPodIp:     "1.2.3.4",
-		}
-		for _, m := range mods {
-			m(s.WorkerAssignment)
-		}
-	}
-}
-
 // rpcServiceWithActor seeds one actor in a PostgreSQL-backed store and returns an
 // RPCService over it.
-func rpcServiceWithActor(t *testing.T, actor *ateapipb.Actor) (*RPCService, *ateapipb.Actor) {
+func rpcServiceWithActor(t *testing.T, actor *ateapi.Actor) (*RPCService, *ateapi.Actor) {
 	t.Helper()
 	persistence, cleanup := storetest.SetupTestStore(t)
 	t.Cleanup(cleanup)
@@ -1333,150 +907,159 @@ func rpcServiceWithActor(t *testing.T, actor *ateapipb.Actor) (*RPCService, *ate
 	return &RPCService{impl: newServiceImpl(persistence, nil)}, created
 }
 
-func TestValidateDeleteActorRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.DeleteActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		&ateapipb.DeleteActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"}},
-		nil,
-	}, {
-		"missing actor",
-		&ateapipb.DeleteActorRequest{},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.atespace",
-		&ateapipb.DeleteActorRequest{Actor: &ateapipb.ObjectRef{Name: "id1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "atespace"), "")},
-	}, {
-		"invalid actor.atespace",
-		&ateapipb.DeleteActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.name",
-		&ateapipb.DeleteActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "name"), "")},
-	}, {
-		"invalid actor.name",
-		&ateapipb.DeleteActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "name"), "ID1", "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
+func TestCreateActor_DoesNotInheritGoldenEgressPolicy(t *testing.T) {
+	preview.InitForTest(t, "GoldenEgressPolicy")
+	for _, tt := range []struct {
+		name   string
+		policy *ateapi.EgressPolicyTemplate
+	}{
+		{name: "absent"},
+		{name: "configured", policy: &ateapi.EgressPolicyTemplate{Rules: []*ateapi.EgressRule{
+			{Http: &ateapi.HttpRule{Hostnames: []string{"api.example.com"}}},
+			{Https: &ateapi.HttpsRule{Hostnames: []string{"api.example.com"}}},
+		}}},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateDeleteActorRequest(context.Background(), tt.req), tt.want)
+			ctx := t.Context()
+			persistence := newTestPersistence(t)
+			impl := newServiceImpl(persistence, nil)
+			impl.clusterSnapshotLocation = "gs://cluster-bucket/"
+			svc := &RPCService{impl: impl}
+			storetest.MustCreateAtespace(t, ctx, persistence, "templates")
+			storetest.MustCreateAtespace(t, ctx, persistence, "actors")
+			tmpl, err := svc.CreateActorTemplate(ctx, &ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+				tmpl.Metadata = &ateapi.ResourceMetadata{Atespace: "templates", Name: "tmpl"}
+				tmpl.GoldenEgressPolicy = tt.policy
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmplRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
+			// Existing templates remain usable without the preview gate.
+			preview.InitForTest(t)
+			for _, target := range []resources.ActorRef{
+				{Atespace: "actors", Name: "alpha"},
+				{Atespace: "actors", Name: tmpl.GetMetadata().GetUid()},
+				{Atespace: tmpl.GetMetadata().GetAtespace(), Name: tmpl.GetMetadata().GetUid()},
+			} {
+				actor, err := svc.CreateActor(ctx, &ateapi.CreateActorRequest{Actor: &ateapi.Actor{
+					Metadata: &ateapi.ResourceMetadata{Atespace: target.Atespace, Name: target.Name}, ActorTemplate: tmplRef,
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ref := resources.ActorRefFromActor(actor).ToObjectRef()
+				if _, err := svc.GetActorEgressPolicy(ctx, &ateapi.GetActorEgressPolicyRequest{Actor: ref, Name: resources.SingletonName}); apierror.Code(err) != codes.NotFound {
+					t.Fatalf("actor %v inherited golden policy: %v, want NotFound", target, err)
+				}
+				if _, err := svc.CreateActorEgressPolicy(ctx, &ateapi.CreateActorEgressPolicyRequest{
+					Actor: ref,
+					EgressPolicy: &ateapi.EgressPolicy{
+						Metadata: &ateapi.ResourceMetadata{Atespace: target.Atespace, Name: resources.SingletonName},
+						Rules:    []*ateapi.EgressRule{{Https: &ateapi.HttpsRule{Hostnames: []string{"runtime.example.com"}}}},
+					},
+				}); err != nil {
+					t.Fatalf("creating the actor's runtime policy: %v", err)
+				}
+			}
+			gotTemplate, err := svc.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: tmplRef})
+			if err != nil || !proto.Equal(gotTemplate, tmpl) {
+				t.Fatalf("creating runtime policies changed the template: %v, %v", gotTemplate, err)
+			}
 		})
 	}
 }
 
-func TestValidatePauseActorRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.PauseActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		&ateapipb.PauseActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"}},
-		nil,
-	}, {
-		"missing actor",
-		&ateapipb.PauseActorRequest{},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.atespace",
-		&ateapipb.PauseActorRequest{Actor: &ateapipb.ObjectRef{Name: "id1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "atespace"), "")},
-	}, {
-		"invalid actor.atespace",
-		&ateapipb.PauseActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.name",
-		&ateapipb.PauseActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "name"), "")},
-	}, {
-		"invalid actor.name",
-		&ateapipb.PauseActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "name"), "ID1", "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validatePauseActorRequest(context.Background(), tt.req), tt.want)
-		})
-	}
-}
-
-func TestValidateResumeActorRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.ResumeActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		&ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"}},
-		nil,
-	}, {
-		"missing actor",
-		&ateapipb.ResumeActorRequest{},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.atespace",
-		&ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Name: "id1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "atespace"), "")},
-	}, {
-		"invalid actor.atespace",
-		&ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.name",
-		&ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "name"), "")},
-	}, {
-		"invalid actor.name",
-		&ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "name"), "ID1", "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateResumeActorRequest(context.Background(), tt.req), tt.want)
-		})
-	}
-}
-
-func TestValidateSuspendActorRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		req  *ateapipb.SuspendActorRequest
-		want field.ErrorList
-	}{{
-		"valid",
-		&ateapipb.SuspendActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"}},
-		nil,
-	}, {
-		"missing actor",
-		&ateapipb.SuspendActorRequest{},
-		field.ErrorList{field.Required(field.NewPath("actor"), "")},
-	}, {
-		"missing actor.atespace",
-		&ateapipb.SuspendActorRequest{Actor: &ateapipb.ObjectRef{Name: "id1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "atespace"), "")},
-	}, {
-		"invalid actor.atespace",
-		&ateapipb.SuspendActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "atespace"), "NS1", "").WithOrigin("format=k8s-short-name")},
-	}, {
-		"missing actor.name",
-		&ateapipb.SuspendActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1"}},
-		field.ErrorList{field.Required(field.NewPath("actor", "name"), "")},
-	}, {
-		"invalid actor.name",
-		&ateapipb.SuspendActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"}},
-		field.ErrorList{field.Invalid(field.NewPath("actor", "name"), "ID1", "").WithOrigin("format=k8s-short-name")},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateSuspendActorRequest(context.Background(), tt.req), tt.want)
+func TestCreateActor_GoldenTagDefault(t *testing.T) {
+	for _, scenario := range []string{"default", "explicit tag", "own snapshot", "missing", "pending", "wrong template", "data scope"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := t.Context()
+			persistence := newTestPersistence(t)
+			storetest.MustCreateAtespace(t, ctx, persistence, "team-a")
+			tmpl := seedSubstrateTemplate(t, ctx, persistence, "tmpl")
+			ref := &ateapi.ObjectRef{Atespace: "team-a", Name: tmpl.GetMetadata().GetUid()}
+			tag := &ateapi.Tag{
+				Metadata:    &ateapi.ResourceMetadata{Atespace: ref.Atespace, Name: ref.Name},
+				SourceActor: ref,
+				Scope:       ateapi.TagScope_TAG_SCOPE_PUBLISHED,
+				Status: &ateapi.TagStatus{
+					ActorTemplateUid: tmpl.GetMetadata().GetUid(),
+					Snapshot:         newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmpl.GetMetadata().GetUid(), someActorUID, "gs://bucket/atespaces/team-a/tags/"+someActorUID, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
+				},
+			}
+			wantCode := codes.OK
+			switch scenario {
+			case "missing":
+				wantCode = codes.FailedPrecondition
+			case "pending":
+				tag.Status.Snapshot = nil
+				wantCode = codes.FailedPrecondition
+			case "wrong template":
+				tag.Status.ActorTemplateUid = "other"
+				wantCode = codes.FailedPrecondition
+			case "data scope":
+				tag.Status.Snapshot.Fidelity = ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+			}
+			if scenario != "missing" {
+				if _, err := persistence.CreateTag(ctx, tag); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := persistence.UpdateActorTemplate(ctx, resources.ActorTemplateRefFromActorTemplate(tmpl), store.PreconditionFrom(tmpl), func(db *ateapi.ActorTemplate) error {
+				db.Status = &ateapi.ActorTemplateStatus{GoldenSnapshotStatus: &ateapi.GoldenSnapshotStatus{GoldenTag: ref}}
+				db.GoldenEgressPolicy = &ateapi.EgressPolicyTemplate{Rules: []*ateapi.EgressRule{{Https: &ateapi.HttpsRule{Hostnames: []string{"init.example.com"}, Ports: &ateapi.Ports{Numbers: []int32{443}}}}}}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			actor := &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Atespace: "team-a", Name: "actor"}, ActorTemplate: resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()}
+			if scenario == "explicit tag" {
+				tag.Metadata.Name = "explicit"
+				tag.Status.Snapshot = newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmpl.GetMetadata().GetUid(), "explicit", "gs://bucket/atespaces/team-a/tags/explicit", ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+				if _, err := persistence.CreateTag(ctx, tag); err != nil {
+					t.Fatal(err)
+				}
+				actor.SourceTag = &ateapi.ObjectRef{Atespace: ref.Atespace, Name: "explicit"}
+			}
+			svc := &ServiceImpl{store: persistence}
+			created, err := svc.CreateActor(ctx, actor)
+			if apierror.Code(err) != wantCode {
+				t.Fatalf("CreateActor = %v, want %v", err, wantCode)
+			}
+			if err != nil {
+				return
+			}
+			gotSnap := findLatestDurableSnapshot(created.GetStatus(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+			if gotSnap.GetDurableSnapshot().GetObject().GetSnapshotUri() != tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED) || gotSnap.GetActorTemplateUid() != tmpl.GetMetadata().GetUid() {
+				t.Fatalf("incorrect initial status: %v", created.GetStatus())
+			}
+			if _, err := persistence.GetEgressPolicy(ctx, resources.ActorRefFromActor(created)); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("actor restored from a tag inherited golden policy: %v, want NotFound", err)
+			}
+			if scenario == "own snapshot" {
+				uri, err := resources.NewActorSnapshotURI(tmpl.GetSnapshotConfig().GetStorageLocation(), "team-a", created.GetMetadata().GetUid(), "snapshot")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := persistence.UpdateActor(ctx, resources.ActorRefFromActor(created), store.PreconditionFrom(created), func(db *ateapi.Actor) error {
+					db.Status.LastAssignedGeneration = 1
+					db.Status.Snapshots = []*ateapi.Snapshot{
+						newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmpl.GetMetadata().GetUid(), uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			workflow := &ActorWorkflow{store: persistence}
+			actorRef := resources.ActorRefFromActor(created)
+			loaded, _, err := workflow.loadActorForResume(ctx, actorRef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshotToResume(loaded.GetStatus()) == nil {
+				t.Fatalf("missing snapshot source for %s", scenario)
+			}
 		})
 	}
 }

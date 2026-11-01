@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -33,8 +35,8 @@ import (
 //   - inline, substituted wherever they appear (an empty value just disappears);
 //   - block, which must be the entire content of their line. They expand to a
 //     YAML fragment that brings its own indentation, and an empty value takes
-//     the whole line with it — the same trick hack/install-demo-counter.sh
-//     plays with `sed /.../d`. Requiring the placeholder to be the whole line
+//     the whole line with it — the same trick the installer's renderer plays
+//     with its drop list. Requiring the placeholder to be the whole line
 //     is what lets a comment mention one without being deleted.
 func renderManifest(t *testing.T, relPath string, inline, blocks map[string]string) string {
 	t.Helper()
@@ -98,8 +100,8 @@ func yamlListBlock[T any](t *testing.T, key string, items []T, indent int) strin
 //
 // Through the repo's pinned ko (hack/run-tool.sh), because CI does not install
 // ko on PATH and every other deploy in this repo goes through that wrapper. The
-// trailing `-- --context=...` mirrors run_ko in hack/install-ate.sh: ko's apply
-// subcommand forwards args after `--` to kubectl. KO_CONFIG_PATH is required
+// trailing `-- --context=...` is how ko's apply subcommand takes a context: it
+// forwards args after `--` to kubectl. KO_CONFIG_PATH is required
 // because ko resolves .ko.yaml from its working directory, which is the test's
 // package dir rather than the repo root; without it the build silently loses
 // defaultPlatforms and produces images that cannot run on the cluster's nodes.
@@ -120,12 +122,37 @@ func koApply(t *testing.T, manifest string) {
 // the manifest with those references replaced by pushed digests. Same pinned
 // ko and KO_CONFIG_PATH rules as koApply; resolve is how a manifest that is
 // not destined for kubectl (a protojson ActorTemplate document) still gets
-// its image built.
-func koResolve(t *testing.T, manifest string) []byte {
+// its image built. args go to ko resolve before the manifest.
+func koResolve(t *testing.T, manifest string, args ...string) []byte {
 	t.Helper()
 	root, err := FindRepoRoot()
 	if err != nil {
 		t.Fatalf("FindRepoRoot: %v", err)
 	}
-	return RunCmdOutput(t, []string{"KO_CONFIG_PATH=" + root}, filepath.Join(root, "hack/run-tool.sh"), "ko", "resolve", "-f", manifest)
+	resolveArgs := append([]string{"ko", "resolve"}, args...)
+	resolveArgs = append(resolveArgs, "-f", manifest)
+	return RunCmdOutput(t, []string{"KO_CONFIG_PATH=" + root}, filepath.Join(root, "hack/run-tool.sh"), resolveArgs...)
+}
+
+// ResolveFixtureImage builds a fixture through the same ko resolver used by
+// fixture manifests and returns its digest-pinned image reference.
+func ResolveFixtureImage(t *testing.T, importPath string) string {
+	t.Helper()
+	pod := corev1.Pod{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fixture", Image: "ko://" + importPath}}}}
+	raw, err := yaml.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(t.TempDir(), "fixture-image.yaml")
+	if err := os.WriteFile(manifest, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(koResolve(t, manifest), &pod); err != nil {
+		t.Fatal(err)
+	}
+	image := pod.Spec.Containers[0].Image
+	if !strings.Contains(image, "@sha256:") {
+		t.Fatalf("fixture image %q is not pinned by digest", image)
+	}
+	return image
 }

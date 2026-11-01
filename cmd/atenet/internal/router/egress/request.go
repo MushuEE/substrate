@@ -1,0 +1,210 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package egress
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+const (
+	websocketDeniedBody = "WebSocket egress is not supported"
+	connectDeniedBody   = "CONNECT egress is not supported"
+)
+
+// handleRequest authorizes one request the gateway can read: cleartext HTTP,
+// or HTTPS the gateway terminated. It runs per request, because the
+// Host can change between requests on one connection.
+//
+// The request is decided on the Host it named and the port the actor dialed,
+// by the http rules on the cleartext leg and the https rules on the MITM leg,
+// where the connection's SNI must fall under an https rule too. An allowed
+// request is dialed by the name it was decided on, on the port the actor
+// dialed.
+func (h *Handler) handleRequest(ctx context.Context, md *extproc.RequestMetadata, leg string) (extproc.Result, error) {
+	if isWebSocketUpgrade(md) {
+		slog.WarnContext(ctx, "egress denied: WebSocket upgrades are not supported", slog.String("leg", leg), slog.String("host", md.Host))
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, websocketDeniedBody)
+	}
+	// We don't support Actor making a CONNECT (inside the tunnel).
+	if strings.EqualFold(md.Method, http.MethodConnect) {
+		slog.WarnContext(ctx, "egress denied: CONNECT inside the egress tunnel is not supported", slog.String("leg", leg), slog.String("authority", md.Host))
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, connectDeniedBody)
+	}
+
+	ref, err := actorFromFilterState(md)
+	if err != nil {
+		slog.WarnContext(ctx, "egress denied: request carries no actor identity", slog.String("leg", leg), slog.Any("err", err))
+		return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err, deniedBody)
+	}
+	dest, err := requestDestination(md)
+	if err != nil {
+		slog.WarnContext(ctx, "egress denied: request names no destination a rule could allow",
+			slog.Any("actor", ref), slog.String("leg", leg), slog.Any("err", err))
+		return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err, deniedBody)
+	}
+	policy, err := h.lookupPolicy(ctx, leg, ref)
+	if err != nil {
+		return extproc.Result{}, err
+	}
+
+	decrypted := leg == extproc.EgressTLSMITMFilterChainName
+	sni := md.Attribute(extproc.RequestedServerNameAttribute)
+	// Built lazily: the allow path logs nothing at the default level.
+	attrs := func(decision egresspolicy.Decision) []any {
+		return []any{
+			slog.Any("actor", ref),
+			slog.String("leg", leg),
+			slog.String("method", md.Method),
+			slog.String("host", md.Host),
+			slog.Uint64("dialedPort", uint64(dest.Port)),
+			slog.String("sni", sni),
+			slog.Int("rule", decision.RuleIndex),
+		}
+	}
+	if decrypted {
+		// An https rule intercepts a connection on its SNI and port; the
+		// requests inside are then decided on their authority. The gateway
+		// still intercepts every connection, so the first half is checked
+		// here. A connection that sent no SNI is under no rule.
+		connection := connectionDestination(sni, dest.Port)
+		if decision := policy.EvaluateRequest(connection, true); !decision.Allowed {
+			slog.WarnContext(ctx, "egress denied: no https rule covers the connection's SNI", attrs(decision)...)
+			return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
+		}
+	}
+	decision := policy.EvaluateRequest(dest, decrypted)
+	if !decision.Allowed {
+		// TODO(liorlieberman): do we need an audit mode to roll a policy out
+		// against live traffic without denying it first?
+		slog.WarnContext(ctx, "egress denied: no rule allows the destination", attrs(decision)...)
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
+	}
+	injected, err := h.applyEffects(ctx, ref, dest, md.Headers, decision.Effects)
+	if err != nil {
+		return extproc.Result{}, err
+	}
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.DebugContext(ctx, "egress allowed", append(attrs(decision), slog.Int("injectedHeaders", len(injected)))...)
+	}
+	res := allow()
+	// ext_proc only honors the clear when the response also carries a header
+	// mutation, on the assumption that nothing else can move a route, so an
+	// empty one goes along — carrying any injected credential headers.
+	res.Response.Response.ClearRouteCache = true
+	res.Response.Response.HeaderMutation = &extprocv3.HeaderMutation{SetHeaders: injected}
+	res.DynamicMetadata = metadataAnswer(map[string]string{
+		extproc.EgressDialKey:     extproc.EgressDialName,
+		extproc.EgressDialHostKey: dialHost(dest),
+	})
+	return res, nil
+}
+
+// dialHost is the name dest was decided on, for Envoy's forward proxy to dial
+// on the port the actor dialed. Envoy would dial a port written in the name
+// instead, so it carries none, and it would read an unbracketed IPv6
+// literal's last group as a port.
+func dialHost(dest egresspolicy.Destination) string {
+	switch {
+	case dest.Hostname != "":
+		return dest.Hostname
+	case dest.IP.Is6():
+		return "[" + dest.IP.String() + "]"
+	default:
+		return dest.IP.String()
+	}
+}
+
+func isWebSocketUpgrade(md *extproc.RequestMetadata) bool {
+	return md.Method == "GET" && hasHTTPToken(md.Header("connection"), "upgrade") && hasHTTPToken(md.Header("upgrade"), "websocket")
+}
+
+func hasHTTPToken(value, want string) bool {
+	for _, token := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(token), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// connectionDestination is the SNI a decrypted connection presented, on the
+// port the actor dialed, in the form the https rules are matched against. An
+// SNI that is not a DNS name, or none at all, matches nothing.
+func connectionDestination(sni string, port uint16) egresspolicy.Destination {
+	dest, err := egresspolicy.NormalizeAuthority(sni)
+	if err != nil || dest.Hostname == "" {
+		return egresspolicy.Destination{Port: port}
+	}
+	return egresspolicy.Destination{Hostname: dest.Hostname, Port: port}
+}
+
+// requestDestination is what the request is going to: the Host, a DNS name
+// or an IP literal, and the port the actor dialed, from the CONNECT authority
+// the outer chain shares as filter state. A port in the Host is neither
+// matched nor dialed.
+//
+// A Host header naming something other than :authority is refused rather than
+// policed on one name and dialed on the other. Envoy itself never delivers two
+// different values: HTTP/1.1 has only Host, which it stores as :authority, and
+// on HTTP/2 it drops a Host sent alongside :authority. The check guards a
+// dataplane that forwards both.
+func requestDestination(md *extproc.RequestMetadata) (egresspolicy.Destination, error) {
+	authority := md.Header(extproc.AuthorityHeader)
+	host := md.Header("host")
+	if authority == "" {
+		authority = host
+	}
+	named, err := egresspolicy.NormalizeAuthority(authority)
+	if err != nil {
+		return egresspolicy.Destination{}, err
+	}
+	if host != "" && host != authority {
+		fromHost, err := egresspolicy.NormalizeAuthority(host)
+		if err != nil || fromHost != named {
+			return egresspolicy.Destination{}, fmt.Errorf("request :authority %q and Host %q name different destinations", authority, host)
+		}
+	}
+	dest := egresspolicy.Destination{Hostname: named.Hostname, IP: named.IP}
+	if raw := md.Attribute(extproc.ConnectAuthorityFilterStateAttribute); raw != "" {
+		dialed, err := egresspolicy.NormalizeAuthority(raw)
+		if err != nil || !dialed.IP.IsValid() || dialed.Port == 0 {
+			return egresspolicy.Destination{}, fmt.Errorf("CONNECT authority %q is not an IP:port", raw)
+		}
+		dest.Port = dialed.Port
+	}
+	return dest, nil
+}
+
+// actorFromFilterState reads the actor from the identity filter state the
+// outer CONNECT chain set from the verified peer certificate.
+func actorFromFilterState(md *extproc.RequestMetadata) (resources.ActorRef, error) {
+	id := md.Attribute(extproc.ActorIdentityFilterStateAttribute)
+	if id == "" {
+		return resources.ActorRef{}, errors.New("no actor identity in filter state")
+	}
+	return resources.ActorRefFromWorkerForActorSPIFFEID(id)
+}

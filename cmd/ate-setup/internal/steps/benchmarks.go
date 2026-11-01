@@ -18,21 +18,20 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
 
-// The benchmark and micro-VM stacks are still driven by shell. They orchestrate
-// several other scripts (image builds, asset assembly, object-store staging)
-// that are out of scope for this command, so ate-setup shells out to them with
-// a translated argument list rather than reimplementing them.
-const (
-	deployLocustScript      = "benchmarking/deploy_locust.sh"
-	installMicrovmDepScript = "hack/install-microvm-deps.sh"
-)
+var sandboxConfigGVK = atev1.GroupVersion.WithKind("SandboxConfig")
+
+// The benchmark stack is still driven by shell. It orchestrates image builds
+// and load-test deployment that are out of scope for this command, so
+// ate-setup shells out to it with a translated argument list rather than
+// reimplementing it.
+const deployLocustScript = "benchmarking/deploy_locust.sh"
 
 // BenchmarkOptions shapes the benchmark WorkerPool.
 type BenchmarkOptions struct {
@@ -42,17 +41,19 @@ type BenchmarkOptions struct {
 	SandboxClass string
 }
 
-// Validate checks the options the shell script would otherwise reject after
-// having already started work.
+// Validate is a precondition on the exported benchmark methods. The commands
+// check the same two settings first and report which channel supplied a bad
+// value; these messages name the field, because a caller that reaches them
+// built the options itself and has no channel to be sent to.
 func (o BenchmarkOptions) Validate() error {
 	if o.WorkerCount < 1 {
-		return fmt.Errorf("--worker-count must be at least 1, got %d", o.WorkerCount)
+		return fmt.Errorf("BenchmarkOptions.WorkerCount must be at least 1, got %d", o.WorkerCount)
 	}
 	switch o.SandboxClass {
 	case config.SandboxClassGvisor, config.SandboxClassMicrovm:
 		return nil
 	default:
-		return fmt.Errorf("--sandbox-class must be %s or %s, got %q",
+		return fmt.Errorf("BenchmarkOptions.SandboxClass must be %s or %s, got %q",
 			config.SandboxClassGvisor, config.SandboxClassMicrovm, o.SandboxClass)
 	}
 }
@@ -63,16 +64,20 @@ func (e *Env) DeployBenchmarks(ctx context.Context, opts BenchmarkOptions) error
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	log.Stepf("deploy_benchmarks (worker_count=%d, sandbox_class=%s)", opts.WorkerCount, opts.SandboxClass)
-
-	// The microvm SandboxConfig lives outside the default set installed by
-	// `deploy ate-system`, which only installs gvisor-default. The workloads
-	// deploy references it by name and would fail if this were skipped.
+	if err := e.RequireControlPlane(ctx); err != nil {
+		return err
+	}
 	if opts.SandboxClass == config.SandboxClassMicrovm {
-		if err := e.runScript(ctx, installMicrovmDepScript, "--install"); err != nil {
-			return err
+		ok, err := e.Kube.Exists(ctx, sandboxConfigGVK, "", microvmSandboxConfigName)
+		if err != nil {
+			return fmt.Errorf("while checking sandboxconfig/%s: %w", microvmSandboxConfigName, err)
+		}
+		if !ok {
+			return fmt.Errorf("benchmarks with --sandbox-class=microvm require sandboxconfig/%s; install it with:\n  go run ./cmd/ate-setup deploy sandboxconfig --sandbox-classes=microvm",
+				microvmSandboxConfigName)
 		}
 	}
+	log.Stepf("deploy_benchmarks (worker_count=%d, sandbox_class=%s)", opts.WorkerCount, opts.SandboxClass)
 	return e.runScript(ctx, deployLocustScript, deployLocustArgs(opts, e.Cfg.OtlpEndpoint, e.Cfg.BenchmarkActorMemory)...)
 }
 
@@ -104,28 +109,13 @@ func (e *Env) DeleteBenchmarks(ctx context.Context, opts BenchmarkOptions) error
 		return err
 	}
 	log.Stepf("delete_benchmarks (sandbox_class=%s)", opts.SandboxClass)
-
-	if err := e.runScript(ctx, deployLocustScript, "--delete"); err != nil {
-		return err
-	}
-	// Only tear down the microvm SandboxConfig if the caller opted into
-	// microvm: it is cluster-wide and may be in use by something else.
-	if opts.SandboxClass == config.SandboxClassMicrovm {
-		return e.runScript(ctx, installMicrovmDepScript, "--delete")
-	}
-	return nil
+	return e.runScript(ctx, deployLocustScript, "--delete")
 }
 
 // runScript executes a repository script from the repository root with the
 // environment the shell installer would have given it.
 func (e *Env) runScript(ctx context.Context, relPath string, args ...string) error {
-	cmd := exec.CommandContext(ctx, e.Cfg.Path(relPath), args...)
-	cmd.Dir = e.Cfg.Root
-	cmd.Env = e.Cfg.ScriptEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
+	if err := e.runCmd(ctx, os.Stdin, e.Cfg.Path(relPath), args...); err != nil {
 		return fmt.Errorf("while running %s: %w", relPath, err)
 	}
 	return nil

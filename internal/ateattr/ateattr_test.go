@@ -15,22 +15,17 @@
 package ateattr
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"maps"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/ateerrors"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/resources"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 )
 
 func toMap(kvs []attribute.KeyValue) map[attribute.Key]attribute.Value {
@@ -73,14 +68,14 @@ func assertAttrs(t *testing.T, got map[attribute.Key]attribute.Value, want map[a
 func TestActorAttributes(t *testing.T) {
 	tests := []struct {
 		name  string
-		actor *ateapipb.Actor
+		actor *ateapi.Actor
 		want  map[attribute.Key]any
 	}{
 		{
 			name: "full actor",
-			actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "support-agent-42", Uid: "uid-abc", Version: 7},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: "ate-agents", Name: "support-agent"},
+			actor: &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: "team-a", Name: "support-agent-42", Uid: "uid-abc", Version: 7},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "ate-agents", Name: "support-agent"},
 			},
 			want: map[attribute.Key]any{
 				AtespaceKey:         "team-a",
@@ -158,19 +153,18 @@ func TestKeySpellings(t *testing.T) {
 		{TemplateNameKey, "ate.template.name"},
 		{TemplateAtespaceKey, "ate.template.atespace"},
 		{ActorVersionKey, "ate.actor.version"},
+		{ActorStateKey, "ate.actor.state"},
 		{ActorOperationNameKey, "ate.actor.operation.name"},
 		{WorkerPoolNamespaceKey, "ate.workerpool.namespace"},
 		{WorkerPoolNameKey, "ate.workerpool.name"},
 		{WorkerStateKey, "ate.worker.state"},
 		{SandboxClassKey, "ate.sandbox.class"},
 		{SnapshotKindKey, "ate.snapshot.kind"},
-		{SnapshotScopeKey, "ate.snapshot.scope"},
+		{SnapshotFidelityKey, "ate.snapshot.fidelity"},
 		{SnapshotPhaseKey, "ate.snapshot.phase"},
 		{ImageCacheOutcomeKey, "ate.imagecache.outcome"},
 		{SchedulerOutcomeKey, "ate.scheduler.outcome"},
 		{ErrorTypeKey, "error.type"},
-		{FailureReasonKey, "ate.failure.reason"},
-		{FailureDomainKey, "ate.failure.domain"},
 		{OTLPRelayKey, "ate.otlp.relay"},
 	}
 	for _, tt := range tests {
@@ -376,13 +370,15 @@ func TestMetricLabelValues(t *testing.T) {
 		want string
 	}{
 		{WorkerStateIdle, "idle"},
-		{WorkerStateAssigned, "assigned"},
+		{WorkerStatePartial, "partial"},
+		{WorkerStateAtCapacity, "at_capacity"},
+		{WorkerStateUnschedulable, "unschedulable"},
 
 		{OperationCreate, "create"},
 		{OperationResume, "resume"},
 		{OperationSuspend, "suspend"},
-		{OperationPause, "pause"},
 		{OperationDelete, "delete"},
+		{OperationRevert, "revert"},
 		{OperationUnknown, "unknown"},
 
 		{ImageCacheOutcomeHit, "hit"},
@@ -392,30 +388,36 @@ func TestMetricLabelValues(t *testing.T) {
 		{ImageCacheOutcomeTimeout, "timeout"},
 
 		{SchedulerOutcomeAssigned, "assigned"},
-		{SchedulerOutcomeNoFreeWorker, "no_free_worker"},
+		{SchedulerOutcomeNoCapacity, "no_capacity"},
 		{SchedulerOutcomeError, "error"},
 
-		{SnapshotKindGolden, "golden"},
 		{SnapshotKindLatest, "latest"},
 		{SnapshotKindLocal, "local"},
 		{SnapshotKindBoot, "boot"},
 
-		{SnapshotScopeFull, "full"},
-		{SnapshotScopeData, "data"},
-		{SnapshotScopeDataOnGolden, "data_on_golden"},
-		{SnapshotScopeUnknown, "unknown"},
+		{SnapshotFidelityMemory, "memory"},
+		{SnapshotFidelityVolumes, "volumes"},
+		{SnapshotFidelityRootfs, "rootfs"},
+		{SnapshotFidelityUnknown, "unknown"},
 
 		{SnapshotPhaseVolumeMount, "volume_mount"},
 		{SnapshotPhaseManifestFetch, "manifest_fetch"},
 		{SnapshotPhaseSandboxAssets, "sandbox_assets"},
 		{SnapshotPhaseDownload, "download"},
 		{SnapshotPhaseOCIUnpack, "oci_unpack"},
-		{SnapshotPhaseAteomRestore, "ateom_restore"},
-		{SnapshotPhaseAteomCheckpoint, "ateom_checkpoint"},
+		{SnapshotPhaseWorkerRestore, "worker_restore"},
+		{SnapshotPhaseWorkerCheckpoint, "worker_checkpoint"},
 		{SnapshotPhasePersist, "persist"},
+		{SnapshotPhaseCleanup, "cleanup"},
 		{SnapshotPhaseTotal, "total"},
 
 		{SandboxClassUnknown, "unknown"},
+		{TemplateUnknown, "unknown"},
+
+		{RouterResumeNone, "none"},
+		{RouterResumeTriggered, "triggered"},
+		{RouterResumeJoined, "joined"},
+		{RouterResumeUnknown, "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
@@ -427,18 +429,18 @@ func TestMetricLabelValues(t *testing.T) {
 }
 
 func TestActorMetricAttributes(t *testing.T) {
-	actor := &ateapipb.Actor{
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "counter-template"},
-		Status: &ateapipb.ActorStatus{
-			WorkerAssignment: &ateapipb.WorkerAssignment{
+	actor := &ateapi.Actor{
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "counter-template"},
+		Status: &ateapi.ActorStatus{
+			WorkerAssignment: &ateapi.WorkerAssignment{
 				WorkerNamespace: "ate-workers",
 				WorkerPool:      "default-pool",
 			},
 		},
 	}
 
-	t.Run("explicit operation and reason", func(t *testing.T) {
-		got := toMap(ActorMetricAttributes(actor, "gvisor", OperationResume, ReasonCorruptedAssignment))
+	t.Run("explicit operation", func(t *testing.T) {
+		got := toMap(ActorMetricAttributes(actor, "gvisor", OperationResume))
 		want := map[attribute.Key]any{
 			TemplateAtespaceKey:    "default",
 			TemplateNameKey:        "counter-template",
@@ -446,15 +448,13 @@ func TestActorMetricAttributes(t *testing.T) {
 			WorkerPoolNameKey:      "default-pool",
 			SandboxClassKey:        "gvisor",
 			ActorOperationNameKey:  OperationResume,
-			FailureReasonKey:       ReasonCorruptedAssignment,
-			FailureDomainKey:       FailureDomainInfrastructure,
 		}
 
 		assertAttrs(t, got, want)
 	})
 
 	t.Run("default unknown values", func(t *testing.T) {
-		got := toMap(ActorMetricAttributes(actor, "gvisor", "", ""))
+		got := toMap(ActorMetricAttributes(actor, "gvisor", ""))
 		want := map[attribute.Key]any{
 			TemplateAtespaceKey:    "default",
 			TemplateNameKey:        "counter-template",
@@ -462,15 +462,29 @@ func TestActorMetricAttributes(t *testing.T) {
 			WorkerPoolNameKey:      "default-pool",
 			SandboxClassKey:        "gvisor",
 			ActorOperationNameKey:  OperationUnknown,
-			FailureReasonKey:       ReasonUnknown,
-			FailureDomainKey:       FailureDomainUnknown,
+		}
+
+		assertAttrs(t, got, want)
+	})
+
+	// The class is empty when the actor's worker assignment is already clear or
+	// carries no sandbox runtime. Empty is not a permitted value.
+	t.Run("empty sandbox class is normalized to unknown", func(t *testing.T) {
+		got := toMap(ActorMetricAttributes(actor, "", OperationResume))
+		want := map[attribute.Key]any{
+			TemplateAtespaceKey:    "default",
+			TemplateNameKey:        "counter-template",
+			WorkerPoolNamespaceKey: "ate-workers",
+			WorkerPoolNameKey:      "default-pool",
+			SandboxClassKey:        SandboxClassUnknown,
+			ActorOperationNameKey:  OperationResume,
 		}
 
 		assertAttrs(t, got, want)
 	})
 
 	t.Run("out of range operation name is normalized to unknown", func(t *testing.T) {
-		got := toMap(ActorMetricAttributes(actor, "gvisor", "invalid_op", ""))
+		got := toMap(ActorMetricAttributes(actor, "gvisor", "invalid_op"))
 		want := map[attribute.Key]any{
 			TemplateAtespaceKey:    "default",
 			TemplateNameKey:        "counter-template",
@@ -478,23 +492,21 @@ func TestActorMetricAttributes(t *testing.T) {
 			WorkerPoolNameKey:      "default-pool",
 			SandboxClassKey:        "gvisor",
 			ActorOperationNameKey:  OperationUnknown,
-			FailureReasonKey:       ReasonUnknown,
-			FailureDomainKey:       FailureDomainUnknown,
 		}
 
 		assertAttrs(t, got, want)
 	})
 
 	t.Run("empty template ref reports empty labels", func(t *testing.T) {
-		noTemplate := &ateapipb.Actor{
-			Status: &ateapipb.ActorStatus{
-				WorkerAssignment: &ateapipb.WorkerAssignment{
+		noTemplate := &ateapi.Actor{
+			Status: &ateapi.ActorStatus{
+				WorkerAssignment: &ateapi.WorkerAssignment{
 					WorkerNamespace: "ate-workers",
 					WorkerPool:      "default-pool",
 				},
 			},
 		}
-		got := toMap(ActorMetricAttributes(noTemplate, "gvisor", OperationResume, ReasonUnknown))
+		got := toMap(ActorMetricAttributes(noTemplate, "gvisor", OperationResume))
 		want := map[attribute.Key]any{
 			TemplateAtespaceKey:    "",
 			TemplateNameKey:        "",
@@ -502,8 +514,6 @@ func TestActorMetricAttributes(t *testing.T) {
 			WorkerPoolNameKey:      "default-pool",
 			SandboxClassKey:        "gvisor",
 			ActorOperationNameKey:  OperationResume,
-			FailureReasonKey:       ReasonUnknown,
-			FailureDomainKey:       FailureDomainUnknown,
 		}
 
 		assertAttrs(t, got, want)
@@ -513,17 +523,15 @@ func TestActorMetricAttributes(t *testing.T) {
 	// one key of the pair, or an empty-string name, would put that crash in a
 	// series that looks like a real pool.
 	t.Run("unassigned actor omits both pool keys", func(t *testing.T) {
-		unassigned := &ateapipb.Actor{
-			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "counter-template"},
+		unassigned := &ateapi.Actor{
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "counter-template"},
 		}
-		got := toMap(ActorMetricAttributes(unassigned, "gvisor", OperationCreate, ReasonUnknown))
+		got := toMap(ActorMetricAttributes(unassigned, "gvisor", OperationCreate))
 		want := map[attribute.Key]any{
 			TemplateAtespaceKey:   "default",
 			TemplateNameKey:       "counter-template",
 			SandboxClassKey:       "gvisor",
 			ActorOperationNameKey: OperationCreate,
-			FailureReasonKey:      ReasonUnknown,
-			FailureDomainKey:      FailureDomainUnknown,
 		}
 
 		assertAttrs(t, got, want)
@@ -561,27 +569,122 @@ func TestWorkerPoolAttributes(t *testing.T) {
 	})
 }
 
-// TestSnapshotScopeValue pins the enum-to-label mapping ateapi and atelet share.
+// TestSnapshotFidelityValue pins the enum-to-label mapping ateapi and atelet share.
 // An unmapped enum value must report unknown rather than its stringified form,
 // which would let a wire value widen the label set.
-func TestSnapshotScopeValue(t *testing.T) {
+func TestSnapshotFidelityValue(t *testing.T) {
 	tests := []struct {
 		name  string
-		scope ateletpb.SnapshotScope
+		scope ateletpb.SnapshotFidelity
 		want  string
 	}{
-		{name: "full", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL, want: SnapshotScopeFull},
-		{name: "data", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA, want: SnapshotScopeData},
-		{name: "data on golden", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN, want: SnapshotScopeDataOnGolden},
-		{name: "unspecified", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED, want: SnapshotScopeUnknown},
-		{name: "value outside the enum", scope: ateletpb.SnapshotScope(9999), want: SnapshotScopeUnknown},
+		{name: "memory", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, want: SnapshotFidelityMemory},
+		{name: "volumes", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, want: SnapshotFidelityVolumes},
+		{name: "rootfs", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, want: SnapshotFidelityRootfs},
+		{name: "unspecified", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, want: SnapshotFidelityUnknown},
+		{name: "value outside the enum", scope: ateletpb.SnapshotFidelity(9999), want: SnapshotFidelityUnknown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := SnapshotScopeValue(tt.scope); got != tt.want {
-				t.Errorf("SnapshotScopeValue(%v) = %q, want %q", tt.scope, got, tt.want)
+			if got := SnapshotFidelityValue(tt.scope); got != tt.want {
+				t.Errorf("SnapshotFidelityValue(%v) = %q, want %q", tt.scope, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestActorStateValues pins the spelling of every state a record can report.
+func TestActorStateValues(t *testing.T) {
+	tests := []struct {
+		got  string
+		want string
+	}{
+		{ActorStateResuming, "resuming"},
+		{ActorStateRunning, "running"},
+		{ActorStateSuspending, "suspending"},
+		{ActorStateSuspended, "suspended"},
+		{ActorStateCrashed, "crashed"},
+		{ActorStateDeleting, "deleting"},
+		{ActorStateDeleted, "deleted"},
+		{ActorStateUnknown, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("got %q, want %q", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActorStateValue pins the mapping producers read the state through, so a
+// record reports the state the store holds rather than one named by hand.
+func TestActorStateValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		state ateapi.ActorState
+		want  string
+	}{
+		{name: "resuming", state: ateapi.ActorState_ACTOR_STATE_RESUMING, want: ActorStateResuming},
+		{name: "running", state: ateapi.ActorState_ACTOR_STATE_RUNNING, want: ActorStateRunning},
+		{name: "suspending", state: ateapi.ActorState_ACTOR_STATE_SUSPENDING, want: ActorStateSuspending},
+		{name: "suspended", state: ateapi.ActorState_ACTOR_STATE_SUSPENDED, want: ActorStateSuspended},
+		{name: "crashed", state: ateapi.ActorState_ACTOR_STATE_CRASHED, want: ActorStateCrashed},
+		{name: "deleting", state: ateapi.ActorState_ACTOR_STATE_DELETING, want: ActorStateDeleting},
+		{name: "reverting", state: ateapi.ActorState_ACTOR_STATE_REVERTING, want: ActorStateReverting},
+		{name: "unspecified", state: ateapi.ActorState_ACTOR_STATE_UNSPECIFIED, want: ActorStateUnknown},
+		{name: "value outside the enum", state: ateapi.ActorState(9999), want: ActorStateUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ActorStateValue(tt.state); got != tt.want {
+				t.Errorf("ActorStateValue(%v) = %q, want %q", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActorStateValuesMirrorActorState holds the log vocabulary to the control
+// plane's state machine. A state added to the enum without a value here would
+// leave the stream unable to name the state an actor is in.
+//
+// ActorStateDeleted is excluded on purpose: the actor row is gone by the time it
+// is reported, so no enum value can stand for it. A second such value has to be
+// added to this list deliberately.
+func TestActorStateValuesMirrorActorState(t *testing.T) {
+	// deleted has no enum value because the row is gone; unknown is the
+	// mapper's fallback for UNSPECIFIED and anything off the enum.
+	noEnumCounterpart := map[string]bool{ActorStateDeleted: true, ActorStateUnknown: true}
+
+	got := map[string]bool{
+		ActorStateResuming:   true,
+		ActorStateRunning:    true,
+		ActorStateSuspending: true,
+		ActorStateSuspended:  true,
+		ActorStateCrashed:    true,
+		ActorStateDeleting:   true,
+		ActorStateReverting:  true,
+		ActorStateDeleted:    true,
+		ActorStateUnknown:    true,
+	}
+
+	want := map[string]bool{}
+	for value, name := range ateapi.ActorState_name {
+		if ateapi.ActorState(value) == ateapi.ActorState_ACTOR_STATE_UNSPECIFIED {
+			continue
+		}
+		want[strings.ToLower(strings.TrimPrefix(name, "ACTOR_STATE_"))] = true
+	}
+
+	for state := range want {
+		if !got[state] {
+			t.Errorf("ateapi.ActorState has %q with no ateattr constant", state)
+		}
+	}
+	for state := range got {
+		if !want[state] && !noEnumCounterpart[state] {
+			t.Errorf("ateattr has state %q that ateapi.ActorState does not", state)
+		}
 	}
 }
 
@@ -594,8 +697,8 @@ func TestNormalizeSandboxClass(t *testing.T) {
 		class string
 		want  string
 	}{
-		{name: "gvisor", class: string(atev1alpha1.SandboxClassGvisor), want: string(atev1alpha1.SandboxClassGvisor)},
-		{name: "microvm", class: string(atev1alpha1.SandboxClassMicroVM), want: string(atev1alpha1.SandboxClassMicroVM)},
+		{name: "gvisor", class: string(atev1.SandboxClassGvisor), want: string(atev1.SandboxClassGvisor)},
+		{name: "microvm", class: string(atev1.SandboxClassMicroVM), want: string(atev1.SandboxClassMicroVM)},
 		{name: "empty", class: "", want: SandboxClassUnknown},
 		{name: "unknown runtime", class: "kvm", want: SandboxClassUnknown},
 		{name: "casing is not normalized away", class: "GVISOR", want: SandboxClassUnknown},
@@ -610,59 +713,6 @@ func TestNormalizeSandboxClass(t *testing.T) {
 	}
 }
 
-// TestFailureReason pins the error-to-label mapping: only the registered
-// ateerrors taxonomy may reach the label, so anything unclassified collapses
-// onto UNKNOWN instead of leaking an unbounded error message.
-func TestFailureReason(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{
-			name: "wrapped reason",
-			err:  fmt.Errorf("%w: while uploading external snapshot", ateerrors.ReasonFaileSaveSnapshot),
-			want: string(ateerrors.ReasonFaileSaveSnapshot),
-		},
-		{
-			name: "reason nested several wraps deep",
-			err:  fmt.Errorf("restore: %w", fmt.Errorf("%w: bad manifest", ateerrors.ReasonInvalidSandboxAsset)),
-			want: string(ateerrors.ReasonInvalidSandboxAsset),
-		},
-		{
-			name: "gRPC status carrying the reason as an ErrorInfo detail",
-			err:  ateerrors.NewGRPCError(context.Background(), codes.DataLoss, ateerrors.ReasonTerminalFileSystemError, nil, errors.New("no space left on device")),
-			want: string(ateerrors.ReasonTerminalFileSystemError),
-		},
-		{
-			name: "infrastructure error with no reason attached",
-			err:  errors.New("dial tcp 10.96.192.187:9000: connect: connection refused"),
-			want: ReasonUnknown,
-		},
-		{
-			name: "plain gRPC status with no ErrorInfo",
-			err:  status.Error(codes.Unavailable, "unavailable"),
-			want: ReasonUnknown,
-		},
-		{
-			name: "nil error",
-			err:  nil,
-			want: ReasonUnknown,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := FailureReason(tt.err)
-			if got != tt.want {
-				t.Errorf("FailureReason() = %q, want %q", got, tt.want)
-			}
-			if !ateerrors.IsValidReason(got) {
-				t.Errorf("FailureReason() = %q, which is not a registered reason", got)
-			}
-		})
-	}
-}
-
 func TestNormalizeOperationName(t *testing.T) {
 	tests := []struct {
 		op   string
@@ -671,8 +721,9 @@ func TestNormalizeOperationName(t *testing.T) {
 		{OperationCreate, OperationCreate},
 		{OperationResume, OperationResume},
 		{OperationSuspend, OperationSuspend},
-		{OperationPause, OperationPause},
+		{"pause", OperationUnknown},
 		{OperationDelete, OperationDelete},
+		{OperationRevert, OperationRevert},
 		{"", OperationUnknown},
 		{"invalid", OperationUnknown},
 		{"crash", OperationUnknown},
@@ -680,77 +731,6 @@ func TestNormalizeOperationName(t *testing.T) {
 	for _, tt := range tests {
 		if got := NormalizeOperationName(tt.op); got != tt.want {
 			t.Errorf("NormalizeOperationName(%q) = %q, want %q", tt.op, got, tt.want)
-		}
-	}
-}
-
-func TestFailureDomain(t *testing.T) {
-	tests := []struct {
-		name   string
-		reason string
-		want   string
-	}{
-		{"runtime workload reason", string(ateerrors.ReasonWorkloadNotReady), FailureDomainWorkload},
-		// A misdeclared template is the actor owner's to fix, so it is a
-		// workload fault even though substrate is what detects it.
-		{"template resolves to no runnable process", string(ateerrors.ReasonInvalidContainerConfig), FailureDomainWorkload},
-		{"template storage_location unparseable", string(ateerrors.ReasonInvalidObjectURL), FailureDomainWorkload},
-		// SandboxConfig is cluster-scoped, so no actor owner can cause or fix this.
-		{"bad sandbox asset stays infrastructure", string(ateerrors.ReasonInvalidSandboxAsset), FailureDomainInfrastructure},
-		{"node infrastructure reason", string(ateerrors.ReasonTerminalFileSystemError), FailureDomainInfrastructure},
-		{"control-plane infrastructure reason", string(ateerrors.ReasonWorkerPodGone), FailureDomainInfrastructure},
-		{"unknown asserts no domain", ReasonUnknown, FailureDomainUnknown},
-		{"empty", "", FailureDomainUnknown},
-		{"unregistered reason", "SOMETHING_ELSE", FailureDomainUnknown},
-		{"workload prefix is not what decides", "WORKLOAD_NOT_A_REAL_REASON", FailureDomainUnknown},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := FailureDomain(tt.reason); got != tt.want {
-				t.Errorf("FailureDomain(%q) = %q, want %q", tt.reason, got, tt.want)
-			}
-		})
-	}
-}
-
-// Every registered reason must classify, so adding one to AllReasons without
-// deciding its domain fails here rather than silently reporting unknown.
-func TestFailureDomainCoversAllReasons(t *testing.T) {
-	for _, r := range ateerrors.AllReasons {
-		got := FailureDomain(string(r))
-		if r == ateerrors.ReasonUnknown {
-			if got != FailureDomainUnknown {
-				t.Errorf("FailureDomain(%q) = %q, want %q", r, got, FailureDomainUnknown)
-			}
-			continue
-		}
-		if got == FailureDomainUnknown {
-			t.Errorf("FailureDomain(%q) = %q; add it to workloadReasons or confirm it is infrastructure", r, got)
-		}
-	}
-}
-
-func TestFailureAttributesAlwaysPaired(t *testing.T) {
-	reason := string(ateerrors.ReasonWorkloadNotReady)
-
-	kvs := FailureAttributes(reason)
-	if len(kvs) != 2 {
-		t.Fatalf("FailureAttributes() returned %d attributes, want 2", len(kvs))
-	}
-	if kvs[0].Key != FailureReasonKey || kvs[0].Value.AsString() != reason {
-		t.Errorf("FailureAttributes()[0] = %v, want %s=%s", kvs[0], FailureReasonKey, reason)
-	}
-	if kvs[1].Key != FailureDomainKey || kvs[1].Value.AsString() != FailureDomainWorkload {
-		t.Errorf("FailureAttributes()[1] = %v, want %s=%s", kvs[1], FailureDomainKey, FailureDomainWorkload)
-	}
-
-	attrs := FailureLogAttrs(reason)
-	if len(attrs) != len(kvs) {
-		t.Fatalf("FailureLogAttrs() returned %d attributes, FailureAttributes() returned %d; they must agree", len(attrs), len(kvs))
-	}
-	for i, a := range attrs {
-		if a.Key != string(kvs[i].Key) || a.Value.String() != kvs[i].Value.AsString() {
-			t.Errorf("FailureLogAttrs()[%d] = %s=%s, want %s=%s", i, a.Key, a.Value, kvs[i].Key, kvs[i].Value.AsString())
 		}
 	}
 }
@@ -768,5 +748,24 @@ func TestActorRefLogAttrs(t *testing.T) {
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("ActorRefLogAttrs() = %v, want %v", got, want)
+	}
+}
+
+func TestNormalizeTemplateDimension(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty falls back to unknown", in: "", want: TemplateUnknown},
+		{name: "template name preserved", in: "counter", want: "counter"},
+		{name: "atespace preserved", in: "ate-demo", want: "ate-demo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NormalizeTemplateDimension(tt.in); got != tt.want {
+				t.Errorf("NormalizeTemplateDimension(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }

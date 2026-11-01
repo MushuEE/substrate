@@ -21,13 +21,14 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
-	"github.com/agent-substrate/substrate/internal/portforward"
+	"go.ate.dev/substrate/internal/ateclient"
+	"go.ate.dev/substrate/internal/portforward"
 	"k8s.io/client-go/kubernetes"
 )
 
-// routerStatusPort is the atenet-router Service port for the router's
-// --status-port (the "status" container port).
+// routerStatusPort is the router's --status-port. The router binds it to
+// loopback and the Service does not publish it, so the client forwards to a
+// router pod directly.
 const routerStatusPort = 4040
 
 // StatuszClient reads the atenet router's /statusz page over a
@@ -42,7 +43,7 @@ type StatuszClient struct {
 // NewStatuszClient establishes a port-forward to the router's status port.
 // Call Close to tear it down.
 func NewStatuszClient(ctx context.Context) (*StatuszClient, error) {
-	config, err := ateclient.LoadConfig(KubeConfig, KubeContext)
+	config, err := ateclient.LoadKubeConfig(KubeConfig, KubeContext)
 	if err != nil {
 		return nil, fmt.Errorf("loading kubeconfig: %w", err)
 	}
@@ -51,7 +52,7 @@ func NewStatuszClient(ctx context.Context) (*StatuszClient, error) {
 		return nil, fmt.Errorf("creating k8s client: %w", err)
 	}
 
-	localPort, stop, err := portforward.ServicePortForward(ctx, config, clientset, routerNamespace, routerService, routerStatusPort)
+	localPort, stop, err := portforward.ServicePodPortForward(ctx, config, clientset, SystemNamespace(), ResourceName("atenet-router"), routerStatusPort)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +93,23 @@ func (c *StatuszClient) Parking(ctx context.Context) (*ParkingStatusz, error) {
 		return nil, fmt.Errorf("decoding statusz JSON: %w", err)
 	}
 	return &dashboard.Parking, nil
+}
+
+// WaitForCount polls the request-parking gauge until cond holds.
+func (c *StatuszClient) WaitForCount(ctx context.Context, cond func(int) bool) (int, error) {
+	deadline := time.Now().Add(4 * time.Second)
+	var last int
+	for time.Now().Before(deadline) {
+		parking, err := c.Parking(ctx)
+		if err == nil {
+			last = parking.Active
+			if cond(last) {
+				return last, nil
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return last, fmt.Errorf("timed out waiting for the parking gauge to satisfy the condition")
 }
 
 // Close tears down the port-forward.

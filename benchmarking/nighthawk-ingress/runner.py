@@ -48,7 +48,7 @@ NIGHTHAWK_SERVICE = "nighthawk_service"
 ADAPTIVE_CLIENT = "nighthawk_adaptive_load_client"
 SERVICE_ADDRESS = "127.0.0.1:8443"
 
-DEFAULT_ROUTER_URL = "http://atenet-router.ate-system.svc.cluster.local:80"
+DEFAULT_ROUTER_URL = "https://atenet-router.ate-system.svc:443"
 DESC_PATH = os.environ.get("NIGHTHAWK_DESC", "/app/nighthawk.desc")
 
 
@@ -268,12 +268,10 @@ def main() -> None:
                 log=lambda m: tee(logs, m),
             )
 
-            hosts = [
-                spec_mod.actor_host(n, args.atespace) for n in actor_names
-            ]
             spec_dict = spec_mod.build_spec_dict(
                 uri=f"{args.router_url.rstrip('/')}/ping",
-                hosts=hosts,
+                actor_names=actor_names,
+                atespace=args.atespace,
                 client_concurrency=args.client_concurrency,
                 connections=args.connections,
                 max_pending_requests=args.max_pending,

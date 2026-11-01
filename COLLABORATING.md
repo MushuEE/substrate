@@ -7,7 +7,7 @@ guidelines for collaborating on this project.
 
 ## Code of conduct
 
-Please read and internalize our [code of conduct](code-of-conduct.md).  We want
+Please read and internalize our [code of conduct](CODE_OF_CONDUCT.md).  We want
 this to be a welcoming and inclusive community, and we expect everyone to
 adhere to the code of conduct at all times.  If you see someone violating the
 code of conduct, please report it to the maintainers immediately.  We take all
@@ -34,17 +34,6 @@ been in the conversation to understand why a decision was made the way it was.
 When writing, please strive for clarity and conciseness.  Not everyone in the
 community will have the same proficiency in English, so please be mindful of
 that when writing.
-
-## Always use Pull Requests
-
-Do not push directly to the main branch.  Always use pull requests to propose
-changes to the codebase.  This allows for code review and discussion before
-changes are merged, which helps maintain the quality of the codebase and
-fosters collaboration.
-
-### Merging PRs
-
-PRs should be merged by the reviewer of a PR, not the author.
 
 ### Using AI
 
@@ -76,8 +65,16 @@ project](https://www.kubernetes.dev/docs/guide/pull-requests/#ai-guidance):
 ## Code reviews
 
 We want to move quickly, but we need to balance that with quality and
-maintainability.  Code reviews are an important part of that process.  All PRs
-should be reviewed BEFORE they are merged.
+maintainability.  Code reviews are an important part of that process.
+
+Agent Substrate requires at least one approving GitHub review from a maintainer
+in order for the PR to be eligible for the merge queue.  It is allowable to use
+the "merge when ready" functionality to mark the PR as eligible for the merge
+queue as soon as all preconditions are met.
+
+Note that most changes to a PR will require a new approving review.  Use the
+"re-request review" button to automatically place the PR back into your
+reviewer's GitHub inbox.
 
 ### Code reviews across companies
 

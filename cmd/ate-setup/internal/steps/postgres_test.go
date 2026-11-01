@@ -15,30 +15,279 @@
 package steps
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
+	"go.ate.dev/substrate/pkg/postgressetup"
 )
 
-func TestUseBundledPostgres(t *testing.T) {
+// postgresObjects loads the bundled postgres manifest of the given
+// environment, as applyPostgres would before any resizing.
+func postgresObjects(t *testing.T, kind bool) []*unstructured.Unstructured {
+	t.Helper()
+	e := &Env{Cfg: &config.Config{Root: repoRoot(t), Kind: kind}}
+	manifest, err := e.render(e.postgresManifestPath())
+	if err != nil {
+		t.Fatalf("render(%s): %v", e.postgresManifestPath(), err)
+	}
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		t.Fatalf("decoding the postgres manifest: %v", err)
+	}
+	return objs
+}
+
+func findObject(objs []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	for _, obj := range objs {
+		if obj.GetKind() == kind && obj.GetName() == name {
+			return obj
+		}
+	}
+	return nil
+}
+
+// The kind overlay has to be what a kind install applies: the base file asks
+// for more CPU than a laptop cluster schedules.
+func TestPostgresManifestPathSelectsKindOverlay(t *testing.T) {
+	objs := postgresObjects(t, true)
+	ss := findObject(objs, "StatefulSet", "postgres")
+	if ss == nil {
+		t.Fatal("kind postgres overlay renders no statefulset/postgres")
+	}
+	cpu, _, _ := unstructured.NestedString(ss.Object, "spec", "template", "spec", "containers", "0", "resources", "requests", "cpu")
+	containers, _, _ := unstructured.NestedSlice(ss.Object, "spec", "template", "spec", "containers")
+	if len(containers) > 0 {
+		cpu, _, _ = unstructured.NestedString(containers[0].(map[string]any), "resources", "requests", "cpu")
+	}
+	if cpu != "250m" {
+		t.Errorf("kind postgres cpu request = %q, want the overlay's 250m", cpu)
+	}
+}
+
+// Runs the size10 resize over the real manifest and the real config patch, so
+// a drift between the two (a renamed ConfigMap key, a second container) fails
+// here rather than on a size10 install.
+func TestApplyPostgresSize10Overrides(t *testing.T) {
+	objs := postgresObjects(t, false)
+	base := findObject(objs, "ConfigMap", "postgres-config")
+	if base == nil {
+		t.Fatal("postgres manifest has no configmap/postgres-config")
+	}
+	baseData, _, _ := unstructured.NestedStringMap(base.Object, "data")
+
+	root := repoRoot(t)
+	conf, err := os.ReadFile(filepath.Join(root, "manifests", "ate-install", "postgres-size10", "postgres-config-patch.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPostgresSize10Overrides(objs, conf); err != nil {
+		t.Fatalf("applyPostgresSize10Overrides: %v", err)
+	}
+
+	cm := findObject(objs, "ConfigMap", "postgres-config")
+	data, _, _ := unstructured.NestedStringMap(cm.Object, "data")
+	if !strings.Contains(data["postgresql.conf"], "max_connections = 500") {
+		t.Errorf("postgresql.conf was not replaced with the size10 tuning:\n%s", data["postgresql.conf"])
+	}
+	// The merge semantics: the base's other keys survive untouched.
+	for _, key := range []string{"pg_hba.conf", "reload-tls.sh"} {
+		if data[key] != baseData[key] {
+			t.Errorf("data[%s] changed; the size10 patch must only replace postgresql.conf", key)
+		}
+	}
+	// And the TLS wiring the base's postgresql.conf carried must not be lost
+	// by the replacement, or the server refuses connections.
+	for _, want := range []string{"ssl = on", "hba_file = ", "ssl_ca_file = '/run/postgres.podcert.ate.dev/trust-bundle.pem'"} {
+		if !strings.Contains(data["postgresql.conf"], want) {
+			t.Errorf("size10 postgresql.conf lacks %q", want)
+		}
+	}
+
+	ss := findObject(objs, "StatefulSet", "postgres")
+	containers, _, _ := unstructured.NestedSlice(ss.Object, "spec", "template", "spec", "containers")
+	resources, _, _ := unstructured.NestedMap(containers[0].(map[string]any), "resources")
+	requests, _ := resources["requests"].(map[string]any)
+	limits, _ := resources["limits"].(map[string]any)
+	if requests["cpu"] != size10PostgresCPURequest {
+		t.Errorf("requests.cpu = %v, want %s", requests["cpu"], size10PostgresCPURequest)
+	}
+	if requests["memory"] != size10PostgresMemory || limits["memory"] != size10PostgresMemory {
+		t.Errorf("memory request/limit = %v/%v, want %s for both", requests["memory"], limits["memory"], size10PostgresMemory)
+	}
+	if _, ok := limits["cpu"]; ok {
+		t.Errorf("limits.cpu = %v, want it removed", limits["cpu"])
+	}
+}
+
+func TestApplyPostgresSize10OverridesRejectsMissingObjects(t *testing.T) {
+	root := repoRoot(t)
+	conf, err := os.ReadFile(filepath.Join(root, "manifests", "ate-install", "postgres-size10", "postgres-config-patch.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs := postgresObjects(t, false)
+
+	var withoutStatefulSet []*unstructured.Unstructured
+	for _, obj := range objs {
+		if obj.GetKind() != "StatefulSet" {
+			withoutStatefulSet = append(withoutStatefulSet, obj)
+		}
+	}
+	if err := applyPostgresSize10Overrides(withoutStatefulSet, conf); err == nil {
+		t.Error("applyPostgresSize10Overrides succeeded without a StatefulSet, want an error")
+	}
+	if err := applyPostgresSize10Overrides(objs, []byte("data: {}\n")); err == nil {
+		t.Error("applyPostgresSize10Overrides succeeded with an empty patch, want an error")
+	}
+}
+
+// dataClaimStorageClass returns the StorageClass of the postgres StatefulSet's
+// data claim, and whether it is set at all.
+func dataClaimStorageClass(t *testing.T, objs []*unstructured.Unstructured) (string, bool) {
+	t.Helper()
+	ss := findObject(objs, "StatefulSet", "postgres")
+	if ss == nil {
+		t.Fatal("no statefulset/postgres")
+	}
+	claims, _, _ := unstructured.NestedSlice(ss.Object, "spec", "volumeClaimTemplates")
+	for _, c := range claims {
+		claim := c.(map[string]any)
+		if name, _, _ := unstructured.NestedString(claim, "metadata", "name"); name == "data" {
+			class, found, _ := unstructured.NestedString(claim, "spec", "storageClassName")
+			return class, found
+		}
+	}
+	t.Fatal("statefulset/postgres has no data claim")
+	return "", false
+}
+
+// Runs over the real manifests, so a renamed claim fails here rather than on
+// an install that asked for a StorageClass.
+func TestSetPostgresStorageClass(t *testing.T) {
+	for _, kind := range []bool{false, true} {
+		objs := postgresObjects(t, kind)
+		if class, found := dataClaimStorageClass(t, objs); found {
+			t.Fatalf("kind=%v: manifest already names StorageClass %q", kind, class)
+		}
+		if err := setPostgresStorageClass(objs, "dynamic-rwo"); err != nil {
+			t.Fatalf("kind=%v: setPostgresStorageClass: %v", kind, err)
+		}
+		if class, _ := dataClaimStorageClass(t, objs); class != "dynamic-rwo" {
+			t.Errorf("kind=%v: StorageClass = %q, want dynamic-rwo", kind, class)
+		}
+	}
+}
+
+func TestSetPostgresStorageClassRejectsMissingObjects(t *testing.T) {
+	objs := postgresObjects(t, false)
+
+	var withoutStatefulSet []*unstructured.Unstructured
+	for _, obj := range objs {
+		if obj.GetKind() != "StatefulSet" {
+			withoutStatefulSet = append(withoutStatefulSet, obj)
+		}
+	}
+	if err := setPostgresStorageClass(withoutStatefulSet, "x"); err == nil {
+		t.Error("setPostgresStorageClass succeeded without a StatefulSet, want an error")
+	}
+
+	ss := findObject(objs, "StatefulSet", "postgres")
+	unstructured.RemoveNestedField(ss.Object, "spec", "volumeClaimTemplates")
+	if err := setPostgresStorageClass(objs, "x"); err == nil {
+		t.Error("setPostgresStorageClass succeeded without a data claim, want an error")
+	}
+}
+
+func TestPostgresObjectsStorageClass(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		class     string
+		size10    bool
+		wantClass string
+		wantSet   bool
+	}{
+		{name: "unset keeps the cluster default"},
+		{name: "set", class: "dynamic-rwo", wantClass: "dynamic-rwo", wantSet: true},
+		{name: "set with size10", class: "dynamic-rwo", size10: true, wantClass: "dynamic-rwo", wantSet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Root: repoRoot(t), PostgresStorageClass: tc.class}
+			if tc.size10 {
+				cfg.ClusterSize = config.ClusterSizeSize10
+			}
+			objs, err := (&Env{Cfg: cfg}).postgresObjects()
+			if err != nil {
+				t.Fatalf("postgresObjects: %v", err)
+			}
+			class, set := dataClaimStorageClass(t, objs)
+			if class != tc.wantClass || set != tc.wantSet {
+				t.Errorf("StorageClass = %q (set %v), want %q (set %v)", class, set, tc.wantClass, tc.wantSet)
+			}
+		})
+	}
+}
+
+func TestPlanPostgres(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		connString string
-		want       bool
+		cloudSQL   config.CloudSQLConfig
+		recorded   map[string]string
+		want       postgresPlan
 	}{
-		{name: "no external database", connString: "", want: true},
 		{
-			name:       "external database configured",
+			name: "no external database",
+			want: postgresPlan{bundled: true},
+		},
+		{
+			name:       "explicit DSN",
 			connString: "postgresql://user@db.example.com:5432/atepg",
-			want:       false,
+			want:       postgresPlan{external: "ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING"},
+		},
+		{
+			name:     "Cloud SQL instance from the environment",
+			cloudSQL: config.CloudSQLConfig{Instance: "p:r:i", InstanceSet: true},
+			want:     postgresPlan{external: "Cloud SQL instance p:r:i"},
+		},
+		{
+			name:     "Cloud SQL instance adopted from the cluster",
+			recorded: map[string]string{envCloudSQLInstance: "p:r:i"},
+			want:     postgresPlan{external: "Cloud SQL instance p:r:i"},
+		},
+		{
+			// The removal case: the cluster still records an instance, but
+			// the operator asked for it to go away.
+			name:     "explicitly empty instance ignores the cluster record",
+			cloudSQL: config.CloudSQLConfig{InstanceSet: true},
+			recorded: map[string]string{envCloudSQLInstance: "p:r:i"},
+			want:     postgresPlan{bundled: true},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := &Env{Cfg: &config.Config{PostgresConnectionString: tc.connString}}
-			if got := e.useBundledPostgres(); got != tc.want {
-				t.Errorf("useBundledPostgres() = %v, want %v", got, tc.want)
+			e := &Env{
+				Cfg: &config.Config{
+					PostgresReadWriteConnectionString: tc.connString,
+					CloudSQL:                          tc.cloudSQL,
+				},
+				Kube: fakeKube(t, apiServerEnvVarsConfigMap(tc.recorded)),
+			}
+			got, err := e.planPostgres(t.Context())
+			if err != nil {
+				t.Fatalf("planPostgres() error = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("planPostgres() = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
@@ -60,4 +309,193 @@ func TestBundledPostgresManifestExists(t *testing.T) {
 	if _, err := os.Stat(stray); err == nil {
 		t.Errorf("%s exists; the bundle render would apply it even for external databases", stray)
 	}
+}
+
+func labeledNode(name string, labels map[string]string) runtime.Object {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
+}
+
+// Under --cordon-system-infra-components the StatefulSet's rolling update
+// deletes the running postgres before its replacement schedules, so a cluster
+// with no ate-postgres node must be refused before anything is applied.
+func TestRequirePostgresPool(t *testing.T) {
+	systemInfra := labeledNode("infra-1", map[string]string{"ate.dev/workloadType": "ate-system-infra"})
+	postgres := labeledNode("pg-1", map[string]string{"ate.dev/workloadType": "ate-postgres"})
+	for _, tc := range []struct {
+		name    string
+		cordon  bool
+		nodes   []runtime.Object
+		wantErr bool
+	}{
+		{name: "not cordoned", nodes: []runtime.Object{systemInfra}},
+		{name: "cordoned with a postgres node", cordon: true, nodes: []runtime.Object{systemInfra, postgres}},
+		{name: "cordoned without a postgres node", cordon: true, nodes: []runtime.Object{systemInfra}, wantErr: true},
+		{name: "cordoned with no nodes", cordon: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Env{
+				Cfg:  &config.Config{CordonSystemInfraComponents: tc.cordon},
+				Kube: fakeKube(t, tc.nodes...),
+			}
+			err := e.requirePostgresPool(t.Context())
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("requirePostgresPool() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "docs/architecture.md") {
+				t.Errorf("requirePostgresPool() error = %q, want it to point at docs/architecture.md", err)
+			}
+		})
+	}
+}
+
+// applyPostgres is the path both `deploy ate-system` and `deploy postgres`
+// take to the StatefulSet, so the pool check has to sit in front of it.
+func TestApplyPostgresRequiresPostgresPool(t *testing.T) {
+	e := &Env{
+		Cfg:  &config.Config{Root: repoRoot(t), CordonSystemInfraComponents: true},
+		Kube: fakeKube(t),
+	}
+	err := e.applyPostgres(t.Context())
+	if err == nil || !strings.Contains(err.Error(), postgresPoolSelector) {
+		t.Fatalf("applyPostgres() error = %v, want the missing %s pool", err, postgresPoolSelector)
+	}
+}
+
+func TestBundledPostgresIdentityConfiguration(t *testing.T) {
+	cfg := &config.Config{
+		PostgresReadWriteRole: config.DefaultPostgresReadWriteRole,
+		PostgresOwnerRole:     config.DefaultPostgresOwnerRole,
+	}
+	e := &Env{Cfg: cfg}
+	readWrite, owner, err := e.postgresReadWriteConnectionStrings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readWrite != bundledPostgresDSN(postgressetup.ReadWriteUser) {
+		t.Errorf("read/write DSN = %q", readWrite)
+	}
+	if owner != bundledPostgresDSN(postgressetup.OwnerUser) {
+		t.Errorf("owner DSN = %q", owner)
+	}
+}
+
+func TestBundledPostgresRequiresFixedIdentity(t *testing.T) {
+	e := &Env{Cfg: &config.Config{PostgresReadWriteRole: "custom", PostgresOwnerRole: config.DefaultPostgresOwnerRole}}
+	if _, _, err := e.postgresReadWriteConnectionStrings(); err == nil {
+		t.Fatal("postgresReadWriteConnectionStrings() accepted a custom bundled role")
+	}
+}
+
+func TestBundledPostgresManifestAuthentication(t *testing.T) {
+	manifest, err := os.ReadFile(filepath.Join(repoRoot(t), "manifests", "ate-install", "postgres", "postgres.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(manifest)
+	for _, want := range []string{
+		"local all all trust",
+		"hostssl all postgres all reject",
+		"hostssl atepg substrate_owner_user,substrate_readwrite_user all cert",
+		"name: POSTGRES_HOST_AUTH_METHOD",
+		"value: trust",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("postgres manifest lacks %q", want)
+		}
+	}
+}
+
+// Resolve the shipped DSN's client credential paths through the API pod's
+// projections, and the database's client trust bundle through its projection.
+func TestPostgresCertificateProjections(t *testing.T) {
+	e := &Env{Cfg: &config.Config{Root: repoRoot(t)}}
+	manifest, err := e.render(e.Cfg.Manifest("ate-api-server.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment := findObject(objs, "Deployment", "ate-api-server")
+	if deployment == nil {
+		t.Fatal("missing API deployment")
+	}
+	var api appsv1.Deployment
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(deployment.Object, &api); err != nil {
+		t.Fatal(err)
+	}
+	e.Cfg.PostgresReadWriteRole = config.DefaultPostgresReadWriteRole
+	e.Cfg.PostgresOwnerRole = config.DefaultPostgresOwnerRole
+	readWriteDSN, ownerDSN, err := e.postgresReadWriteConnectionStrings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	for _, tc := range []struct{ dsn, username string }{{readWriteDSN, postgressetup.ReadWriteUser}, {ownerDSN, postgressetup.OwnerUser}} {
+		dsn, err := url.Parse(tc.dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, hasPassword := dsn.User.Password()
+		if dsn.User.Username() != tc.username || hasPassword || dsn.Query().Get("sslmode") != "verify-full" {
+			t.Fatalf("DSN must use %s with verified TLS and no password", tc.username)
+		}
+		certPath := dsn.Query().Get("sslcert")
+		if paths[certPath] {
+			t.Fatal("owner and runtime share a certificate")
+		}
+		paths[certPath] = true
+		if certPath != dsn.Query().Get("sslkey") || filepath.Base(certPath) != tc.username+".pem" {
+			t.Fatal("DSN does not use the login's credential bundle")
+		}
+		for _, param := range []string{"sslcert", "sslkey"} {
+			if signer := projectedFileSigner(t, api.Spec.Template.Spec, dsn.Query().Get(param), false); signer != "postgres.podcert.ate.dev/identity" {
+				t.Fatalf("%s projected by %q", param, signer)
+			}
+		}
+		if signer := projectedFileSigner(t, api.Spec.Template.Spec, dsn.Query().Get("sslrootcert"), true); signer != "servicedns.podcert.ate.dev/identity" {
+			t.Fatalf("server trust projected by %q", signer)
+		}
+	}
+
+	for _, kind := range []bool{false, true} {
+		objs := postgresObjects(t, kind)
+		var database appsv1.StatefulSet
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(findObject(objs, "StatefulSet", "postgres").Object, &database); err != nil {
+			t.Fatal(err)
+		}
+		if signer := projectedFileSigner(t, database.Spec.Template.Spec, "/run/postgres.podcert.ate.dev/trust-bundle.pem", true); signer != "postgres.podcert.ate.dev/identity" {
+			t.Fatalf("database client trust projected by %q", signer)
+		}
+	}
+}
+
+func projectedFileSigner(t *testing.T, pod corev1.PodSpec, path string, trust bool) string {
+	t.Helper()
+	for _, container := range pod.Containers {
+		for _, mount := range container.VolumeMounts {
+			if filepath.Dir(path) != mount.MountPath {
+				continue
+			}
+			for _, volume := range pod.Volumes {
+				if volume.Name != mount.Name || volume.Projected == nil {
+					continue
+				}
+				for _, source := range volume.Projected.Sources {
+					if trust && source.ClusterTrustBundle != nil && source.ClusterTrustBundle.Path == filepath.Base(path) {
+						return *source.ClusterTrustBundle.SignerName
+					}
+					if !trust && source.PodCertificate != nil && source.PodCertificate.CredentialBundlePath == filepath.Base(path) {
+						if got := source.PodCertificate.UserAnnotations["postgres.podcert.ate.dev/username"]; got != strings.TrimSuffix(filepath.Base(path), ".pem") {
+							t.Fatalf("projection for %s requests username %q", path, got)
+						}
+						return source.PodCertificate.SignerName
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("no projected %s in pod", path)
+	return ""
 }

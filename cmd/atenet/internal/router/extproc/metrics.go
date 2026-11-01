@@ -21,28 +21,20 @@ import (
 	"time"
 
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
-
-// ServiceName is the OpenTelemetry service name and instrumentation scope
-// shared by every part of the atenet router process — the ext_proc mux here,
-// the direction handlers, and the router's own servers. It lives in this
-// package because it is the one package all of them already depend on.
-const ServiceName = "atenet-router"
 
 // atenet.router.route.duration measures the latency from when the ext_proc handler receives a request
 // (dataplane -> EPP) until the target worker endpoint is resolved
 const routeDurationMetricName = "atenet.router.route.duration"
 
-// NewRouteDurationHistogram creates the atenet.router.route.duration histogram from
-// the global MeterProvider.
-func NewRouteDurationHistogram() (metric.Float64Histogram, error) {
-	h, err := otel.Meter(ServiceName).Float64Histogram(
+// NewRouteDurationHistogram creates the atenet.router.route.duration histogram on meter.
+func NewRouteDurationHistogram(meter metric.Meter) (metric.Float64Histogram, error) {
+	h, err := meter.Float64Histogram(
 		routeDurationMetricName,
 		metric.WithUnit("s"),
 		metric.WithDescription(
@@ -64,6 +56,8 @@ func (s *Server) recordRouteDuration(ctx context.Context, d time.Duration, tmplN
 	if s.routeDuration == nil {
 		return
 	}
+	tmplNs = ateattr.NormalizeTemplateDimension(tmplNs)
+	tmplName = ateattr.NormalizeTemplateDimension(tmplName)
 	s.routeDuration.Record(ctx, d.Seconds(), metric.WithAttributes(
 		ateattr.TemplateAtespaceKey.String(tmplNs),
 		ateattr.TemplateNameKey.String(tmplName),
@@ -74,38 +68,48 @@ func (s *Server) recordRouteDuration(ctx context.Context, d time.Duration, tmplN
 
 func classifyOutcome(err error) string {
 	if err == nil {
-		return "ok"
+		return ateattr.RouterOutcomeOK
 	}
 	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-		return "cancelled"
+		return ateattr.RouterOutcomeCancelled
 	}
 	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
-		return "timeout"
+		return ateattr.RouterOutcomeTimeout
 	}
 	switch status.Code(err) {
 	case codes.ResourceExhausted:
-		return "no_capacity"
+		return ateattr.RouterOutcomeNoCapacity
 	case codes.FailedPrecondition:
-		return "failed_precondition"
+		return ateattr.RouterOutcomeFailedPrecondition
 	case codes.Aborted:
-		return "lock_conflict"
+		return ateattr.RouterOutcomeLockConflict
 	case codes.NotFound:
-		return "not_found"
+		return ateattr.RouterOutcomeNotFound
 	case codes.Unavailable:
-		return "unavailable"
+		return ateattr.RouterOutcomeUnavailable
+	case codes.PermissionDenied:
+		return ateattr.RouterOutcomeDenied
 	}
 	var re *ReqError
 	if errors.As(err, &re) {
 		switch envoy_type.StatusCode(re.StatusCode) {
 		case envoy_type.StatusCode_NotFound:
-			return "not_found"
+			return ateattr.RouterOutcomeNotFound
 		case envoy_type.StatusCode_ServiceUnavailable:
-			return "no_capacity"
+			// The switch above already reports no_capacity for a wrapped
+			// ResourceExhausted cause, since status.Code unwraps through
+			// ReqError.Cause. A 503 that reaches here has no such cause: a
+			// shed request whose resume did not fail with ResourceExhausted,
+			// or a failed policy or credential lookup. None of these mean
+			// the fleet is full.
+			return ateattr.RouterOutcomeUnavailable
 		case envoy_type.StatusCode_GatewayTimeout:
-			return "timeout"
+			return ateattr.RouterOutcomeTimeout
 		case envoy_type.StatusCode_TooManyRequests:
-			return "rate_limited"
+			return ateattr.RouterOutcomeRateLimited
+		case envoy_type.StatusCode_Forbidden:
+			return ateattr.RouterOutcomeDenied
 		}
 	}
-	return "resume_error"
+	return ateattr.RouterOutcomeResumeError
 }

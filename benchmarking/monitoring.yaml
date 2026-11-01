@@ -16,6 +16,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: benchmarking
+  labels:
+    # Admits the benchmark clients to the Substrate API through
+    # manifests/ate-install/ate-system-networkpolicies.yaml.
+    ate.dev/api-access: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -77,6 +81,30 @@ subjects:
   name: prometheus
   namespace: benchmarking
 ---
+# The postgres-exporter job discovers pods in ate-system. A Role there would
+# go with the namespace, which every automated test deletes and recreates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-benchmarking-pods
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-benchmarking-pods
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-benchmarking-pods
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: benchmarking
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -132,6 +160,45 @@ data:
             action: replace
             target_label: pod
 
+      # The locust pod annotates port 8000 for the Python locust process. The
+      # boomer-worker sidecar exposes its Prometheus metrics on port 8001, and
+      # so does boomer inside an automation runner Job.
+      - job_name: 'boomer-worker'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - benchmarking
+        relabel_configs:
+          - source_labels:
+              - __meta_kubernetes_pod_label_app
+              - __meta_kubernetes_pod_container_port_number
+            action: keep
+            regex: (locust|substrate-benchmark-runner);8001
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+
+      # The postgres_exporter sidecar that an automation test with a
+      # `controlPlane:` block adds to Postgres (benchmarking/automation/
+      # controlplane.py): connections by state, commits, cache hits, and
+      # pg_stat_statements.
+      - job_name: 'postgres-exporter'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - ate-system
+        relabel_configs:
+          - source_labels:
+              - __meta_kubernetes_pod_label_app
+              - __meta_kubernetes_pod_container_port_number
+            action: keep
+            regex: postgres;9187
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+
       # The container memory directly from the cAdvisor endpoint of the
       # kubelet. `kubectl top` reads metrics-server, which reports an average
       # across its own window and hides short peaks.
@@ -155,18 +222,29 @@ data:
             target_label: __metrics_path__
             replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
         metric_relabel_configs:
+          # cAdvisor reports host-level root cgroup metrics (such as Linux kernel
+          # PSI pressure stall information) with id="/" and an empty container
+          # label. Relabel id="/" to container="node" before dropping empty
+          # container labels so host-level pressure and utilization are kept.
+          - source_labels: [id]
+            regex: ^/$
+            target_label: container
+            replacement: node
           # cAdvisor sends a very large number of metrics. Keep only the
-          # metrics that the benchmarks read.
+          # metrics that the benchmarks read: kernel pressure stall (PSI),
+          # container network bandwidth, disk I/O, memory RSS/working-set,
+          # CPU utilization, CFS throttling, and OOM kill events.
           - source_labels: [__name__]
             action: keep
-            regex: container_(memory_working_set_bytes|cpu_usage_seconds_total|spec_memory_limit_bytes)
-          # Drop the series that have an empty container label, not the label
-          # itself. cAdvisor gives a rollup for the whole pod cgroup next to
-          # the series for each container. Keeping both counts the memory of
-          # each pod two times.
-          - source_labels: [container]
+            regex: container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes|oom_events_total)
+          # Drop the series that have an empty container label only for cumulative
+          # memory working set and CPU usage. cAdvisor gives a rollup for the whole
+          # pod cgroup next to the series for each container; keeping both counts
+          # the memory/CPU of each pod two times. Dropping empty container on other
+          # metrics (such as network or PSI) would drop valid pod/node stats.
+          - source_labels: [__name__, container]
             action: drop
-            regex: ""
+            regex: container_(memory_working_set_bytes|cpu_usage_seconds_total);$
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -186,6 +264,12 @@ spec:
         app: prometheus
     spec:
       serviceAccountName: prometheus
+      # Allows scheduling on the ate.dev/benchmarking load-generator pool.
+      tolerations:
+      - key: ate.dev/benchmarking
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
       containers:
       - name: prometheus
         image: prom/prometheus:v2.45.0
@@ -265,8 +349,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
           "targets": [
-            { "expr": "sum(rate(locust_requests_total_total{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) or sum(rate(locust_requests_total{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m]))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "sum(rate(locust_requests_total_total{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "sum(rate(locust_requests_total_total{name=\"GetActor\"}[1m])) or sum(rate(locust_requests_total{name=\"GetActor\"}[1m]))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "sum(rate(locust_requests_total_total{name=\"GetActor\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"GetActor\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "req/sec" } }
         },
@@ -275,8 +359,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
           "targets": [
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "ms" } }
         },
@@ -286,7 +370,7 @@ data:
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
           "targets": [
             {
-              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\", user_class=\"AteAPIUser\"}[1m])) by (le)",
+              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"GetActor\"}[1m])) by (le)",
               "refId": "A"
             }
           ],
@@ -311,8 +395,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
           "targets": [
-            { "expr": "sum(rate(locust_requests_total_total{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) or sum(rate(locust_requests_total{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m]))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "sum(rate(locust_requests_total_total{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "sum(rate(locust_requests_total_total{name=\"ResumeActor\"}[1m])) or sum(rate(locust_requests_total{name=\"ResumeActor\"}[1m]))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "sum(rate(locust_requests_total_total{name=\"ResumeActor\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"ResumeActor\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "req/sec" } }
         },
@@ -321,8 +405,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
           "targets": [
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "ms" } }
         },
@@ -332,7 +416,7 @@ data:
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
           "targets": [
             {
-              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\", user_class=\"AteAPIUser\"}[1m])) by (le)",
+              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"ResumeActor\"}[1m])) by (le)",
               "refId": "A"
             }
           ],
@@ -357,8 +441,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
           "targets": [
-            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) or sum(rate(locust_requests_total{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m]))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActor\"}[1m])) or sum(rate(locust_requests_total{name=\"SuspendActor\"}[1m]))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActor\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"SuspendActor\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "req/sec" } }
         },
@@ -367,8 +451,8 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
           "targets": [
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "ms" } }
         },
@@ -378,7 +462,7 @@ data:
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
           "targets": [
             {
-              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\", user_class=\"AteAPIUser\"}[1m])) by (le)",
+              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\"}[1m])) by (le)",
               "refId": "A"
             }
           ],
@@ -399,11 +483,68 @@ data:
           }
         },
         {
+          "title": "SuspendActorAsync QPS",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+          "targets": [
+            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActorAsync\"}[1m])) or sum(rate(locust_requests_total{name=\"SuspendActorAsync\"}[1m]))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "sum(rate(locust_requests_total_total{name=\"SuspendActorAsync\"}[1m])) by (status) or sum(rate(locust_requests_total{name=\"SuspendActorAsync\"}[1m])) by (status)", "refId": "B", "legendFormat": "{{status}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "req/sec" } }
+        },
+        {
+          "title": "SuspendActorAsync Latency 99th Pct",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+          "targets": [
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActorAsync\"}[1m])) by (le))", "refId": "A", "legendFormat": "Total" },
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActorAsync\"}[1m])) by (le, status))", "refId": "B", "legendFormat": "{{status}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "ms" } }
+        },
+        {
+          "title": "SuspendActorAsync Latency Heatmap",
+          "type": "heatmap",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 56 },
+          "targets": [
+            {
+              "expr": "sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActorAsync\"}[1m])) by (le)",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "labelsToFields",
+              "options": {
+                "valueLabel": "le"
+              }
+            }
+          ],
+          "options": {
+            "calculate": false,
+            "yAxis": {
+              "unit": "ms"
+            }
+          }
+        },
+        {
+          "title": "Hibernate Latency (Async vs Sync Suspend)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+          "targets": [
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActorAsync\"}[1m])) by (le))", "refId": "A", "legendFormat": "SuspendActorAsync p99" },
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\"}[1m])) by (le))", "refId": "B", "legendFormat": "SuspendActor p99" },
+            { "expr": "histogram_quantile(0.50, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActorAsync\"}[1m])) by (le))", "refId": "C", "legendFormat": "SuspendActorAsync p50" },
+            { "expr": "histogram_quantile(0.50, sum(rate(locust_request_duration_milliseconds_bucket{name=\"SuspendActor\"}[1m])) by (le))", "refId": "D", "legendFormat": "SuspendActor p50" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "ms" } }
+        },
+        {
           "title": "Locust Requesters (Active Users)",
           "type": "timeseries",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 72 },
           "targets": [
-            { "expr": "sum(locust_users{user_class=\"AteAPIUser\"}) by (pod)", "refId": "A" }
+            { "expr": "sum(locust_users) by (pod, user_class)", "refId": "A", "legendFormat": "{{pod}} - {{user_class}}" }
           ]
         }
       ],
@@ -573,7 +714,7 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
           "targets": [
-            { "expr": "sum(rate(locust_requests_total_total{user_class=~\"SleepUser|UserMemUser|KernelMemUser\"}[1m])) by (user_class, name) or sum(rate(locust_requests_total{user_class=~\"SleepUser|UserMemUser|KernelMemUser\"}[1m])) by (user_class, name)", "refId": "A", "legendFormat": "{{user_class}} - {{name}}" }
+            { "expr": "sum(rate(locust_requests_total_total{user_class=~\"SleepUser|UserMemUser|KernelMemUser|GluttonUser|DurdirUser\"}[1m])) by (user_class, name) or sum(rate(locust_requests_total{user_class=~\"SleepUser|UserMemUser|KernelMemUser|GluttonUser|DurdirUser\"}[1m])) by (user_class, name)", "refId": "A", "legendFormat": "{{user_class}} - {{name}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "req/sec" } }
         },
@@ -582,7 +723,7 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
           "targets": [
-            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{user_class=~\"SleepUser|UserMemUser|KernelMemUser\"}[1m])) by (le, user_class, name))", "refId": "A", "legendFormat": "{{user_class}} - {{name}}" }
+            { "expr": "histogram_quantile(0.99, sum(rate(locust_request_duration_milliseconds_bucket{user_class=~\"SleepUser|UserMemUser|KernelMemUser|GluttonUser|DurdirUser\"}[1m])) by (le, user_class, name))", "refId": "A", "legendFormat": "{{user_class}} - {{name}}" }
           ],
           "fieldConfig": { "defaults": { "unit": "ms" } }
         },
@@ -591,7 +732,7 @@ data:
           "type": "timeseries",
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
           "targets": [
-            { "expr": "sum(locust_users{user_class=~\"SleepUser|UserMemUser|KernelMemUser\"}) by (user_class)", "refId": "A", "legendFormat": "{{user_class}}" }
+            { "expr": "sum(locust_users{user_class=~\"SleepUser|UserMemUser|KernelMemUser|GluttonUser|DurdirUser\"}) by (user_class)", "refId": "A", "legendFormat": "{{user_class}}" }
           ]
         }
       ],

@@ -24,14 +24,21 @@ import (
 	"strings"
 )
 
-// OverlaySpecFileName is the file atelet writes into each container bundle,
-// next to config.json, describing how to compose the bundle's rootfs from
-// cached layers. Its absence means the bundle's rootfs is a plain directory
-// (e.g. one prepared by a pre-imagecache atelet) and needs no mount.
+// ImageVolumeMountPath is where one image volume is composed inside a
+// bundle. The worker mounts the volume there (see setupImageVolumes) and binds
+// it into the container.
+func ImageVolumeMountPath(bundlePath, volumeName string) string {
+	return filepath.Join(bundlePath, "volumes", volumeName)
+}
+
+// OverlaySpecFileName is the file atelet writes into each container bundle
+// describing how to compose the bundle's rootfs from cached layers. Its
+// absence means the bundle's rootfs is a plain directory (e.g. one prepared by
+// a pre-imagecache atelet) and needs no mount.
 const OverlaySpecFileName = "rootfs-overlay.json"
 
 // OverlaySpec is the contract between atelet (which cannot mount) and the
-// ateom runtimes (which mount the rootfs overlay just before running the
+// worker runtimes (which mount the rootfs overlay just before running the
 // workload). The overlay's mountpoint, upperdir, and workdir are always the
 // bundle-local rootfs/, upper/, and work/ directories — derived from the
 // bundle path by the consumer rather than trusted from the file.
@@ -51,7 +58,7 @@ type OverlaySpec struct {
 	// ExtraDirs are absolute in-rootfs directories the consumer creates after
 	// mounting (they land in the actor's private upper): bind-mount targets
 	// that must exist for the runtime to attach them, e.g. the actor identity
-	// mount.
+	// mount, and the process's working directory.
 	ExtraDirs []string `json:"extraDirs,omitempty"`
 	// ImageVolumes are read-only image contents to expose beside the rootfs,
 	// one per image-typed volume the container mounts. The consumer composes

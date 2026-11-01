@@ -16,7 +16,9 @@ package controllers
 
 import (
 	"slices"
+	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -24,31 +26,49 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 
-	"github.com/agent-substrate/substrate/internal/ateomcapacity"
-	"github.com/agent-substrate/substrate/internal/ateompath"
-	"github.com/agent-substrate/substrate/internal/deviceplugin"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/deviceplugin"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/workercapacity"
 )
 
-// ateomOTelResourceAttributes mirrors atelet.yaml; service.instance.id is the pod
+// workerOTelResourceAttributes mirrors atelet.yaml; service.instance.id is the pod
 // uid so each worker pod is a distinct telemetry source.
-const ateomOTelResourceAttributes = "k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)"
+const workerOTelResourceAttributes = "k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)"
 
 // workerTerminationGracePeriodSeconds is the hardcoded pod termination grace
 // period for worker pods (60 minutes).
 const workerTerminationGracePeriodSeconds int64 = 3600
 
-// ateomOTelSettings is the telemetry configuration propagated to ateom worker
-// pods. A zero value leaves the pods without telemetry env.
-type ateomOTelSettings struct {
-	// Endpoint is the OTLP collector address. Empty disables ateom telemetry
-	// entirely, so the other fields are ignored.
+// Rollout settings for the pool's Deployment. A pool edit rolls the workers
+// through the eviction path, so the strategy is chosen for the actors on them:
+//
+//   - maxSurge 0 with a 10% maxUnavailable, which Kubernetes raises to at
+//     least one pod. To make the roll smooth, make it gradual, maxSurge should
+//     be 0 to avoid any potential stall for small size WorkerPool.
+//   - progressDeadlineSeconds above the 3600s pod grace period, with room for
+//     the replacement to start, so a batch waiting out the drain does not have
+//     kubectl rollout status report a failed rollout.
+const (
+	workerRolloutMaxSurge                = 0
+	workerRolloutMaxUnavailable          = "10%"
+	workerRolloutProgressDeadlineSeconds = int32(4800)
+)
+
+// workerOTelSettings is the telemetry configuration propagated to worker
+// pods. A zero value sets only the worker's resource identity.
+type workerOTelSettings struct {
+	// Endpoint is the OTLP collector address the worker exports to directly, when it
+	// finds no atelet relay. Empty leaves the worker exporting through the relay
+	// only, and exporting nothing without one.
 	Endpoint string
 	// MetricExportInterval overrides the SDK's 60s PeriodicReader interval. It is
 	// the raw OTEL_METRIC_EXPORT_INTERVAL value, i.e. whole milliseconds; the SDK
 	// falls back to its default when it does not parse. Empty keeps the default.
 	//
-	// ateom registers no instruments of its own, so its only telemetry is
+	// worker registers no instruments of its own, so its only telemetry is
 	// otelgrpc's rpc.server.* and it stays invisible to the collector until the
 	// first export tick fires. Shortening the interval is what keeps that
 	// startup gap inside an e2e budget; production leaves it unset.
@@ -57,26 +77,38 @@ type ateomOTelSettings struct {
 	// whole-millisecond form as MetricExportInterval. Empty keeps the default.
 	MetricExportTimeout string
 	// TracesSampler and TracesSamplerArg are the raw OTEL_TRACES_SAMPLER and
-	// OTEL_TRACES_SAMPLER_ARG values, passed through untouched: ateom's own
+	// OTEL_TRACES_SAMPLER_ARG values, passed through untouched: worker's own
 	// serverboot resolution validates them. Empty sampler keeps the worker's
 	// default and drops the arg, which is dead config on its own.
 	TracesSampler    string
 	TracesSamplerArg string
+	// LogsExporter, TracesExporter and MetricsExporter are the
+	// OTEL_LOGS_EXPORTER, OTEL_TRACES_EXPORTER and OTEL_METRICS_EXPORTER set on
+	// the worker, passed through untouched. They are worker-only values rather than
+	// the controller's own: on the control plane, metrics prometheus means
+	// scraped instead of pushed, and ateworker serves no /metrics. Empty keeps
+	// ateworker's defaults: none for logs, otlp for traces and metrics.
+	LogsExporter    string
+	TracesExporter  string
+	MetricsExporter string
 }
+
+// workerPoolLabel names the WorkerPool on each of its worker pods.
+const workerPoolLabel = "ate.dev/worker-pool"
 
 const (
 	atunnelIdentityVolume       = "atunnel-identity"
 	atunnelIdentityMountPath    = "/run/podidentity.podcert.ate.dev"
 	atunnelEgressTrustVolume    = "atunnel-egress-trust"
 	atunnelEgressTrustMountPath = "/run/servicedns.podcert.ate.dev"
-	ateomCapacityVolume         = "ateom-capacity"
+	workerCapacityVolume        = "worker-capacity"
 )
 
 // buildDeploymentApplyConfig constructs the SSA apply configuration for the
 // Deployment managed by a WorkerPool. Only fields owned by this controller
-// are declared here. otel, when it carries an endpoint, is propagated to the
-// ateom container so it pushes telemetry to that collector.
-func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettings) *appsv1ac.DeploymentApplyConfiguration {
+// are declared here. otel is propagated to the worker container (see
+// workerContainerEnv).
+func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string) *appsv1ac.DeploymentApplyConfiguration {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	if wp.Spec.Template != nil {
@@ -87,20 +119,59 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 			annotations[key] = value
 		}
 	}
-	labels["ate.dev/worker-pool"] = wp.Name
+	labels[workerPoolLabel] = wp.Name
+
+	args := []string{
+		"--pod-uid=$(POD_UID)",
+		"--pod-ips=$(POD_IPS)",
+		"--atunnel-listen-address=:443",
+		"--atunnel-connect-listen-address=:8443",
+		"--atunnel-credential-bundle=" + atunnelIdentityMountPath + "/credential-bundle.pem",
+		"--atunnel-trust-bundle=" + atunnelIdentityMountPath + "/trust-bundle.pem",
+		// The peers atunnel authenticates live in substrate's namespace, not
+		// the worker's, so the controller passes their identities rather than
+		// letting worker assume the default install. --atunnel-client-identity
+		// has been accepted by every worker that carries this controller's
+		// contemporaries, so it is always safe to pass.
+		"--atunnel-client-identity=" + installdefaults.SPIFFEID(systemNamespace, routerServiceAccount),
+	}
+
+	// --atunnel-broker-identity is newer than the oldest worker a WorkerPool
+	// may still pin, and a worker exits on an unrecognized flag. A worker
+	// without the flag hardcodes the canonical identity, and a worker with it
+	// defaults to the same, so omitting the flag when it carries that value is
+	// equivalent for both. A relocated or renamed install passes something
+	// else and needs an image new enough to accept it, which it necessarily
+	// has.
+	if brokerIdentity := installdefaults.SPIFFEID(systemNamespace, ateletServiceAccount); brokerIdentity != installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace) {
+		args = append(args, "--atunnel-broker-identity="+brokerIdentity)
+	}
+
+	args = append(args,
+		"--atunnel-egress-listen-address=0.0.0.0:15001",
+		"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
+		"--dns-egress-policy="+dnsEgressPolicy,
+	)
+
+	// worker gets preview features when the controller has them.
+	enabledGates := func() []string {
+		ret := []string{}
+		for k, v := range preview.AsMap() {
+			if v {
+				ret = append(ret, k)
+			}
+		}
+		// Map order is random; a stable arg avoids needless rollouts.
+		slices.Sort(ret)
+		return ret
+	}
+	previewArg := "--preview=" + strings.Join(enabledGates(), ",")
+	args = append(args, previewArg)
 
 	containerAC := corev1ac.Container().
-		WithName("ateom").
+		WithName("worker").
 		WithImage(wp.Spec.WorkerImage).
-		WithArgs(
-			"--pod-uid=$(POD_UID)",
-			"--atunnel-listen-address=:443",
-			"--atunnel-connect-listen-address=:8443",
-			"--atunnel-credential-bundle="+atunnelIdentityMountPath+"/credential-bundle.pem",
-			"--atunnel-trust-bundle="+atunnelIdentityMountPath+"/trust-bundle.pem",
-			"--atunnel-egress-listen-address=0.0.0.0:15001",
-			"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
-		).
+		WithArgs(args...).
 		WithPorts(corev1ac.ContainerPort().
 			WithName("https").
 			WithContainerPort(443).
@@ -117,16 +188,16 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 			WithHTTPGet(corev1ac.HTTPGetAction().
 				WithPath("/readyz").
 				WithPort(intstr.FromString("readyz")))).
-		WithSecurityContext(ateomSecurityContext(wp.Spec.SandboxClass)).
-		WithEnv(ateomContainerEnv(otel)...).
+		WithSecurityContext(workerSecurityContext(wp.Spec.DefaultSandboxClass())).
+		WithEnv(workerContainerEnv(otel)...).
 		WithVolumeMounts(
 			corev1ac.VolumeMount().
-				WithName(ateomCapacityVolume).
-				WithMountPath(ateomcapacity.CapacityMountPath).
+				WithName(workerCapacityVolume).
+				WithMountPath(workercapacity.MountPath).
 				WithReadOnly(true),
 			corev1ac.VolumeMount().
-				WithName("run-ateom").
-				WithMountPath(ateompath.BasePath).
+				WithName("ate-base").
+				WithMountPath(nodepath.BasePath).
 				WithMountPropagation(corev1.MountPropagationHostToContainer),
 			corev1ac.VolumeMount().
 				WithName(atunnelIdentityVolume).
@@ -144,16 +215,16 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 			WithRunAsGroup(0)).
 		WithVolumes(
 			corev1ac.Volume().
-				WithName(ateomCapacityVolume).
+				WithName(workerCapacityVolume).
 				WithDownwardAPI(corev1ac.DownwardAPIVolumeSource().
 					WithItems(
-						resourceFieldRefFile(ateomcapacity.CPULimitFile, "limits.cpu", milliCores),
-						resourceFieldRefFile(ateomcapacity.MemoryLimitFile, "limits.memory", wholeBytes),
+						resourceFieldRefFile(workercapacity.CPULimitFile, "limits.cpu", milliCores),
+						resourceFieldRefFile(workercapacity.MemoryLimitFile, "limits.memory", wholeBytes),
 					)),
 			corev1ac.Volume().
-				WithName("run-ateom").
+				WithName("ate-base").
 				WithHostPath(corev1ac.HostPathVolumeSource().
-					WithPath(ateompath.BasePath).
+					WithPath(nodepath.BasePath).
 					WithType(corev1.HostPathDirectoryOrCreate)),
 			corev1ac.Volume().
 				WithName(atunnelIdentityVolume).
@@ -187,7 +258,8 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 		)
 
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
-	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.SandboxClass)
+	applySandboxClassToleration(podSpecAC, wp.Spec.DefaultSandboxClass())
+	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.DefaultSandboxClass())
 	podSpecAC.WithContainers(containerAC)
 	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 
@@ -195,7 +267,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 		WithLabels(labels).
 		WithAnnotations(annotations).
 		WithOwnerReferences(metav1ac.OwnerReference().
-			WithAPIVersion(atev1alpha1.GroupVersion.String()).
+			WithAPIVersion(atev1.GroupVersion.String()).
 			WithKind("WorkerPool").
 			WithName(wp.Name).
 			WithUID(wp.UID).
@@ -203,31 +275,41 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 			WithBlockOwnerDeletion(true)).
 		WithSpec(appsv1ac.DeploymentSpec().
 			WithReplicas(wp.Spec.Replicas).
+			WithStrategy(appsv1ac.DeploymentStrategy().
+				WithType(appsv1.RollingUpdateDeploymentStrategyType).
+				WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+					WithMaxSurge(intstr.FromInt32(workerRolloutMaxSurge)).
+					WithMaxUnavailable(intstr.FromString(workerRolloutMaxUnavailable)))).
+			WithProgressDeadlineSeconds(workerRolloutProgressDeadlineSeconds).
 			WithSelector(metav1ac.LabelSelector().
-				WithMatchLabels(map[string]string{"ate.dev/worker-pool": wp.Name})).
+				WithMatchLabels(map[string]string{workerPoolLabel: wp.Name})).
 			WithTemplate(corev1ac.PodTemplateSpec().
 				WithLabels(labels).
 				WithAnnotations(annotations).
 				WithSpec(podSpecAC)))
 }
 
-// ateomContainerEnv adds the OTLP endpoint and resource identity only when
-// telemetry is configured. Every ref precedes OTEL_RESOURCE_ATTRIBUTES so its
-// $(...) substitutions resolve.
-func ateomContainerEnv(otel ateomOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
+// workerContainerEnv always sets the resource identity, since the worker
+// exports through atelet's relay whenever atelet has a collector, and adds the
+// OTLP endpoint only when one is configured. Every ref precedes
+// OTEL_RESOURCE_ATTRIBUTES so its $(...) substitutions resolve.
+func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
+	// The pool pair also labels every usage record. A worker pod runs in its
+	// WorkerPool's namespace.
 	envs := []*corev1ac.EnvVarApplyConfiguration{
 		fieldRefEnv("POD_UID", "metadata.uid"),
-	}
-	if otel.Endpoint == "" {
-		return envs
-	}
-	envs = append(envs,
-		fieldRefEnv("POD_NAME", "metadata.name"),
 		fieldRefEnv("POD_NAMESPACE", "metadata.namespace"),
+		fieldRefEnv("WORKER_POOL_NAME", "metadata.labels['"+workerPoolLabel+"']"),
+		fieldRefEnv("POD_NAME", "metadata.name"),
 		fieldRefEnv("NODE_NAME", "spec.nodeName"),
-		corev1ac.EnvVar().WithName("OTEL_EXPORTER_OTLP_ENDPOINT").WithValue(otel.Endpoint),
-		corev1ac.EnvVar().WithName("OTEL_RESOURCE_ATTRIBUTES").WithValue(ateomOTelResourceAttributes),
-	)
+		// Resolved when the container starts, so a worker process started in a
+		// recreated pod sandbox registers the sandbox's new IPs.
+		fieldRefEnv("POD_IPS", "status.podIPs"),
+	}
+	if otel.Endpoint != "" {
+		envs = append(envs, corev1ac.EnvVar().WithName("OTEL_EXPORTER_OTLP_ENDPOINT").WithValue(otel.Endpoint))
+	}
+	envs = append(envs, corev1ac.EnvVar().WithName("OTEL_RESOURCE_ATTRIBUTES").WithValue(workerOTelResourceAttributes))
 	if otel.MetricExportInterval != "" {
 		envs = append(envs, corev1ac.EnvVar().
 			WithName("OTEL_METRIC_EXPORT_INTERVAL").
@@ -238,6 +320,11 @@ func ateomContainerEnv(otel ateomOTelSettings) []*corev1ac.EnvVarApplyConfigurat
 			WithName("OTEL_METRIC_EXPORT_TIMEOUT").
 			WithValue(otel.MetricExportTimeout))
 	}
+	if otel.LogsExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_LOGS_EXPORTER").
+			WithValue(otel.LogsExporter))
+	}
 	if otel.TracesSampler != "" {
 		envs = append(envs, corev1ac.EnvVar().
 			WithName("OTEL_TRACES_SAMPLER").
@@ -247,6 +334,16 @@ func ateomContainerEnv(otel ateomOTelSettings) []*corev1ac.EnvVarApplyConfigurat
 				WithName("OTEL_TRACES_SAMPLER_ARG").
 				WithValue(otel.TracesSamplerArg))
 		}
+	}
+	if otel.TracesExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_TRACES_EXPORTER").
+			WithValue(otel.TracesExporter))
+	}
+	if otel.MetricsExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_METRICS_EXPORTER").
+			WithValue(otel.MetricsExporter))
 	}
 	return envs
 }
@@ -264,7 +361,7 @@ func resourceFieldRefFile(path, resourceName, divisor string) *corev1ac.Downward
 	return corev1ac.DownwardAPIVolumeFile().
 		WithPath(path).
 		WithResourceFieldRef(corev1ac.ResourceFieldSelector().
-			WithContainerName("ateom").
+			WithContainerName("worker").
 			WithResource(resourceName).
 			WithDivisor(resource.MustParse(divisor)))
 }
@@ -277,39 +374,55 @@ func fieldRefEnv(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
 				WithFieldPath(fieldPath)))
 }
 
-// ateomGvisorCapabilities is the capability set an unprivileged gVisor worker
-// needs. runsc's gofer maps a full-range identity in a user namespace
-// (SETUID/SETGID/SETPCAP/SETFCAP), the sandbox pivots root and traces the
-// application (SYS_ADMIN/SYS_CHROOT/SYS_PTRACE), actor networking programs the
-// veth and nftables rules (NET_ADMIN/NET_RAW), and the OCI rootfs is unpacked
-// and device nodes created as root over image-owned trees
-// (DAC_OVERRIDE/FOWNER/CHOWN/MKNOD). This replaces the former privileged worker;
-// seccomp stays at the runtime default, but AppArmor must be Unconfined (see
-// ateomSecurityContext) since runsc's own mounts trip the default profile.
-var ateomGvisorCapabilities = []corev1.Capability{
-	"NET_ADMIN", "SYS_ADMIN", "SYS_CHROOT", "SYS_PTRACE",
-	"SETUID", "SETGID", "SETPCAP", "DAC_OVERRIDE",
-	"FOWNER", "CHOWN", "MKNOD", "NET_RAW", "SETFCAP",
+// workerGvisorCapabilities is the fixed capability set for gVisor workers.
+// runsc's gofer maps a full-range identity in a user namespace
+// (SETUID/SETGID, plus SETFCAP: since Linux 5.12, writing a uid_map that maps
+// uid 0 needs CAP_SETFCAP over the parent user namespace, and without it the
+// gofer fails with "cannot create gofer process: fork/exec /proc/self/exe:
+// operation not permitted"), worker mounts need SYS_ADMIN, actor networking
+// needs NET_ADMIN/NET_RAW, and rootfs ownership and modes need
+// DAC_OVERRIDE/FOWNER/CHOWN.
+//
+// The sandbox's user namespace supplies its own SYS_CHROOT (gofer) and
+// SYS_PTRACE (systrap); the outer worker needs neither, nor SETPCAP. That user
+// namespace comes from runsc's modifySpecForDirectfs, which creates an
+// identity-mapped userns only while directfs is on and --network is not host.
+// Both hold with the runsc flags in cmd/ateworker-gvisor/kodata/internal_flags.json;
+// setting --directfs=false or --network=host there moves the gofer and systrap
+// back into the worker's userns, where runsc only logs that it drops the
+// missing capabilities. Since Linux 5.8, creating the 0:0 overlay whiteouts
+// does not require MKNOD.
+var workerGvisorCapabilities = []corev1.Capability{
+	"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE",
+	"FOWNER", "CHOWN", "NET_RAW", "SETFCAP",
 }
 
-// ateomMicroVMCapabilities is the capability set an unprivileged micro-VM worker
-// needs: the gVisor set, which covers the same worker-side work, plus FSETID and
-// DAC_READ_SEARCH for virtiofsd. virtiofsd re-applies a fixed set to its
-// sandboxed child, and the kernel refuses to raise a capability the bounding set
-// omits, so without those two it exits with "can't apply the child capabilities"
-// and the VM never gets its virtio-fs device.
+// workerMicroVMCapabilities retains virtiofsd's eight default child
+// capabilities, plus NET_ADMIN and SYS_ADMIN for worker networking and mounts.
+// MKNOD and FSETID preserve guest device-node creation and setgid files.
+// DAC_READ_SEARCH is not granted: virtiofsd only adds it to its child set to
+// open file handles, and virtiofsdArgs in cmd/ateworker-microvm/internal/kata
+// turns file handles off. Unlike gVisor, this runtime does not need NET_RAW.
+//
+// SETPCAP stays because virtiofsd's serving child drops its bounding set with
+// PR_CAPBSET_DROP, which libcap-ng only issues while CAP_SETPCAP is effective.
+// Without it the child keeps the worker's full bounding set, and a virtiofsd
+// built against unpatched libcap-ng (>= 0.8.1) refuses to start. Granting it
+// adds nothing reachable: the worker's permitted set already equals its
+// bounding set.
 //
 // The hypervisor devices are not capabilities: they come from atelet's device
 // plugin (see maybeApplyMicroVMPodShape).
-var ateomMicroVMCapabilities = slices.Concat(ateomGvisorCapabilities, []corev1.Capability{
-	"FSETID", "DAC_READ_SEARCH",
-})
+var workerMicroVMCapabilities = []corev1.Capability{
+	"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE",
+	"FOWNER", "CHOWN", "MKNOD", "SETFCAP", "FSETID", "SETPCAP",
+}
 
-// ateomSecurityContext returns the ateom container security context for a sandbox
+// workerSecurityContext returns the worker container security context for a sandbox
 // class. Neither class runs privileged; they differ in their capability set.
 // Both declare seccomp Unconfined because their sandbox child pivot_root()s,
 // which the default profile denies. An empty class defaults to gVisor.
-func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
+func workerSecurityContext(class atev1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
 	// Both runtimes mount inside the worker — runsc pivots root and the worker
 	// remounts /sys/fs/cgroup to nest per-actor cgroups; the micro-VM worker
 	// shares /run/kata-containers and remounts /proc/sys — and the default
@@ -321,22 +434,23 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 		WithRunAsUser(0).
 		WithRunAsGroup(0).
 		WithPrivileged(false).
+		WithAllowPrivilegeEscalation(false).
 		WithAppArmorProfile(corev1ac.AppArmorProfile().
 			WithType(corev1.AppArmorProfileTypeUnconfined))
 
-	if class == atev1alpha1.SandboxClassMicroVM {
+	if class == atev1.SandboxClassMicroVM {
 		// Give up the default seccomp profile so virtiofsd keeps its own sandbox,
 		// which pivot_root()s — a syscall the profile denies whatever capabilities
 		// the worker holds. The trade favors containing the guest: virtiofsd parses
 		// requests from it, so its namespaces are part of the guest-to-host
-		// boundary, while the pod-wide profile mostly confines ateom, which we
+		// boundary, while the pod-wide profile mostly confines worker, which we
 		// trust. Both guest-facing processes confine themselves anyway, virtiofsd
-		// with its own seccomp filter and nine capabilities, cloud-hypervisor with
+		// with its own seccomp filter and eight capabilities, cloud-hypervisor with
 		// per-thread filters.
 		return sc.
 			WithCapabilities(corev1ac.Capabilities().
 				WithDrop("ALL").
-				WithAdd(ateomMicroVMCapabilities...)).
+				WithAdd(workerMicroVMCapabilities...)).
 			WithSeccompProfile(corev1ac.SeccompProfile().
 				WithType(corev1.SeccompProfileTypeUnconfined))
 	}
@@ -348,7 +462,7 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 	return sc.
 		WithCapabilities(corev1ac.Capabilities().
 			WithDrop("ALL").
-			WithAdd(ateomGvisorCapabilities...)).
+			WithAdd(workerGvisorCapabilities...)).
 		WithSeccompProfile(corev1ac.SeccompProfile().
 			WithType(corev1.SeccompProfileTypeUnconfined))
 }
@@ -365,9 +479,9 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 func maybeApplyMicroVMPodShape(
 	podSpecAC *corev1ac.PodSpecApplyConfiguration,
 	containerAC *corev1ac.ContainerApplyConfiguration,
-	sandboxClass atev1alpha1.SandboxClass,
+	sandboxClass atev1.SandboxClass,
 ) {
-	if sandboxClass != atev1alpha1.SandboxClassMicroVM {
+	if sandboxClass != atev1.SandboxClassMicroVM {
 		return
 	}
 
@@ -412,15 +526,34 @@ func maybeApplyMicroVMPodShape(
 	// with no node advertising the resource, workers stay Pending rather than
 	// landing somewhere they cannot run.
 	//
-	// The toleration stays: extended resources constrain where this pod fits but
-	// repel nothing, so a cluster reserving nested-virt nodes with a taint still
-	// needs it. Additive on top of the WorkerPool's configurable scheduling
-	// fields (spec.template nodeSelector/tolerations/affinity, added in #247) —
-	// merge, don't overwrite.
+	// Extended resources constrain where this pod fits but repel nothing, so a
+	// cluster reserving nested-virt nodes with a taint also needs the toleration
+	// that applySandboxClassToleration adds for every class.
+}
+
+// sandboxClassTaintKey is the taint key a cluster puts on a node pool reserved
+// for one sandbox class, with the class name as the value:
+// ate.dev/sandboxClass=<class>:NoSchedule. The atelet DaemonSet tolerates the
+// key for any value.
+const sandboxClassTaintKey = "ate.dev/sandboxClass"
+
+// applySandboxClassToleration lets worker pods schedule onto a node pool
+// tainted for the pool's own sandbox class. Without it a cluster that reserves
+// nodes per class with the ate.dev/sandboxClass taint leaves every worker
+// Pending. The toleration is additive on top of the WorkerPool's configurable
+// spec.template tolerations. An empty class means the API default, gvisor,
+// which is what the CRD's defaulting produces on the server.
+func applySandboxClassToleration(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	sandboxClass atev1.SandboxClass,
+) {
+	if sandboxClass == "" {
+		sandboxClass = atev1.SandboxClassGvisor
+	}
 	podSpecAC.WithTolerations(corev1ac.Toleration().
-		WithKey("ate.dev/sandboxClass").
+		WithKey(sandboxClassTaintKey).
 		WithOperator(corev1.TolerationOpEqual).
-		WithValue(string(atev1alpha1.SandboxClassMicroVM)).
+		WithValue(string(sandboxClass)).
 		WithEffect(corev1.TaintEffectNoSchedule))
 }
 
@@ -449,11 +582,12 @@ func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, 
 func applyWorkerPoolPodTemplate(
 	podSpecAC *corev1ac.PodSpecApplyConfiguration,
 	containerAC *corev1ac.ContainerApplyConfiguration,
-	tmpl *atev1alpha1.WorkerPoolPodTemplate,
+	tmpl *atev1.WorkerPoolPodTemplate,
 ) {
 	podSpecAC.NodeSelector = map[string]string{}
 	podSpecAC.Tolerations = []corev1ac.TolerationApplyConfiguration{}
 	podSpecAC.WithPriorityClassName("")
+	podSpecAC.WithServiceAccountName(installdefaults.WorkerServiceAccount)
 	podSpecAC.WithAffinity(corev1ac.Affinity())
 	resourcesAC := corev1ac.ResourceRequirements()
 	containerAC.WithResources(resourcesAC)
@@ -467,6 +601,9 @@ func applyWorkerPoolPodTemplate(
 	}
 	podSpecAC.Tolerations = tolerationApplyValues(tolerationsToApply(tmpl.Tolerations))
 	podSpecAC.WithPriorityClassName(tmpl.PriorityClassName)
+	if tmpl.ServiceAccountName != nil {
+		podSpecAC.WithServiceAccountName(*tmpl.ServiceAccountName)
+	}
 
 	if tmpl.NodeAffinity != nil {
 		podSpecAC.WithAffinity(corev1ac.Affinity().WithNodeAffinity(nodeAffinityToApply(tmpl.NodeAffinity)))

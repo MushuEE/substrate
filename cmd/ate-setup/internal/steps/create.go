@@ -15,18 +15,20 @@
 package steps
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/encoding/prototext"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
-	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/pkg/proto/ateconfigpb"
 )
 
 // Secret and ConfigMap names the control plane reads.
@@ -36,11 +38,15 @@ const (
 	SecretActorIDCACerts   = "actor-id-ca-certs"
 	SecretServiceDNSCA     = "service-dns-ca-pool"
 	SecretPodIdentityCA    = "pod-identity-ca-pool"
+	SecretPostgresCA       = "postgres-ca-pool"
 	SecretEgressMITMCAPool = "egress-mitm-ca-pool"
+	SecretAPIEnvVars       = "ate-api-server-secret-envvars"
+	SecretPostgresServerCA = "postgres-server-ca"
 	ConfigMapAPIEnvVars    = "ate-api-server-envvars"
 	ConfigMapAPIAuthn      = "ate-api-authentication"
-	// poolKeyID is the identifier given to the first CA and JWT key in a new
-	// pool, matching the --ca-id/--key-id the shell scripts passed.
+	ConfigMapAPIConfig     = "ate-api-config"
+	// poolKeyID is the identifier given to the first CA in a new pool,
+	// matching the --ca-id the shell scripts passed.
 	poolKeyID = "1"
 )
 
@@ -49,57 +55,62 @@ const (
 const caValidity = 365 * 24 * time.Hour
 
 // CreateJWTAuthorityPoolSecret generates the actor-identity JWT signing pool.
+// An existing pool is kept, and its "jwks" key is brought in step with it.
 // This is the make-jwt-pool call create_jwt_authority_pool_secret shelled out
 // to kubectl-ate for.
 func (e *Env) CreateJWTAuthorityPoolSecret(ctx context.Context) error {
 	log.Step("create_jwt_authority_pool_secret")
-	return e.createJWTPool(ctx, NamespaceAteSystem, SecretActorIDJWTPool)
+	return e.createJWTPool(ctx, e.Namespace(), SecretActorIDJWTPool)
 }
 
-// CreateActorIDCAPoolSecret generates the actor-identity CA pool.
+// CreateActorIDCAPoolSecret generates the actor-identity CA pool. External
+// relying parties trust this root, so it uses ECDSA P-256, which is more
+// broadly accepted than Ed25519.
 func (e *Env) CreateActorIDCAPoolSecret(ctx context.Context) error {
 	log.Step("create_actor_id_ca_pool_secret")
-	return e.createCAPool(ctx, NamespaceAteSystem, SecretActorIDCAPool)
+	return e.createCAPool(ctx, e.Namespace(), SecretActorIDCAPool, localca.KeyTypeECDSAP256)
 }
 
 // CreateEgressMITMCAPoolSecret generates the egress MITM CA pool.
 func (e *Env) CreateEgressMITMCAPoolSecret(ctx context.Context) error {
 	log.Step("create_egress_mitm_ca_pool_secret")
-	exists, err := e.Kube.SecretExists(ctx, NamespaceAteSystem, SecretEgressMITMCAPool)
+	exists, err := e.Kube.SecretExists(ctx, e.Namespace(), SecretEgressMITMCAPool)
 	if err != nil {
 		return err
 	}
 	if exists {
-		log.Infof("  CA pool %s/%s already exists; keeping it", NamespaceAteSystem, SecretEgressMITMCAPool)
+		log.Infof("  CA pool %s/%s already exists; keeping it", e.Namespace(), SecretEgressMITMCAPool)
 		return nil
 	}
 
-	poolBytes, err := newCAPoolBytes(poolKeyID, localca.KeyTypeECDSAP256)
+	data, err := newCAPoolSecretData(poolKeyID, localca.KeyTypeECDSAP256)
 	if err != nil {
-		return fmt.Errorf("while generating the CA pool for %s/%s: %w", NamespaceAteSystem, SecretEgressMITMCAPool, err)
+		return fmt.Errorf("while generating the CA pool for %s/%s: %w", e.Namespace(), SecretEgressMITMCAPool, err)
 	}
-	return e.createPoolSecret(ctx, NamespaceAteSystem, SecretEgressMITMCAPool, poolBytes)
+	return e.createPoolSecret(ctx, e.Namespace(), SecretEgressMITMCAPool, corev1.SecretTypeTLS, data)
 }
 
-// EnsureEgressMITMCAPoolSecret creates the egress MITM CA pool secret if sdsmint is enabled.
+// EnsureEgressMITMCAPoolSecret creates the egress MITM CA pool secret. Both
+// dataplanes need it: the agentgateway-egress overlay mounts the same
+// Secret the envoy egress does.
 func (e *Env) EnsureEgressMITMCAPoolSecret(ctx context.Context) error {
-	if e.Cfg.Router == config.RouterAgentgateway || !e.Cfg.ExperimentalUseSDSMint {
-		return nil
-	}
-	return e.ensureSecret(ctx, NamespaceAteSystem, SecretEgressMITMCAPool, e.CreateEgressMITMCAPoolSecret)
+	return e.ensureSecret(ctx, e.Namespace(), SecretEgressMITMCAPool, e.CreateEgressMITMCAPoolSecret)
 }
 
-// CreatePodCertificateControllerCAs generates the two signer pools the
+// CreatePodCertificateControllerCAs generates the signer pools the
 // podcertificate controller issues from.
 func (e *Env) CreatePodCertificateControllerCAs(ctx context.Context) error {
 	log.Step("create_podcertificate_controller_cas")
 	if err := e.Kube.EnsureNamespace(ctx, NamespacePodCert); err != nil {
 		return err
 	}
-	if err := e.createCAPool(ctx, NamespacePodCert, SecretServiceDNSCA); err != nil {
+	if err := e.createCAPool(ctx, NamespacePodCert, SecretServiceDNSCA, localca.KeyTypeED25519); err != nil {
 		return err
 	}
-	return e.createCAPool(ctx, NamespacePodCert, SecretPodIdentityCA)
+	if err := e.createCAPool(ctx, NamespacePodCert, SecretPodIdentityCA, localca.KeyTypeED25519); err != nil {
+		return err
+	}
+	return e.createCAPool(ctx, NamespacePodCert, SecretPostgresCA, localca.KeyTypeED25519)
 }
 
 // CreateActorIDCACertsSecret derives a certificate-only trust bundle from the
@@ -110,63 +121,86 @@ func (e *Env) CreatePodCertificateControllerCAs(ctx context.Context) error {
 // root.
 func (e *Env) CreateActorIDCACertsSecret(ctx context.Context) error {
 	log.Step("create_actor_id_ca_certs_secret")
-	root, err := e.Kube.CAPoolRootPEM(ctx, NamespaceAteSystem, SecretActorIDCAPool)
+	root, err := e.Kube.CAPoolRootPEM(ctx, e.Namespace(), SecretActorIDCAPool)
 	if err != nil {
 		return fmt.Errorf("while building %s: %w", SecretActorIDCACerts, err)
 	}
-	return e.Kube.ApplySecret(ctx, NamespaceAteSystem, SecretActorIDCACerts, map[string]string{
+	return e.Kube.ApplySecret(ctx, e.Namespace(), SecretActorIDCACerts, map[string]string{
 		"ca.crt": string(root),
 	})
 }
 
-// CreateAPIServerEnvVars writes the ConfigMap that tells ate-api-server how to
-// reach its PostgreSQL store. ate-api-server.yaml pulls it in via an optional
-// envFrom and resolves --postgres-connection-string=@env and
-// --postgres-schema=@env from it.
-func (e *Env) CreateAPIServerEnvVars(ctx context.Context) error {
-	log.Step("create_api_server_env_vars")
-	if err := e.Kube.EnsureNamespace(ctx, NamespaceAteSystem); err != nil {
+// defaultAPILogLevel is the ate-api-server log level a new install gets when
+// none is asked for.
+const defaultAPILogLevel = "info"
+
+// CreateAPIConfig writes the ate-api-server config file.
+func (e *Env) CreateAPIConfig(ctx context.Context) error {
+	log.Step("create_api_config")
+	if err := e.Kube.EnsureNamespace(ctx, e.Namespace()); err != nil {
 		return err
 	}
 
-	connString := e.Cfg.PostgresConnString()
-	log.Infof("POSTGRES_CONNECTION_STRING: %s", connString)
-
-	return e.Kube.ApplyConfigMap(ctx, NamespaceAteSystem, ConfigMapAPIEnvVars,
-		buildAPIServerEnvVars(connString, e.Cfg.PostgresSchemaName()))
+	logLevel := e.Cfg.APILogLevel
+	if logLevel == "" {
+		logLevel = defaultAPILogLevel
+	}
+	apiConfig, err := buildAPIConfig(logLevel)
+	if err != nil {
+		return err
+	}
+	log.Infof("%s apiconfig.textproto:", ConfigMapAPIConfig)
+	for _, line := range strings.Split(strings.TrimRight(apiConfig, "\n"), "\n") {
+		log.Infof("  | %s", line)
+	}
+	return e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIConfig, map[string]string{
+		"apiconfig.textproto": apiConfig,
+	})
 }
 
-// buildAPIServerEnvVars is the ConfigMap payload. ate-api-server takes the
-// connection string and the schema from it, and exits on an empty schema; an
-// unrecognized key here reaches the container as a stray environment variable,
-// so the set stays exactly what the shell installer's
-// create_api_server_env_vars writes.
-func buildAPIServerEnvVars(connString, schema string) map[string]string {
-	return map[string]string{
-		"ATE_API_POSTGRES_CONNECTION_STRING": connString,
-		"ATE_API_POSTGRES_SCHEMA":            schema,
+// buildAPIConfig renders apiconfig.textproto.
+func buildAPIConfig(logLevel string) (string, error) {
+	b, err := prototext.MarshalOptions{Multiline: true}.Marshal(&ateconfigpb.APIConfig{
+		Logging: &ateconfigpb.APILogging{Level: logLevel},
+	})
+	if err != nil {
+		return "", fmt.Errorf("while marshaling the ate-api-server config: %w", err)
 	}
+	return string(b), nil
 }
 
 // CreateAPIAuthenticationConfig writes the default ate-api-server
 // authentication config, pointing it at the cluster's service account issuer.
 func (e *Env) CreateAPIAuthenticationConfig(ctx context.Context) error {
 	log.Step("create_api_authentication_config")
-	if err := e.Kube.EnsureNamespace(ctx, NamespaceAteSystem); err != nil {
+	if err := e.Kube.EnsureNamespace(ctx, e.Namespace()); err != nil {
 		return err
 	}
 
 	authnConfig := buildAuthenticationConfig(e.jwtIssuer(ctx))
-	return e.Kube.ApplyConfigMap(ctx, NamespaceAteSystem, ConfigMapAPIAuthn, map[string]string{
+	// The issuer decides which tokens the apiserver accepts at all, and a
+	// wrong one fails as an opaque 401 much later, so show what was written.
+	log.Infof("%s authentication.yaml:", ConfigMapAPIAuthn)
+	for _, line := range strings.Split(authnConfig, "\n") {
+		log.Infof("  | %s", line)
+	}
+	return e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIAuthn, map[string]string{
 		"authentication.yaml": authnConfig,
 	})
 }
 
-// jwtIssuer determines the service account token issuer to trust. On GKE it is
-// derived from the cluster coordinates; otherwise it comes from the cluster's
-// OpenID discovery document, falling back to the in-cluster default.
+// jwtIssuer determines the service account token issuer to trust.
+//
+// ate-api-server accepts a token only if its iss claim equals this string
+// exactly. EXPECTED_JWT_ISSUER, when set, is that string; the rest is for
+// clusters whose issuer follows a standard form — derived from the cluster
+// coordinates on GKE, otherwise read from the cluster's OpenID discovery
+// document, falling back to the in-cluster default.
 func (e *Env) jwtIssuer(ctx context.Context) string {
 	cfg := e.Cfg
+	if cfg.ExpectedJWTIssuer != "" {
+		return cfg.ExpectedJWTIssuer
+	}
 	if cfg.ProjectID != "" && cfg.ClusterLocation != "" && cfg.ClusterName != "" {
 		return fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
 			cfg.ProjectID, cfg.ClusterLocation, cfg.ClusterName)
@@ -188,7 +222,7 @@ const inClusterIssuer = "https://kubernetes.default.svc"
 // OIDC discovery handshake. A GKE or otherwise external issuer needs neither.
 func buildAuthenticationConfig(issuer string) string {
 	config := fmt.Sprintf(
-		"actorIdentityJWTProvider: kubernetes\njwtProviders:\n- name: kubernetes\n  issuer: %s\n  audiences: [api.ate-system.svc]\n",
+		"jwtProviders:\n- name: kubernetes\n  issuer: %s\n  audiences: [api.ate-system.svc]\n",
 		issuer)
 	switch issuer {
 	case inClusterIssuer, inClusterIssuer + ".cluster.local":
@@ -206,7 +240,7 @@ func buildAuthenticationConfig(issuer string) string {
 // An existing pool is left alone. Regenerating it would rotate the root out
 // from under every certificate already issued from it, and the callers in the
 // shell script all guarded these calls with an existence check for that reason.
-func (e *Env) createCAPool(ctx context.Context, namespace, name string) error {
+func (e *Env) createCAPool(ctx context.Context, namespace, name string, keyType localca.KeyType) error {
 	exists, err := e.Kube.SecretExists(ctx, namespace, name)
 	if err != nil {
 		return err
@@ -216,18 +250,26 @@ func (e *Env) createCAPool(ctx context.Context, namespace, name string) error {
 		return nil
 	}
 
-	poolBytes, err := newCAPoolBytes(poolKeyID, localca.KeyTypeED25519)
+	data, err := newCAPoolSecretData(poolKeyID, keyType)
 	if err != nil {
 		return fmt.Errorf("while generating the CA pool for %s/%s: %w", namespace, name, err)
 	}
-	return e.createPoolSecret(ctx, namespace, name, poolBytes)
+	return e.createPoolSecret(ctx, namespace, name, corev1.SecretTypeTLS, data)
 }
 
-// newCAPoolBytes generates a pool holding one freshly minted CA, marshaled the
-// way kubectl-ate admin make-ca-pool writes it: the new CA is named and marked
-// active for signing. A pool with no active CA still signs with its first entry,
-// but only as a backwards-compatibility fallback.
-func newCAPoolBytes(id string, keyType localca.KeyType) ([]byte, error) {
+// newCAPoolSecretData generates a pool holding one freshly minted CA and
+// returns the Secret contents kubectl-ate admin make-ca-pool writes for it: the
+// marshaled pool, where the new CA is named and marked active for signing, plus
+// the root certificate chain and its private key under the standard TLS keys.
+// A pool with no active CA still signs with its first entry, but only as a
+// backwards-compatibility fallback.
+//
+// The certificate and key are not redundant with the pool. Consumers that speak
+// TLS rather than the pool format mount them directly — the
+// agentgateway-egress overlay mounts tls.crt and tls.key from
+// egress-mitm-ca-pool non-optionally, so a pool Secret holding only "pool"
+// leaves atenet-egress stuck in ContainerCreating.
+func newCAPoolSecretData(id string, keyType localca.KeyType) (map[string][]byte, error) {
 	ca, err := localca.GenerateCA(id, keyType, caValidity)
 	if err != nil {
 		return nil, fmt.Errorf("while generating CA %q: %w", id, err)
@@ -239,34 +281,75 @@ func newCAPoolBytes(id string, keyType localca.KeyType) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while marshaling the pool for CA %q: %w", id, err)
 	}
-	return poolBytes, nil
+	certificateChain, err := ca.TLSCertificateChainPEM()
+	if err != nil {
+		return nil, fmt.Errorf("while encoding the certificate chain for CA %q: %w", id, err)
+	}
+	privateKey, err := ca.TLSPrivateKeyPEM()
+	if err != nil {
+		return nil, fmt.Errorf("while encoding the private key for CA %q: %w", id, err)
+	}
+	return map[string][]byte{
+		"pool":                  poolBytes,
+		corev1.TLSCertKey:       certificateChain,
+		corev1.TLSPrivateKeyKey: privateKey,
+	}, nil
 }
 
 // createJWTPool generates a JWT authority pool and stores it in a Secret. As
 // with the CA pools, an existing pool is preserved: rotating the signing key
 // would invalidate every token already minted from it.
 func (e *Env) createJWTPool(ctx context.Context, namespace, name string) error {
-	exists, err := e.Kube.SecretExists(ctx, namespace, name)
+	existing, err := e.Kube.GetSecret(ctx, namespace, name)
 	if err != nil {
 		return err
 	}
-	if exists {
+	if existing != nil {
 		log.Infof("  JWT authority pool %s/%s already exists; keeping it", namespace, name)
-		return nil
+		return e.publishJWTPoolKeys(ctx, existing)
 	}
 
-	authority, err := localjwtauthority.GenerateECDSAP256Authority(poolKeyID)
+	data, err := newJWTPoolSecretData(e.Cfg.ActorJWTAlgorithm)
 	if err != nil {
-		return fmt.Errorf("while generating the JWT authority for %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("while building the JWT pool for %s/%s: %w", namespace, name, err)
 	}
-	poolBytes, err := localjwtauthority.Marshal(&localjwtauthority.ConcretePool{
-		Authorities:      []*localjwtauthority.Authority{authority},
-		ActiveForSigning: poolKeyID,
-	})
+	return e.createPoolSecret(ctx, namespace, name, corev1.SecretTypeOpaque, data)
+}
+
+// publishJWTPoolKeys makes the "jwks" key of a pool Secret match its pool:
+// missing on a Secret from before the key existed, or stale after a tool that
+// did not know it rewrote the pool. A stale set would keep a removed key
+// trusted, so it is recomputed from the pool every run. A matching Secret is
+// left alone.
+func (e *Env) publishJWTPoolKeys(ctx context.Context, secret *corev1.Secret) error {
+	jwks, err := localjwtauthority.PublicJWKS(secret.Data["pool"])
 	if err != nil {
-		return fmt.Errorf("while marshaling the JWT pool for %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("while publishing the public keys of %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
-	return e.createPoolSecret(ctx, namespace, name, poolBytes)
+	if bytes.Equal(secret.Data["jwks"], jwks) {
+		return nil
+	}
+	secret.Data["jwks"] = jwks
+	if _, err := e.Kube.Typed.CoreV1().Secrets(secret.Namespace).Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("while writing jwks to %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	log.Infof("  published the public keys of %s/%s as jwks", secret.Namespace, secret.Name)
+	return nil
+}
+
+// newJWTPoolSecretData generates a pool with one active authority for
+// algorithm, keyed by its thumbprint. "jwks" holds the pool's public keys for
+// verifiers that must not see the pool.
+func newJWTPoolSecretData(algorithm string) (map[string][]byte, error) {
+	poolBytes, _, err := localjwtauthority.GeneratePool(algorithm, "")
+	if err != nil {
+		return nil, fmt.Errorf("while generating the JWT pool: %w", err)
+	}
+	jwks, err := localjwtauthority.PublicJWKS(poolBytes)
+	if err != nil {
+		return nil, fmt.Errorf("while publishing the JWT pool's public keys: %w", err)
+	}
+	return map[string][]byte{"pool": poolBytes, "jwks": jwks}, nil
 }
 
 // createPoolSecret writes pool state.
@@ -274,10 +357,11 @@ func (e *Env) createJWTPool(ctx context.Context, namespace, name string) error {
 // Create, not apply: these Secrets hold generated private key material, and
 // creation is guarded by an existence check above. Using apply would let a
 // concurrent run overwrite a pool another run just generated.
-func (e *Env) createPoolSecret(ctx context.Context, namespace, name string, poolBytes []byte) error {
+func (e *Env) createPoolSecret(ctx context.Context, namespace, name string, secretType corev1.SecretType, data map[string][]byte) error {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Data:       map[string][]byte{"pool": poolBytes},
+		Type:       secretType,
+		Data:       data,
 	}
 	if _, err := e.Kube.Typed.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("while creating pool secret %s/%s: %w", namespace, name, err)

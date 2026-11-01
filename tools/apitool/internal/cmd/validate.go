@@ -20,9 +20,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/agent-substrate/substrate/tools/apitool/internal/exemption"
-	"github.com/agent-substrate/substrate/tools/apitool/internal/lint"
-	"github.com/agent-substrate/substrate/tools/apitool/internal/validate"
+	"go.ate.dev/substrate/tools/apitool/internal/exemption"
+	"go.ate.dev/substrate/tools/apitool/internal/lint"
+	"go.ate.dev/substrate/tools/apitool/internal/validate"
 )
 
 var validateCmd = &cobra.Command{
@@ -69,6 +69,9 @@ func runValidate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := exemption.CheckSorted(exemptions); err != nil {
+		return fmt.Errorf("%s: %w; run `apitool validate --update` to restore canonical order", path, err)
+	}
 	remaining := exemption.NewSet(exemptions)
 
 	fmt.Fprintf(out, "Validating ateapi.proto (%s), %d rule(s), %d exemption(s)...\n\n", api.Services[0].Name, len(lint.All), len(exemptions))
@@ -91,6 +94,7 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		failedRules++
 		total += len(shown)
 		fmt.Fprintf(out, "  %s %s\n", failIcon(), r.Rule.Name)
+		fmt.Fprintf(out, "    %s\n", r.Rule.Description)
 		for _, f := range shown {
 			fmt.Fprintf(out, "      %s: %s\n", f.Subject, f.Message)
 		}

@@ -19,7 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 )
 
 // pageTokenVersion guards against decoding a token produced by an incompatible
@@ -34,7 +34,7 @@ const (
 	kindAtespace      resourceKind = "atespace"
 	kindActor         resourceKind = "actor"
 	kindActorTemplate resourceKind = "actor-template"
-	kindSnapshot      resourceKind = "snapshot"
+	kindTag           resourceKind = "tag"
 	kindWorker        resourceKind = "worker"
 	kindWorkerAssign  resourceKind = "worker-assignment"
 )

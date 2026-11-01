@@ -16,10 +16,14 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/clustertrustbundle"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,18 +39,11 @@ const (
 	KindStatefulSet = "statefulset"
 )
 
-// clusterTrustBundleGVK identifies the certificates.k8s.io ClusterTrustBundle
-// the podcertificate controller publishes.
-var clusterTrustBundleGVK = schema.GroupVersionKind{
-	Group:   "certificates.k8s.io",
-	Version: "v1beta1",
-	Kind:    "ClusterTrustBundle",
-}
-
 // RolloutStatus blocks until a workload has finished rolling out, replacing
 // `kubectl rollout status <kind>/<name> -n <ns> --timeout=<t>`. The readiness
 // conditions match kubectl's own status viewers.
 func (c *Client) RolloutStatus(ctx context.Context, kind, namespace, name string, timeout time.Duration) error {
+	defer log.Elapsed(time.Now(), fmt.Sprintf("rollout status %s/%s", kind, name))
 	var lastMsg string
 	var notFoundCount int
 	err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
@@ -188,6 +185,39 @@ func (c *Client) WaitNamespaceActive(ctx context.Context, name string, timeout t
 	return nil
 }
 
+// WaitJobComplete blocks until the named Job reports Complete=True, replacing
+// `kubectl wait --for=condition=complete job/<name>`. It fails immediately if
+// the Job reports Failed=True.
+func (c *Client) WaitJobComplete(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	defer log.Elapsed(time.Now(), fmt.Sprintf("wait for job/%s", name))
+	err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
+		job, err := c.Typed.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, cond := range job.Status.Conditions {
+			if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+			if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+				detail := cond.Message
+				if detail == "" {
+					detail = cond.Reason
+				}
+				if detail != "" {
+					return false, fmt.Errorf("job failed: %s", detail)
+				}
+				return false, errors.New("job failed")
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for job %s/%s to complete: %w", namespace, name, err)
+	}
+	return nil
+}
+
 // WaitCondition blocks until a custom resource reports the named status
 // condition as True, replacing `kubectl wait --for=condition=<type>`.
 func (c *Client) WaitCondition(ctx context.Context, gvk schema.GroupVersionKind, namespace, name, condition string, timeout time.Duration) error {
@@ -232,11 +262,25 @@ func (c *Client) WaitCondition(ctx context.Context, gvk schema.GroupVersionKind,
 
 // WaitClusterTrustBundles blocks until the podcertificate controller has
 // published the identity bundles the rest of the install depends on.
+//
+// The timeout is one deadline shared across every bundle, not a budget per
+// bundle: a slow first one must not hand the second a fresh full timeout.
 func (c *Client) WaitClusterTrustBundles(ctx context.Context, names []string, timeout time.Duration) error {
+	defer log.Elapsed(time.Now(), "wait for clustertrustbundles")
+	deadline := time.Now().Add(timeout)
 	for _, name := range names {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("waiting for ClusterTrustBundle %s: the %s budget was spent on the bundles before it", name, timeout)
+		}
 		var lastErr error
-		err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
-			ok, err := c.Exists(ctx, clusterTrustBundleGVK, "", name)
+		err := poll(ctx, remaining, func(ctx context.Context) (bool, error) {
+			gv, err := clustertrustbundle.Discover(c.Typed.Discovery())
+			if err != nil {
+				lastErr = err
+				return false, nil
+			}
+			ok, err := c.Exists(ctx, gv.WithKind("ClusterTrustBundle"), "", name)
 			if err != nil {
 				lastErr = err
 				return false, nil

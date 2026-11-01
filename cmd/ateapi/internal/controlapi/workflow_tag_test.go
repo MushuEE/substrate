@@ -1,0 +1,1048 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controlapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/objectstore/objectstoretest"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/testing/protocmp"
+)
+
+// seedTagSource stores a suspended actor whose external snapshot is made of
+// objectNames, the state a tag can be taken from. It returns the actor and the
+// URI of that snapshot.
+func seedTagSource(t *testing.T, ctx context.Context, persistence store.Interface, objects *objectstoretest.Fake, template *ateapi.ActorTemplate, name string, objectNames ...string) (*ateapi.Actor, resources.SnapshotURI) {
+	t.Helper()
+	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: "team-a", Name: name},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "team-a", Name: template.GetMetadata().GetName()},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+	uri := mustActorSnapshotURI(t, template, actor, name+"-snapshot")
+	objects.PutSnapshot(t, uri, objectNames...)
+	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+		s.LastAssignedGeneration = 1
+		snap := newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, template.GetMetadata().GetUid(), uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+		snap.SandboxRuntime = testSandboxRuntime()
+		s.Snapshots = []*ateapi.Snapshot{snap}
+	})
+	return actor, uri
+}
+
+// tagToCreate is the part of a Tag a client owns on create.
+func tagToCreate(sourceActor resources.ActorRef, name string) *ateapi.Tag {
+	return &ateapi.Tag{
+		Metadata:    &ateapi.ResourceMetadata{Name: name},
+		Scope:       ateapi.TagScope_TAG_SCOPE_ATESPACE,
+		SourceActor: sourceActor.ToObjectRef(),
+	}
+}
+
+// mustParseSnapshotURI is [resources.ParseSnapshotURI] for a URI a test has
+// already established is well formed.
+func mustParseSnapshotURI(t *testing.T, uri string) resources.SnapshotURI {
+	t.Helper()
+	parsed, err := resources.ParseSnapshotURI(uri)
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI(%q): %v", uri, err)
+	}
+	return parsed
+}
+
+// TestTagActorSnapshot verifies the whole tag workflow: the tag ends up owning
+// a copy of the actor's external snapshot, not the actor's own, recording where
+// that copy came from, and leaves the actor's snapshot alone.
+func TestTagActorSnapshot(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actor, actorSnapshot := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	actorRef := resources.ActorRefFromActor(actor)
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+
+	tagSnapshot := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+	if tagSnapshot == "" || tagSnapshot == actorSnapshot.String() {
+		t.Fatalf("tag snapshot uri = %q, want a copy of its own rather than the actor's %q", tagSnapshot, actorSnapshot)
+	}
+	if want := mustTagSnapshotURI(t, template, "team-a", tag.GetMetadata().GetUid()).String(); tagSnapshot != want {
+		t.Errorf("tag snapshot uri = %q, want UID-based URI %q", tagSnapshot, want)
+	}
+	if got, want := tag.GetStatus().GetSnapshot().GetUuid(), tag.GetMetadata().GetUid(); got != want {
+		t.Errorf("tag snapshot uuid = %q, want the tag's UID %q", got, want)
+	}
+	if got, want := tag.GetStatus().GetActorTemplateUid(), template.GetMetadata().GetUid(); got != want {
+		t.Errorf("actor template uid = %q, want %q", got, want)
+	}
+	if got, want := tag.GetStatus().GetSnapshot().GetFidelity(), ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY; got != want {
+		t.Errorf("fidelity = %v, want the source's %v", got, want)
+	}
+	if diff := cmp.Diff(testSandboxRuntime(), tag.GetStatus().GetSnapshot().GetSandboxRuntime(), protocmp.Transform()); diff != "" {
+		t.Errorf("tag Snapshot.SandboxRuntime mismatch (-want +got):\n%s", diff)
+	}
+
+	// Both prefixes hold the same objects: the tag copied rather than moved.
+	wantObjects := []string{"manifest.json", "memory.zst"}
+	if diff := cmp.Diff(wantObjects, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+		t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(wantObjects, objects.Snapshot(t, actorSnapshot)); diff != "" {
+		t.Errorf("the actor's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestTagActorSnapshot_ActorRepointedToAnotherTemplate(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	builtOn := seedSubstrateTemplate(t, ctx, persistence, "tmpl-a")
+	repointedTo := seedSubstrateTemplate(t, ctx, persistence, "tmpl-b")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actor, _ := seedTagSource(t, ctx, persistence, objects, builtOn, "actor-1", "manifest.json", "memory.zst")
+	actorRef := resources.ActorRefFromActor(actor)
+
+	// Repoint the suspended actor, the way UpdateActor does. The snapshot on
+	// disk still came from tmpl-a, and the UID recorded alongside it only
+	// moves when a later suspend commits a new snapshot.
+	if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapi.Actor) error {
+		toUpdate.ActorTemplate = &ateapi.ObjectRef{Atespace: "team-a", Name: "tmpl-b"}
+		return nil
+	}); err != nil {
+		t.Fatalf("repointing actor %s: %v", actorRef, err)
+	}
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+
+	if builtOn.GetMetadata().GetUid() == repointedTo.GetMetadata().GetUid() {
+		t.Fatal("the two templates share a UID; the assertion below would be vacuous")
+	}
+	if got, want := tag.GetStatus().GetActorTemplateUid(), builtOn.GetMetadata().GetUid(); got != want {
+		t.Errorf("actor template uid = %q, want the template the snapshot was built under %q (the actor now points at %q)",
+			got, want, repointedTo.GetMetadata().GetUid())
+	}
+}
+
+// TestTagActorSnapshot_LocationOutsideSegmentRules verifies that a tag of a
+// template whose stored location breaks the segment rules fails with
+// FailedPrecondition.
+func TestTagActorSnapshot_LocationOutsideSegmentRules(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template, err := persistence.CreateActorTemplate(ctx, &ateapi.ActorTemplate{
+		Metadata:       &ateapi.ResourceMetadata{Atespace: "team-a", Name: "sub-tmpl"},
+		SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: "gs://ate-snapshots/a.b/"},
+	})
+	if err != nil {
+		t.Fatalf("CreateActorTemplate: %v", err)
+	}
+	w, objects := newFinalizeWorkflow(persistence)
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json")
+
+	_, err = w.TagActorSnapshot(ctx, tagToCreate(resources.ActorRefFromActor(actor), "v1"))
+	if code := apierror.Code(err); code != codes.FailedPrecondition {
+		t.Fatalf("TagActorSnapshot error = %v (code %v), want code %v", err, code, codes.FailedPrecondition)
+	}
+	if !strings.Contains(err.Error(), "invalid storage location") {
+		t.Errorf("TagActorSnapshot error = %v, want it to name the invalid storage location", err)
+	}
+	if _, err := persistence.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "v1"}); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag after failed create: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestTagActorSnapshot_Preconditions verifies what a tag may be taken from:
+// a suspended actor's finished external snapshot, and nothing else.
+func TestTagActorSnapshot_Preconditions(t *testing.T) {
+	tests := []struct {
+		name         string
+		state        ateapi.ActorState
+		withSnapshot bool
+		// builtOnTemplate records the template the seeded snapshot was taken
+		// under, as every real path to holding one does. Only the case that
+		// exercises the missing record leaves it false.
+		builtOnTemplate bool
+		wantCode        codes.Code
+	}{
+		{
+			name:            "the actor is not suspended",
+			state:           ateapi.ActorState_ACTOR_STATE_RUNNING,
+			withSnapshot:    true,
+			builtOnTemplate: true,
+			wantCode:        codes.FailedPrecondition,
+		},
+		{
+			name:     "the actor holds no external snapshot",
+			state:    ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+			wantCode: codes.FailedPrecondition,
+		},
+		{
+			name:         "the actor records no template its snapshot was built under",
+			state:        ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+			withSnapshot: true,
+			wantCode:     codes.Internal,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := newTestPersistence(t)
+			template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+			w, objects := newFinalizeWorkflow(persistence)
+
+			actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+			actor := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "team-a", Name: "sub-tmpl"},
+				Status:        &ateapi.ActorStatus{State: tt.state},
+			})
+			if tt.withSnapshot {
+				uri := mustActorSnapshotURI(t, template, actor, "actor-1-snapshot")
+				objects.PutSnapshot(t, uri, "manifest.json")
+				mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+					var tmplUID string
+					if tt.builtOnTemplate {
+						tmplUID = template.GetMetadata().GetUid()
+					}
+					s.LastAssignedGeneration = 1
+					s.Snapshots = []*ateapi.Snapshot{
+						newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
+					}
+				})
+			}
+
+			_, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+			if code := apierror.Code(err); code != tt.wantCode {
+				t.Fatalf("TagActorSnapshot error = %v (code %v), want code %v", err, code, tt.wantCode)
+			}
+			// A rejected create takes the name with it.
+			if _, err := persistence.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "v1"}); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("GetTag = %v, want ErrNotFound: the rejected create reserved the name", err)
+			}
+		})
+	}
+}
+
+// TestTagActorSnapshot_TagsNewestExternalSnapshot verifies that a tag is
+// accepted when no snapshot is newer than the actor's external one, even when
+// that external snapshot is not at last_assigned_generation.
+func TestTagActorSnapshot_TagsNewestExternalSnapshot(t *testing.T) {
+	tests := []struct {
+		name string
+		// lastAssigned is the actor's last_assigned_generation. The external
+		// snapshot is always at generation extGen.
+		lastAssigned int32
+		extGen       int32
+		// locality is set on the external snapshot, as when the snapshot also
+		// has a local copy on the node.
+		locality string
+	}{
+		{
+			name:         "a revert dropped the newest generation",
+			lastAssigned: 2,
+			extGen:       1,
+		},
+		{
+			name:         "a paused actor's local snapshot was uploaded at the same generation",
+			lastAssigned: 2,
+			extGen:       2,
+			locality:     "node-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := newTestPersistence(t)
+			template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+			w, objects := newFinalizeWorkflow(persistence)
+
+			actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+			actor := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "team-a", Name: "sub-tmpl"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+			})
+			uri := mustActorSnapshotURI(t, template, actor, "actor-1-snapshot")
+			objects.PutSnapshot(t, uri, "manifest.json")
+			mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+				snap := newDurableSnapshot(tt.extGen, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, template.GetMetadata().GetUid(), uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+				snap.Locality = tt.locality
+				s.LastAssignedGeneration = tt.lastAssigned
+				s.Snapshots = []*ateapi.Snapshot{snap}
+			})
+
+			if _, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1")); err != nil {
+				t.Fatalf("TagActorSnapshot: %v", err)
+			}
+		})
+	}
+}
+
+// TestTagActorSnapshot_PromotesLocalSnapshot verifies that tagging a suspended
+// actor whose local snapshot is not uploaded yet has the atelet on the
+// snapshot's node upload it first, records the upload on the actor, and tags
+// that snapshot. A failed upload fails the tag without reserving its name and
+// leaves the actor as it was. A create that cannot succeed fails before the
+// upload.
+func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
+	// reported is the state atelet answers with once it made snap durable.
+	reported := func(snap *ateapi.Snapshot) *ateletpb.ActorSnapshotState {
+		report := &ateletpb.SnapshotReport{Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: snap.GetUuid(),
+			Generation:   snap.GetGeneration(),
+			Fidelity:     fidelityToAtelet(snap.GetFidelity()),
+			Object:       &ateletpb.ObjectStorage{SnapshotUri: snap.GetDurableSnapshot().GetObject().GetSnapshotUri()},
+		}}
+		return &ateletpb.ActorSnapshotState{LatestLocal: report, LatestDurable: proto.CloneOf(report)}
+	}
+
+	tests := []struct {
+		name string
+		// olderDurable seeds a COMPLETED snapshot below the local one.
+		olderDurable bool
+		// uploaded records the local snapshot's durable copy COMPLETED.
+		uploaded bool
+		// nodeLost clears the local snapshot's locality, as when its node
+		// was lost before the upload finished.
+		nodeLost bool
+		// nameTaken seeds a tag under the name the create asks for.
+		nameTaken bool
+		// badLocation points the template at a storage location with an
+		// atespaces segment.
+		badLocation bool
+		// noTemplateUID records no template the local snapshot was built
+		// under, a broken row.
+		noTemplateUID bool
+		// promoteState builds the state PromoteSnapshot answers with from the
+		// local snapshot.
+		promoteState func(paused *ateapi.Snapshot) *ateletpb.ActorSnapshotState
+		promoteErr   error
+		wantPromote  bool
+		wantCode     codes.Code
+	}{
+		{
+			name:         "the paused snapshot is above an older durable one",
+			olderDurable: true,
+			promoteState: reported,
+			wantPromote:  true,
+		},
+		{
+			name:         "the paused snapshot is the actor's only one",
+			promoteState: reported,
+			wantPromote:  true,
+		},
+		{
+			name:     "the paused snapshot's upload is already recorded",
+			uploaded: true,
+		},
+		{
+			name:         "the paused snapshot's node was lost before its upload finished",
+			olderDurable: true,
+			nodeLost:     true,
+		},
+		{
+			name:      "the name is already taken",
+			nameTaken: true,
+			wantCode:  codes.AlreadyExists,
+		},
+		{
+			name:        "the template's storage location has an atespaces segment",
+			badLocation: true,
+			wantCode:    codes.FailedPrecondition,
+		},
+		{
+			name:          "the paused snapshot records no template",
+			olderDurable:  true,
+			noTemplateUID: true,
+			wantCode:      codes.Internal,
+		},
+		{
+			name:        "atelet is unavailable",
+			promoteErr:  apierror.Unavailable("plugin: object store restarting"),
+			wantPromote: true,
+			wantCode:    codes.Unavailable,
+		},
+		{
+			name:        "the snapshot conflicts with atelet's newer state",
+			promoteErr:  apierror.Aborted("stale snapshot generation"),
+			wantPromote: true,
+			wantCode:    codes.Aborted,
+		},
+		{
+			name:        "the paused snapshot is gone and was never uploaded",
+			promoteErr:  apierror.NotFound("local snapshot is gone and no uploaded copy exists: %w", status.Error(codes.NotFound, "manifest not found")),
+			wantPromote: true,
+			wantCode:    codes.FailedPrecondition,
+		},
+		{
+			name:        "the paused snapshot's fidelity does not match",
+			promoteErr:  apierror.FailedPrecondition("pause snapshot captured full; upload asks for memory"),
+			wantPromote: true,
+			wantCode:    codes.FailedPrecondition,
+		},
+		{
+			name:        "the upload fails with a plugin error atelet does not classify",
+			promoteErr:  fmt.Errorf("while uploading snapshot files: %w", status.Error(codes.NotFound, "bucket not found")),
+			wantPromote: true,
+			wantCode:    codes.Internal,
+		},
+		{
+			name:         "atelet reports no durable snapshot",
+			promoteState: func(*ateapi.Snapshot) *ateletpb.ActorSnapshotState { return &ateletpb.ActorSnapshotState{} },
+			wantPromote:  true,
+			wantCode:     codes.Internal,
+		},
+		{
+			name: "atelet reports another snapshot at the generation",
+			promoteState: func(paused *ateapi.Snapshot) *ateletpb.ActorSnapshotState {
+				state := reported(paused)
+				state.LatestDurable.Snapshot.SnapshotUuid = "another-snapshot"
+				return state
+			},
+			wantPromote: true,
+			wantCode:    codes.Internal,
+		},
+		{
+			name: "atelet reports the snapshot at another generation",
+			promoteState: func(paused *ateapi.Snapshot) *ateletpb.ActorSnapshotState {
+				state := reported(paused)
+				state.LatestDurable.Snapshot.Generation = 1
+				return state
+			},
+			wantPromote: true,
+			wantCode:    codes.Internal,
+		},
+		{
+			name: "atelet reports the snapshot uploaded to another URI",
+			promoteState: func(paused *ateapi.Snapshot) *ateletpb.ActorSnapshotState {
+				state := reported(paused)
+				state.LatestDurable.Snapshot.Object.SnapshotUri += "-elsewhere"
+				return state
+			},
+			wantPromote: true,
+			wantCode:    codes.Internal,
+		},
+		{
+			name: "atelet reports the snapshot without a fidelity",
+			promoteState: func(paused *ateapi.Snapshot) *ateletpb.ActorSnapshotState {
+				state := reported(paused)
+				state.LatestDurable.Snapshot.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED
+				return state
+			},
+			wantPromote: true,
+			wantCode:    codes.Internal,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := newTestPersistence(t)
+			template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+			w, atelet, objects := newWireFinalizeWorkflow(t, persistence)
+			tmplUID := template.GetMetadata().GetUid()
+
+			actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+			actor := storetest.MustCreateActor(t, ctx, persistence, &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "team-a", Name: "sub-tmpl"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED, AssignedNode: "node-1"},
+			})
+			pausedURI := mustActorSnapshotURI(t, template, actor, "paused")
+			objects.PutSnapshot(t, pausedURI, "manifest.json", "memory.zst")
+			pausedStatus := ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+			if tt.uploaded {
+				pausedStatus = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+			}
+			paused := newDurableSnapshot(2, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, pausedURI.Name(), pausedURI.String(), pausedStatus)
+			if !tt.nodeLost {
+				paused.Locality = "node-1"
+			}
+			if tt.noTemplateUID {
+				paused.ActorTemplateUid = ""
+			}
+			actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+				s.LastAssignedGeneration = 2
+				if tt.olderDurable {
+					olderURI := mustActorSnapshotURI(t, template, actor, "older")
+					objects.PutSnapshot(t, olderURI, "manifest.json")
+					s.Snapshots = append(s.Snapshots, newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, olderURI.Name(), olderURI.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED))
+				}
+				s.Snapshots = append(s.Snapshots, proto.CloneOf(paused))
+			})
+			tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
+			var takenBy *ateapi.Tag
+			if tt.nameTaken {
+				var err error
+				takenBy, err = persistence.CreateTag(ctx, &ateapi.Tag{
+					Metadata:    &ateapi.ResourceMetadata{Atespace: tagRef.Atespace, Name: tagRef.Name},
+					Scope:       ateapi.TagScope_TAG_SCOPE_ATESPACE,
+					SourceActor: actorRef.ToObjectRef(),
+					Status:      &ateapi.TagStatus{ActorTemplateUid: tmplUID},
+				})
+				if err != nil {
+					t.Fatalf("CreateTag: %v", err)
+				}
+			}
+			if tt.badLocation {
+				_, err := persistence.UpdateActorTemplate(ctx, resources.ActorTemplateRefFromActorTemplate(template), store.PreconditionFrom(template), func(tmpl *ateapi.ActorTemplate) error {
+					tmpl.SnapshotConfig.StorageLocation = "gs://ate-snapshots/root/atespaces/team-b/actors/cc10"
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("UpdateActorTemplate: %v", err)
+				}
+			}
+			if tt.promoteState != nil {
+				atelet.promoteState = tt.promoteState(paused)
+			}
+			atelet.promoteErr = tt.promoteErr
+
+			tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+			if code := apierror.Code(err); code != tt.wantCode {
+				t.Fatalf("TagActorSnapshot error = %v (code %v), want code %v", err, code, tt.wantCode)
+			}
+
+			gotPromote := atelet.promoteRequest()
+			switch {
+			case !tt.wantPromote && gotPromote != nil:
+				t.Errorf("PromoteSnapshot request = %v, want none", gotPromote)
+			case tt.wantPromote:
+				wantPromote := &ateletpb.PromoteSnapshotRequest{
+					Atespace:              "team-a",
+					ActorName:             "actor-1",
+					ActorUid:              actor.GetMetadata().GetUid(),
+					ActorTemplateAtespace: "team-a",
+					ActorTemplateName:     "sub-tmpl",
+					Snapshot: &ateletpb.Snapshot{
+						SnapshotUuid: pausedURI.Name(),
+						Generation:   2,
+						Fidelity:     fidelityToAtelet(ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY),
+						Object:       &ateletpb.ObjectStorage{SnapshotUri: pausedURI.String()},
+					},
+				}
+				if diff := cmp.Diff(wantPromote, gotPromote, protocmp.Transform()); diff != "" {
+					t.Errorf("PromoteSnapshot request mismatch (-want +got):\n%s", diff)
+				}
+			}
+
+			stored, err := persistence.GetActor(ctx, actorRef)
+			if err != nil {
+				t.Fatalf("GetActor: %v", err)
+			}
+			if tt.wantCode != codes.OK {
+				if diff := cmp.Diff(actor.GetStatus(), stored.GetStatus(), protocmp.Transform()); diff != "" {
+					t.Errorf("a failed promote changed the actor's status (-want +got):\n%s", diff)
+				}
+				got, err := persistence.GetTag(ctx, tagRef)
+				switch {
+				case takenBy != nil:
+					if diff := cmp.Diff(takenBy, got, protocmp.Transform()); diff != "" {
+						t.Errorf("the failed create changed the tag holding the name (-want +got):\n%s", diff)
+					}
+				case !errors.Is(err, store.ErrNotFound):
+					t.Errorf("GetTag = %v, want ErrNotFound: the failed create reserved the name", err)
+				}
+				return
+			}
+
+			tagSnapshot := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+			if tt.nodeLost {
+				// Nothing to upload from: the actor is left as it was, and the
+				// tag copied the older durable snapshot.
+				if diff := cmp.Diff(actor.GetStatus(), stored.GetStatus(), protocmp.Transform()); diff != "" {
+					t.Errorf("the actor's status changed (-want +got):\n%s", diff)
+				}
+				if diff := cmp.Diff([]string{"manifest.json"}, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+					t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+				}
+				return
+			}
+
+			// The local snapshot is now durable and stays on its node.
+			wantPaused := proto.CloneOf(paused)
+			wantPaused.DurableSnapshot.State = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+			if diff := cmp.Diff(wantPaused, findSnapshotByGeneration(stored.GetStatus().GetSnapshots(), 2), protocmp.Transform()); diff != "" {
+				t.Errorf("the actor's latest snapshot mismatch (-want +got):\n%s", diff)
+			}
+			// The tag copied the local snapshot, not the older one.
+			if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+				t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestTagActorSnapshot_RecreateAfterCopyFailure verifies what a create that
+// dies mid-copy leaves behind, and how a client gets past it. The row survives
+// as a pending tag naming the prefix the copy was writing into, so the objects
+// it stranded are reachable; the name it holds is taken until the tag is
+// deleted, and only then does a create under that name run again.
+func TestTagActorSnapshot_RecreateAfterCopyFailure(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	actorRef := resources.ActorRefFromActor(actor)
+	tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
+
+	// The copy dies halfway through: the first object lands, the second does not.
+	objects.OnCopy = func(_, srcObject, _, _ string) error {
+		if strings.HasSuffix(srcObject, "memory.zst") {
+			return errObjectStore
+		}
+		return nil
+	}
+	if _, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1")); !isObjectStoreErr(err) {
+		t.Fatalf("TagActorSnapshot = %v, want an error wrapping %v", err, errObjectStore)
+	}
+	objects.OnCopy = nil
+
+	pending, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the external store failure: %v", err)
+	}
+	if got := tagDurableSnapshotURI(pending, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED); got != "" {
+		t.Errorf("snapshot uri after the failure = %q, want unset: the copy never finished", got)
+	}
+	strandedURI := mustReservedTagSnapshotURI(t, pending)
+	stranded := strandedURI.String()
+	if diff := cmp.Diff([]string{"manifest.json"}, objects.Snapshot(t, strandedURI)); diff != "" {
+		t.Errorf("the stranded partial copy mismatch (-want +got):\n%s", diff)
+	}
+
+	// Creating under the same name again is refused, even for the actor the
+	// pending row was reserved for, and leaves that row exactly as it was.
+	_, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if code := apierror.Code(err); code != codes.AlreadyExists {
+		t.Fatalf("TagActorSnapshot over the pending tag = %v (code %v), want code AlreadyExists", err, code)
+	}
+	stillPending, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the refused create: %v", err)
+	}
+	if got := mustReservedTagSnapshotURI(t, stillPending).String(); got != stranded {
+		t.Errorf("in-progress snapshot uri after the refused create = %q, want the prefix the row already named, %q", got, stranded)
+	}
+	if diff := cmp.Diff([]string{"manifest.json"}, objects.Snapshot(t, strandedURI)); diff != "" {
+		t.Errorf("the stranded partial copy after the refused create mismatch (-want +got):\n%s", diff)
+	}
+
+	// Deleting the tag collects the partial copy and frees the name.
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteTag on the pending tag: %v", err)
+	}
+	if got := objects.Snapshot(t, strandedURI); len(got) != 0 {
+		t.Errorf("the stranded prefix after the delete = %v, want collected", got)
+	}
+
+	// The create now runs from scratch, into a prefix of its own.
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot after the delete: %v", err)
+	}
+	recreated := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+	if recreated == "" || recreated == stranded {
+		t.Fatalf("snapshot uri after the delete = %q, want a fresh prefix rather than the stranded %q", recreated, stranded)
+	}
+	if want := mustTagSnapshotURI(t, template, "team-a", tag.GetMetadata().GetUid()).String(); recreated != want {
+		t.Errorf("recreated tag snapshot uri = %q, want UID-based URI %q", recreated, want)
+	}
+	if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, recreated))); diff != "" {
+		t.Errorf("the tag's external snapshot after the delete mismatch (-want +got):\n%s", diff)
+	}
+
+	// A create over the finished tag is refused the same way.
+	_, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if code := apierror.Code(err); code != codes.AlreadyExists {
+		t.Errorf("TagActorSnapshot over the finished tag = %v (code %v), want code AlreadyExists", err, code)
+	}
+}
+
+// recordTagErrorStore fails every UpdateTag while err is set, standing in for
+// a create that dies between reserving the tag and recording its snapshot.
+type recordTagErrorStore struct {
+	store.Interface
+	err error
+}
+
+func (s *recordTagErrorStore) UpdateTag(ctx context.Context, tagRef resources.TagRef, precondition store.Precondition, mutate func(*ateapi.Tag) error) (*ateapi.Tag, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.Interface.UpdateTag(ctx, tagRef, precondition, mutate)
+}
+
+// TestTagActorSnapshot_RecreateAfterRecordFailure verifies what a create that
+// dies after reserving the name, before recording the snapshot, leaves behind:
+// a tag with no snapshot and nothing in object storage, since nothing is
+// copied until the snapshot's URI is recorded. Deleting that tag frees the
+// name without touching object storage, and the create then runs again.
+func TestTagActorSnapshot_RecreateAfterRecordFailure(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	failing := &recordTagErrorStore{Interface: persistence, err: errors.New("store unavailable")}
+	w, objects := newFinalizeWorkflow(failing)
+
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	actorRef := resources.ActorRefFromActor(actor)
+	tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
+
+	if _, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1")); !errors.Is(err, failing.err) {
+		t.Fatalf("TagActorSnapshot = %v, want an error wrapping %v", err, failing.err)
+	}
+	failing.err = nil
+
+	reserved, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the failed record: %v", err)
+	}
+	if snap := reserved.GetStatus().GetSnapshot(); snap != nil {
+		t.Errorf("snapshot after the failed record = %v, want unset", snap)
+	}
+	if got := objects.Snapshot(t, mustTagSnapshotURI(t, template, "team-a", reserved.GetMetadata().GetUid())); len(got) != 0 {
+		t.Errorf("the reserved tag's prefix holds %v, want nothing copied before the snapshot is recorded", got)
+	}
+
+	// The delete has nothing to collect, so it must not reach object storage.
+	objects.OnList = func(_, prefix string) error {
+		t.Errorf("DeleteTag listed %q for a tag that records no snapshot", prefix)
+		return nil
+	}
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteTag on the reserved tag: %v", err)
+	}
+	objects.OnList = nil
+	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
+	}
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot after the delete: %v", err)
+	}
+	if got, want := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED), mustTagSnapshotURI(t, template, "team-a", tag.GetMetadata().GetUid()).String(); got != want {
+		t.Errorf("recreated tag snapshot uri = %q, want UID-based URI %q", got, want)
+	}
+}
+
+// TestTagActorSnapshot_RacesDelete verifies that deleting a tag that's
+// still being created is aborted.
+func TestTagActorSnapshot_RacesDelete(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	actorRef := resources.ActorRefFromActor(actor)
+	tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
+
+	var once sync.Once
+	var pendingURI string
+	var deleteErr error
+	// Simulate deleting the tag that's just being created during
+	// the file copy to GCS/S3.
+	objects.OnCopy = func(_, _, _, _ string) error {
+		once.Do(func() {
+			reserved, err := persistence.GetTag(ctx, tagRef)
+			if err != nil {
+				t.Errorf("GetTag during the copy: %v", err)
+				return
+			}
+			pendingURI = mustReservedTagSnapshotURI(t, reserved).String()
+			_, deleteErr = w.DeleteTag(ctx, tagRef, store.DeletePreconditions{})
+		})
+		return nil
+	}
+
+	tag, createErr := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if pendingURI == "" {
+		t.Fatalf("the create never reserved a row to race with (TagActorSnapshot = %v)", createErr)
+	}
+	if createErr != nil {
+		t.Fatalf("TagActorSnapshot: %v", createErr)
+	}
+	// The delete is refused rather than queued behind the copy: the create
+	// holds the tag's lease until it has finished writing.
+	if code := apierror.Code(deleteErr); code != codes.Aborted {
+		t.Errorf("DeleteTag during the copy = %v (code %v), want code Aborted", deleteErr, code)
+	}
+
+	// Nothing was collected out from under the copy, and the row in the store it
+	// is still there.
+	if got := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED); got != pendingURI {
+		t.Errorf("snapshot uri = %q, want the prefix the create reserved, %q", got, pendingURI)
+	}
+	if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, pendingURI))); diff != "" {
+		t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); err != nil {
+		t.Errorf("GetTag after the race: %v", err)
+	}
+}
+
+// TestTagActorSnapshot_NameTakenByAnotherActor verifies that a name held by a
+// pending tag is taken from every other actor's point of view too: the create
+// is refused and the pending copy is left exactly as it was, rather than a
+// second source writing into the prefix the first one is named after.
+func TestTagActorSnapshot_NameTakenByAnotherActor(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	first, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	second, secondSnapshot := seedTagSource(t, ctx, persistence, objects, template, "actor-2", "other.json")
+	tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
+
+	// The first actor reserves the name, then dies in the copy.
+	objects.OnCopy = func(_, srcObject, _, _ string) error {
+		if strings.HasSuffix(srcObject, "memory.zst") {
+			return errObjectStore
+		}
+		return nil
+	}
+	if _, err := w.TagActorSnapshot(ctx, tagToCreate(resources.ActorRefFromActor(first), "v1")); !isObjectStoreErr(err) {
+		t.Fatalf("TagActorSnapshot(actor-1) = %v, want an error wrapping %v", err, errObjectStore)
+	}
+	pending, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag: %v", err)
+	}
+	strandedURI := mustReservedTagSnapshotURI(t, pending)
+
+	// The second actor asks for the same name, with object storage healthy: it
+	// must not inherit the first actor's prefix.
+	objects.OnCopy = nil
+	_, err = w.TagActorSnapshot(ctx, tagToCreate(resources.ActorRefFromActor(second), "v1"))
+	if code := apierror.Code(err); code != codes.AlreadyExists {
+		t.Fatalf("TagActorSnapshot(actor-2) = %v (code %v), want code AlreadyExists", err, code)
+	}
+	if diff := cmp.Diff([]string{"manifest.json"}, objects.Snapshot(t, strandedURI)); diff != "" {
+		t.Errorf("the rejected create wrote into the pending tag's prefix (-want +got):\n%s", diff)
+	}
+	stored, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the rejected create: %v", err)
+	}
+	if got, want := stored.GetSourceActor().GetName(), first.GetMetadata().GetName(); got != want {
+		t.Errorf("source actor = %q, want the first actor's %q", got, want)
+	}
+	// The second actor kept its own snapshot; the failed tag collected nothing.
+	if diff := cmp.Diff([]string{"other.json"}, objects.Snapshot(t, secondSnapshot)); diff != "" {
+		t.Errorf("the second actor's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestDeleteTag_ReleasesExternalSnapshot verifies the delete collects the
+// external snapshot the tag owns before dropping the row that names it, and
+// that a failure to collect leaves the row intact so a retry can finish the job.
+func TestDeleteTag_ReleasesExternalSnapshot(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(resources.ActorRefFromActor(actor), "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+	tagRef := resources.TagRefFromTag(tag)
+	uri := mustReservedTagSnapshotURI(t, tag)
+
+	// A delete that cannot reach object storage must not drop the row: it is
+	// the only handle left on the snapshot.
+	objects.OnDelete = func(string, string) error { return errObjectStore }
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); !isObjectStoreErr(err) {
+		t.Fatalf("DeleteTag = %v, want an error wrapping %v", err, errObjectStore)
+	}
+	admitted, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the failure: %v", err)
+	}
+	if admitted.GetMetadata().GetDeleteTime() == nil {
+		t.Fatal("a failed delete left delete_time unset")
+	}
+
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); !isObjectStoreErr(err) {
+		t.Fatalf("retried DeleteTag = %v, want an error wrapping %v", err, errObjectStore)
+	}
+	retried, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag after the retried failure: %v", err)
+	}
+	if got, want := retried.GetMetadata().GetVersion(), admitted.GetMetadata().GetVersion(); got != want {
+		t.Errorf("a retried delete moved the version to %d, want %d", got, want)
+	}
+
+	// Simulates a retried deletion. Now, the object deletion succeeds,
+	// so we can remove the row from the DB.
+	objects.OnDelete = nil
+	deleted, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{})
+	if err != nil {
+		t.Fatalf("retried DeleteTag: %v", err)
+	}
+	if !deleted.GetMetadata().GetDeleteTime().AsTime().Equal(admitted.GetMetadata().GetDeleteTime().AsTime()) {
+		t.Errorf("the retry re-stamped delete_time: %v, want %v", deleted.GetMetadata().GetDeleteTime().AsTime(), admitted.GetMetadata().GetDeleteTime().AsTime())
+	}
+	if got := objects.Snapshot(t, uri); len(got) != 0 {
+		t.Errorf("the tag's external snapshot still holds %v, want it collected", got)
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestDeleteTag_ReleasesPendingSnapshot verifies that deleting a tag whose
+// create never finished collects what that create stranded. The pending row
+// names the prefix the copy was writing into, and it is the only handle left on
+// those objects.
+func TestDeleteTag_ReleasesPendingSnapshot(t *testing.T) {
+	ctx := context.Background()
+	persistence, cleanup := storetest.SetupTestStore(t)
+	t.Cleanup(cleanup)
+
+	actor := newTestSuspendedActor(t, ctx, persistence, testAtespace, "actor-1")
+	tag := storetest.MustCreateTag(t, ctx, persistence, newPendingTestTag(t, "v1", actor))
+	tagRef := resources.TagRefFromTag(tag)
+
+	w, objects := newFinalizeWorkflow(persistence)
+	uri := mustReservedTagSnapshotURI(t, tag)
+	// What a copy that died halfway through left behind.
+	objects.PutSnapshot(t, uri, "manifest.json")
+
+	// Cleanup must work without the source actor or its template.
+	mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+		s.State = ateapi.ActorState_ACTOR_STATE_DELETING
+	})
+	if _, err := persistence.DeleteActor(ctx, resources.ActorRefFromActor(actor), store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteActor: %v", err)
+	}
+	objects.OnDelete = func(string, string) error { return errObjectStore }
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); !isObjectStoreErr(err) {
+		t.Fatalf("DeleteTag = %v, want an error wrapping %v", err, errObjectStore)
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); err != nil {
+		t.Fatalf("GetTag after failed cleanup: %v", err)
+	}
+	objects.OnDelete = nil
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteTag: %v", err)
+	}
+	if got := objects.Snapshot(t, uri); len(got) != 0 {
+		t.Errorf("the pending tag's stranded objects are still %v, want them collected", got)
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestDeleteTag_NotFound verifies a delete of a tag that is not there is
+// NotFound rather than a silent success: the client asked to collect a snapshot
+// no row names.
+func TestDeleteTag_NotFound(t *testing.T) {
+	ctx := context.Background()
+	persistence, cleanup := storetest.SetupTestStore(t)
+	t.Cleanup(cleanup)
+	storetest.MustCreateAtespace(t, ctx, persistence, testAtespace)
+	w, _ := newFinalizeWorkflow(persistence)
+
+	_, err := w.DeleteTag(ctx, resources.TagRef{Atespace: testAtespace, Name: "missing"}, store.DeletePreconditions{})
+	if code := apierror.Code(err); code != codes.NotFound {
+		t.Errorf("DeleteTag = %v (code %v), want code NotFound", err, code)
+	}
+}
+
+func mustReservedTagSnapshotURI(t *testing.T, tag *ateapi.Tag) resources.SnapshotURI {
+	t.Helper()
+	uri, err := resources.ParseSnapshotURI(tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_UNSPECIFIED))
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI: %v", err)
+	}
+	return uri
+}
+
+func TestDeleteTag_Preconditions(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+	actor, _ := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "memory.zst")
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(resources.ActorRefFromActor(actor), "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+	tagRef := resources.TagRefFromTag(tag)
+	uri := mustReservedTagSnapshotURI(t, tag)
+	observed, err := persistence.GetTag(ctx, tagRef)
+	if err != nil {
+		t.Fatalf("GetTag: %v", err)
+	}
+	uid, version := observed.GetMetadata().GetUid(), observed.GetMetadata().GetVersion()
+
+	for name, precondition := range map[string]store.DeletePreconditions{
+		"stale version": {UID: uid, Version: version + 1},
+		"foreign uid":   {UID: "0f0e0d0c-0b0a-4908-8706-050403020100", Version: version},
+	} {
+		if _, err := w.DeleteTag(ctx, tagRef, precondition); apierror.Code(err) != codes.Aborted {
+			t.Fatalf("DeleteTag with a %s = %v, want code Aborted", name, err)
+		}
+	}
+	if got := objects.Snapshot(t, uri); len(got) == 0 {
+		t.Fatal("a rejected delete collected the tag's external snapshot")
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); err != nil {
+		t.Fatalf("GetTag after the rejected deletes: %v", err)
+	}
+
+	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{UID: uid, Version: version}); err != nil {
+		t.Fatalf("DeleteTag with matching guards: %v", err)
+	}
+	if got := objects.Snapshot(t, uri); len(got) != 0 {
+		t.Errorf("the tag's external snapshot still holds %v, want it collected", got)
+	}
+	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
+	}
+}

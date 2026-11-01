@@ -91,7 +91,7 @@ def verify_file(filepath):
 def main():
     # Get tracked files via git ls-files
     try:
-        output = subprocess.check_output(['git', 'ls-files', '--others', '--cached', '--exclude-standard'], text=True)
+        output = subprocess.check_output(['git', 'ls-files', '--modified', '--cached', '--exclude-standard'], text=True)
     except subprocess.CalledProcessError as e:
         print(f"Error running git ls-files: {e}")
         sys.exit(1)
@@ -108,7 +108,7 @@ def main():
         # Skip non-source-code files
         if ext in ['.md', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.json', '.pdf', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.svg']:
             continue
-        if filename in ['LICENSE', 'NOTICE', 'CODEOWNERS', '.gitignore', 'go.mod', 'go.sum']:
+        if filename in ['LICENSE', 'NOTICE', 'CODEOWNERS', 'CNAME', '.gitignore', 'go.mod', 'go.sum', 'Cargo.lock']:
             continue
 
         # exclude third_party files, which should have their OWN LICENSE

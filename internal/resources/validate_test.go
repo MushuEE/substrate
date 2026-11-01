@@ -15,13 +15,92 @@
 package resources
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/api/validate"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
+
+func TestToGRPCStatusError(t *testing.T) {
+	err := ToGRPCStatusError(field.ErrorList{field.Required(field.NewPath("actor_name"), "")})
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", got)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "actor_name") {
+		t.Errorf("message %q does not name the field", status.Convert(err).Message())
+	}
+}
+
+func TestToAPIError(t *testing.T) {
+	err := ToAPIError(field.ErrorList{field.Required(field.NewPath("actor_name"), "")})
+	if got := apierror.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", got)
+	}
+	if !strings.Contains(err.Error(), "actor_name") {
+		t.Errorf("message %q does not name the field", err.Error())
+	}
+}
+
+func TestToAPIErrorEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		errs field.ErrorList
+	}{
+		{
+			name: "nil",
+			errs: nil,
+		},
+		{
+			name: "empty",
+			errs: field.ErrorList{},
+		},
+	} {
+		if err := ToAPIError(tc.errs); err != nil {
+			t.Errorf("%s: ToAPIError = %v, want nil", tc.name, err)
+		}
+	}
+}
+
+func TestDeepEqual(t *testing.T) {
+	// Proto messages carry internal state that reflect.DeepEqual would
+	// compare; proto.Equal compares only field values.
+	a := &ateapi.ObjectRef{Atespace: "a", Name: "x"}
+	b := &ateapi.ObjectRef{Atespace: "a", Name: "x"}
+	_ = a.String() // populates a's internal state, not b's
+
+	tests := []struct {
+		name string
+		got  bool
+		want bool
+	}{
+		{name: "equal protos", got: DeepEqual(a, b), want: true},
+		{name: "different protos", got: DeepEqual(a, &ateapi.ObjectRef{Atespace: "a", Name: "y"}), want: false},
+		{name: "nil protos", got: DeepEqual[*ateapi.ObjectRef](nil, nil), want: true},
+		{name: "equal non-protos", got: DeepEqual([]string{"a"}, []string{"a"}), want: true},
+		{name: "different non-protos", got: DeepEqual(1, 2), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("DeepEqual() = %v, want %v", tt.got, tt.want)
+			}
+		})
+	}
+}
 
 func TestIsValidResourceName(t *testing.T) {
 	tests := []struct {
@@ -48,254 +127,7 @@ func TestIsValidResourceName(t *testing.T) {
 	}
 }
 
-func TestValidateObjectRef(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   *ateapipb.ObjectRef
-		wantMsg string
-	}{{
-		"missing atespace",
-		&ateapipb.ObjectRef{Name: "id1"},
-		"atespace: Required value",
-	}, {
-		"invalid atespace",
-		&ateapipb.ObjectRef{Atespace: "NS1", Name: "id1"},
-		"atespace: Invalid value",
-	}, {
-		"missing name",
-		&ateapipb.ObjectRef{Atespace: "ns1"},
-		"name: Required value",
-	}, {
-		"invalid name",
-		&ateapipb.ObjectRef{Atespace: "ns1", Name: "ID1"},
-		"name: Invalid value",
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			errs := ValidateObjectRef(tt.input, field.NewPath("path"))
-			if len(errs) == 0 {
-				t.Fatalf("expected 1 error, got 0")
-			}
-			if len(errs) > 1 {
-				t.Fatalf("expected 1 error, got %v", errs)
-			}
-			err := errs[0]
-			got := err.Error()
-			if matched, matchErr := regexp.MatchString(tt.wantMsg, got); matchErr != nil {
-				t.Fatalf("failed to compile regex %q: %v", tt.wantMsg, matchErr)
-			} else if !matched {
-				t.Errorf("expected message %q, got %q", tt.wantMsg, got)
-			}
-		})
-	}
-}
-
-func TestValidateUpdateMetadataRef(t *testing.T) {
-	const uid = "8bf5b1a2-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
-	tests := []struct {
-		name      string
-		input     *ateapipb.ResourceMetadata
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Uid: uid, Version: 7},
-			wantError: nil,
-		},
-		{
-			name:  "nil metadata",
-			input: nil,
-			wantError: field.ErrorList{
-				field.Required(field.NewPath("path", "atespace"), ""),
-				field.Required(field.NewPath("path", "name"), ""),
-				field.Required(field.NewPath("path", "uid"), ""),
-				field.Required(field.NewPath("path", "version"), ""),
-			},
-		},
-		{
-			name:  "no preconditions",
-			input: &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1"},
-			wantError: field.ErrorList{
-				field.Required(field.NewPath("path", "uid"), ""),
-				field.Required(field.NewPath("path", "version"), ""),
-			},
-		},
-		{
-			name:      "missing atespace",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "atespace"), "")},
-		},
-		{
-			name:      "invalid atespace",
-			input:     &ateapipb.ResourceMetadata{Atespace: "NS1", Name: "id1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "atespace"), "NS1", "")},
-		},
-		{
-			name:      "missing name",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "name"), "")},
-		},
-		{
-			name:      "invalid name",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "ID1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "name"), "ID1", "")},
-		},
-		{
-			name:      "missing uid",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Version: 7},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "uid"), "")},
-		},
-		{
-			name:      "invalid uid",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Uid: "not-a-uuid", Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "uid"), "not-a-uuid", "")},
-		},
-		{
-			name:      "missing version",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Uid: uid},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "version"), "")},
-		},
-		{
-			name:      "negative version",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Uid: uid, Version: -1},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "version"), int64(-1), "")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ValidateUpdateMetadataRef(tt.input, field.NewPath("path"))
-			field.ErrorMatcher{}.ByType().ByField().ByValue().Test(t, tt.wantError, got)
-		})
-	}
-}
-
-func TestValidateGlobalUpdateMetadataRef(t *testing.T) {
-	const uid = "8bf5b1a2-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
-	tests := []struct {
-		name      string
-		input     *ateapipb.ResourceMetadata
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Uid: uid, Version: 7},
-			wantError: nil,
-		},
-		{
-			name:  "nil metadata",
-			input: nil,
-			wantError: field.ErrorList{
-				field.Required(field.NewPath("path", "name"), ""),
-				field.Required(field.NewPath("path", "uid"), ""),
-				field.Required(field.NewPath("path", "version"), ""),
-			},
-		},
-		{
-			name:  "no preconditions",
-			input: &ateapipb.ResourceMetadata{Name: "id1"},
-			wantError: field.ErrorList{
-				field.Required(field.NewPath("path", "uid"), ""),
-				field.Required(field.NewPath("path", "version"), ""),
-			},
-		},
-		{
-			// The global counterpart of ValidateUpdateMetadataRef's "missing
-			// atespace": a global resource belongs to none, so naming one is the
-			// error.
-			name:      "atespace set",
-			input:     &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "id1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "atespace"), "ns1", "")},
-		},
-		{
-			name:      "missing name",
-			input:     &ateapipb.ResourceMetadata{Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "name"), "")},
-		},
-		{
-			name:      "invalid name",
-			input:     &ateapipb.ResourceMetadata{Name: "ID1", Uid: uid, Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "name"), "ID1", "")},
-		},
-		{
-			name:      "missing uid",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Version: 7},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "uid"), "")},
-		},
-		{
-			name:      "invalid uid",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Uid: "not-a-uuid", Version: 7},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "uid"), "not-a-uuid", "")},
-		},
-		{
-			name:      "missing version",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Uid: uid},
-			wantError: field.ErrorList{field.Required(field.NewPath("path", "version"), "")},
-		},
-		{
-			name:      "negative version",
-			input:     &ateapipb.ResourceMetadata{Name: "id1", Uid: uid, Version: -1},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("path", "version"), int64(-1), "")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ValidateGlobalUpdateMetadataRef(tt.input, field.NewPath("path"))
-			field.ErrorMatcher{}.ByType().ByField().ByValue().Test(t, tt.wantError, got)
-		})
-	}
-}
-
-func TestValidateGlobalObjectRef(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   *ateapipb.ObjectRef
-		wantMsg string // empty means no error is expected
-	}{{
-		"valid global ref",
-		&ateapipb.ObjectRef{Name: "team-a"},
-		"",
-	}, {
-		// Unlike ValidateObjectRef, a nil global ref is an error: it names the
-		// resource the request acts on.
-		"missing ref",
-		nil,
-		"path: Required value",
-	}, {
-		"atespace must be empty",
-		&ateapipb.ObjectRef{Atespace: "ns1", Name: "team-a"},
-		"atespace: Invalid value",
-	}, {
-		"missing name",
-		&ateapipb.ObjectRef{},
-		"name: Required value",
-	}, {
-		"invalid name",
-		&ateapipb.ObjectRef{Name: "TEAM-A"},
-		"name: Invalid value",
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			errs := ValidateGlobalObjectRef(tt.input, field.NewPath("path"))
-			if tt.wantMsg == "" {
-				if len(errs) != 0 {
-					t.Fatalf("expected no errors, got %v", errs)
-				}
-				return
-			}
-			if len(errs) != 1 {
-				t.Fatalf("expected 1 error, got %v", errs)
-			}
-			got := errs[0].Error()
-			if matched, matchErr := regexp.MatchString(tt.wantMsg, got); matchErr != nil {
-				t.Fatalf("failed to compile regex %q: %v", tt.wantMsg, matchErr)
-			} else if !matched {
-				t.Errorf("expected message %q, got %q", tt.wantMsg, got)
-			}
-		})
-	}
-}
-
-func TestValidateAteomUID(t *testing.T) {
+func TestValidateWorkerPodUID(t *testing.T) {
 	tests := []struct {
 		name    string
 		uid     string
@@ -310,59 +142,8 @@ func TestValidateAteomUID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := ValidateAteomUID(tt.uid); (err != nil) != tt.wantErr {
-				t.Errorf("ValidateAteomUID(%q) err = %v, wantErr %v", tt.uid, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestValidateContainerNames(t *testing.T) {
-	tests := []struct {
-		name    string
-		names   []string
-		wantErr bool
-	}{
-		{"no containers", nil, false},
-		{"single valid", []string{"worker"}, false},
-		{"multiple valid", []string{"worker", "sidecar"}, false},
-		{"separator", []string{"a/b"}, true},
-		{"traversal", []string{".."}, true},
-		{"empty name", []string{""}, true},
-		{"uppercase", []string{"Worker"}, true},
-		{"reserved pause", []string{"pause"}, true},
-		{"reserved pause among valid", []string{"worker", "pause"}, true},
-		{"duplicate", []string{"worker", "worker"}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := ValidateContainerNames(tt.names); (err != nil) != tt.wantErr {
-				t.Errorf("ValidateContainerNames(%v) err = %v, wantErr %v", tt.names, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestValidateRunscHash(t *testing.T) {
-	const valid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-	tests := []struct {
-		name    string
-		hash    string
-		wantErr bool
-	}{
-		{"valid lowercase", valid, false},
-		{"valid uppercase", strings.ToUpper(valid), false},
-		{"empty", "", true},
-		{"too short", "abc123", true},
-		{"too long", valid + "00", true},
-		{"separator", strings.Repeat("a", 60) + "/../", true},
-		{"non-hex", strings.Repeat("g", 64), true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := ValidateRunscHash(tt.hash); (err != nil) != tt.wantErr {
-				t.Errorf("ValidateRunscHash(%q) err = %v, wantErr %v", tt.hash, err, tt.wantErr)
+			if err := ValidateWorkerPodUID(tt.uid); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateWorkerPodUID(%q) err = %v, wantErr %v", tt.uid, err, tt.wantErr)
 			}
 		})
 	}
@@ -370,32 +151,72 @@ func TestValidateRunscHash(t *testing.T) {
 
 func TestValidateSnapshotLocation(t *testing.T) {
 	tests := []struct {
-		name    string
-		prefix  string
-		wantErr bool
+		name     string
+		location string
+		wantErr  bool
 	}{
 		{"valid with trailing slash", "gs://bucket/actors/1234/snapshots/5678/", false},
 		{"valid without path", "gs://bucket", false},
+		{"valid root path", "gs://bucket/", false},
 		// Scheme is storage-backend policy, not validated here.
 		{"valid alternate scheme", "s3://bucket/path", false},
+		{"valid without scheme", "//bucket/path", false},
+		// Only path segments are restricted.
+		{"dotted bucket", "gs://my.bucket/snaps", false},
+		{"letters, digits, '_' and '-'", "gs://bucket/Team_A-1/snaps_v2", false},
 		{"empty", "", true},
 		{"missing bucket", "gs://", true},
 		{"no scheme or bucket", "bucket/path", true},
 		{"unparseable", "://bucket", true},
 		// Appended object names must not be swallowed by URL components.
 		{"query", "gs://bucket/path?x=1", true},
+		{"empty query", "gs://bucket/path?", true},
 		{"fragment", "gs://bucket/path#frag", true},
 		{"userinfo", "gs://user@bucket/path", true},
 		// Opaque form (no //) parses with an empty host, so it is rejected
 		// on either the bucket or the opaque check.
 		{"opaque", "gs:bucket/path", true},
+
+		{"dot in a segment", "gs://bucket/snaps.v1", true},
+		{"dot dot", "gs://bucket/team-a/../team-b", true},
+		{"trailing dot dot", "gs://bucket/path/..", true},
+		{"escaped dot dot", "gs://bucket/%2e%2e/path", true},
+		{"dot", "gs://bucket/./path", true},
+		{"triple dot", "gs://bucket/.../path", true},
+		{"space padded dot dot", "gs://bucket/a/%20..%20/b", true},
+		{"trailing space dot dot", "gs://bucket/a/..%20/b", true},
+		{"empty segment", "gs://bucket/a//b", true},
+		{"double root slash", "gs://bucket//", true},
+		{"space", "gs://bucket/a%20b", true},
+		{"no-break space", "gs://bucket/a%C2%A0b", true},
+		{"non-ASCII letter", "gs://bucket/caf%C3%A9", true},
+		{"escaped letter", "gs://bucket/%61bc", true},
+		{"backslash", `gs://bucket/team-a\..\team-b`, true},
+		{"escaped backslash", "gs://bucket/a%5Cb", true},
+
+		// Every owner's objects are stored under <location>/atespaces/, so
+		// a location must not contain that segment, or it could sit inside
+		// an atespace's or an owner's prefix.
+		{"under another actor's prefix", "gs://snaps/root/atespaces/team-a/actors/0b4e7c4e-2f3a-4d43-9a5e-0f6d1c2b3a4d", true},
+		{"atespaces at the end", "gs://snaps/root/atespaces/", true},
+		{"mixed-case atespaces", "gs://snaps/root/AteSpaces/team-a", true},
+		{"upper-case atespaces", "gs://snaps/root/ATESPACES/team-a", true},
+		{"escaped atespaces", "gs://snaps/root/%61tespaces/team-a", true},
+		{"escaped separators", "gs://snaps/root%2Fatespaces%2Fteam-a", true},
+		{"atespaces as part of a segment", "gs://snaps/root/my-atespaces/atespaces_old", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := ValidateSnapshotLocation(tt.prefix); (err != nil) != tt.wantErr {
-				t.Errorf("ValidateSnapshotLocation(%q) err = %v, wantErr %v", tt.prefix, err, tt.wantErr)
+			if err := ValidateSnapshotLocation(tt.location); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateSnapshotLocation(%q) err = %v, wantErr %v", tt.location, err, tt.wantErr)
 			}
 		})
+	}
+
+	// An empty segment gets its own message, not the allowlist's.
+	const emptySegment = "gs://bucket/a//b"
+	if err := ValidateSnapshotLocation(emptySegment); err == nil || !strings.Contains(err.Error(), "must not contain an empty path segment") {
+		t.Errorf("ValidateSnapshotLocation(%q) err = %v, want an empty path segment error", emptySegment, err)
 	}
 }
 
@@ -467,5 +288,453 @@ func TestValidateUUID(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateSandboxClass(t *testing.T) {
+	path := field.NewPath("sandbox_class")
+	tests := []struct {
+		name  string
+		class string
+		want  field.ErrorList
+	}{
+		{name: "gvisor", class: "gvisor"},
+		{name: "microvm", class: "microvm"},
+		{name: "empty left to tags", class: ""},
+		{name: "unknown class", class: "kata", want: field.ErrorList{field.NotSupported[string](path, nil, nil)}},
+		{name: "case-sensitive", class: "GVISOR", want: field.ErrorList{field.NotSupported[string](path, nil, nil)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field.ErrorMatcher{}.ByType().ByField().Test(t, tt.want, ValidateSandboxClass(path, tt.class))
+		})
+	}
+}
+
+func testActorDirs() *ateworkerpb.ActorDirs {
+	return &ateworkerpb.ActorDirs{
+		RootDir:                   "/node/actors/a",
+		OciBundleDir:              "/node/actors/a/bundles",
+		CheckpointDir:             "/node/actors/a/checkpoint-state",
+		RestoreDir:                "/node/actors/a/restore-state",
+		DurableDirVolumeMountsDir: "/node/actors/a/durable-dir",
+		SystemInfoVolumeRootsDir:  "/node/actors/a/system-info",
+		ExternalVolumeMountsDir:   "/node/actors/a/volumes",
+		SandboxAssetsDir:          "/node/actors/a/sandbox-assets",
+	}
+}
+
+func TestValidateSnapshotFidelity(t *testing.T) {
+	volumes := ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+	rootfs := ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+	memory := ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	all := []ateworkerpb.SnapshotFidelity{volumes, rootfs, memory}
+	noRootfs := []ateworkerpb.SnapshotFidelity{volumes, memory}
+	for _, tc := range []struct {
+		name      string
+		fidelity  ateworkerpb.SnapshotFidelity
+		supported []ateworkerpb.SnapshotFidelity
+		wantErr   bool
+	}{
+		{"volumes", volumes, all, false},
+		{"memory", memory, all, false},
+		{"rootfs where supported", rootfs, all, false},
+		{"rootfs where unsupported", rootfs, noRootfs, true},
+		{"unspecified", ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, all, true},
+		{"outside the enum", ateworkerpb.SnapshotFidelity(99), all, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateSnapshotFidelity(tc.fidelity, tc.supported, field.NewPath("fidelity"))
+			if gotErr := len(errs) != 0; gotErr != tc.wantErr {
+				t.Fatalf("ValidateSnapshotFidelity(%v) = %v, wantErr %t", tc.fidelity, errs, tc.wantErr)
+			}
+			for _, e := range errs {
+				if e.Field != "fidelity" {
+					t.Errorf("error names field %q, want %q", e.Field, "fidelity")
+				}
+			}
+		})
+	}
+}
+
+func TestValidateActorDirs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs
+		// wantField is the field the one expected error names; empty means valid.
+		wantField string
+	}{
+		{"valid", func(actorDirs *ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs { return actorDirs }, ""},
+		// Presence is the tags' job: nil and empty are not this check's to report.
+		{"nil", func(*ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs { return nil }, ""},
+		{"missing dir", func(actorDirs *ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs {
+			actorDirs.RestoreDir = ""
+			return actorDirs
+		}, ""},
+		{"relative dir", func(actorDirs *ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs {
+			actorDirs.OciBundleDir = "bundles"
+			return actorDirs
+		}, "actor_dirs.oci_bundle_dir"},
+		{"unclean dir", func(actorDirs *ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs {
+			actorDirs.CheckpointDir = "/node/actors/a/../b/checkpoint-state"
+			return actorDirs
+		}, "actor_dirs.checkpoint_dir"},
+		{"relative root", func(actorDirs *ateworkerpb.ActorDirs) *ateworkerpb.ActorDirs {
+			actorDirs.RootDir = "node/actors/a"
+			return actorDirs
+		}, "actor_dirs.root_dir"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateActorDirs(tc.mutate(testActorDirs()), field.NewPath("actor_dirs"))
+			if tc.wantField == "" {
+				if len(errs) != 0 {
+					t.Fatalf("ValidateActorDirs() = %v, want no errors", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || errs[0].Field != tc.wantField {
+				t.Fatalf("ValidateActorDirs() = %v, want one error on %s", errs, tc.wantField)
+			}
+		})
+	}
+}
+
+const testPinnedImage = "example.com/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// stringRuleCase is one input to a single-string rule and whether it fails.
+type stringRuleCase struct {
+	name    string
+	value   string
+	wantErr bool
+}
+
+func runStringRule(t *testing.T, rule func(*field.Path, string) field.ErrorList, tests []stringRuleCase) {
+	t.Helper()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := rule(field.NewPath("f"), tt.value)
+			if (len(errs) > 0) != tt.wantErr {
+				t.Errorf("value %q: errs = %v, wantErr %v", tt.value, errs, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateRuntimeAssetPath(t *testing.T) {
+	// on macOS the temp dir is behind the /var symlink
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset := filepath.Join(root, "runsc-abc")
+	if err := os.WriteFile(asset, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "gvisor-abc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "gvisor-abc", "runsc")
+	if err := os.WriteFile(nested, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "evil")
+	if err := os.WriteFile(outside, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "runsc-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	linkedDir := filepath.Join(root, "gvisor-link")
+	if err := os.Symlink(filepath.Dir(outside), linkedDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{"asset", asset, false},
+		{"release dir asset", nested, false},
+		{"empty", "", true},
+		{"relative", "runsc-abc", true},
+		{"unclean", root + "/gvisor-abc/../runsc-abc", true},
+		{"outside root", outside, true},
+		{"root itself", root, true},
+		{"directory", filepath.Join(root, "gvisor-abc"), true},
+		{"sibling with root prefix", root + "-other/runsc", true},
+		{"host binary", "/bin/sh", true},
+		{"symlink out of root", link, true},
+		{"symlinked directory", filepath.Join(linkedDir, "evil"), true},
+		{"missing", filepath.Join(root, "runsc-missing"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateRuntimeAssetPath(root, tc.path, field.NewPath("runsc_path"))
+			if gotErr := len(errs) > 0; gotErr != tc.wantErr {
+				t.Errorf("ValidateRuntimeAssetPath(%q) = %v, want error: %v", tc.path, errs, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatePinnedImage(t *testing.T) {
+	runStringRule(t, ValidatePinnedImage, []stringRuleCase{
+		{"empty is left to tags", "", false},
+		{"pinned", testPinnedImage, false},
+		{"tag only", "example.com/app:v1", true},
+		{"malformed digest", "example.com/app@sha256:abc", true},
+		{"malformed reference", "Example.com/App", true},
+	})
+}
+
+func TestValidateMountPath(t *testing.T) {
+	runStringRule(t, ValidateMountPath, []stringRuleCase{
+		{"empty is left to tags", "", false},
+		{"clean absolute", "/data/cache", false},
+		{"relative", "data", true},
+		{"root", "/", true},
+		{"trailing slash", "/data/", true},
+		{"double slash", "/data//x", true},
+		{"colon", "/data:x", true},
+		{"dot segment", "/data/./x", true},
+		{"dot-dot segment", "/data/../x", true},
+		{"control character", "/data\x01", true},
+	})
+}
+
+func TestValidateHTTPGetPath(t *testing.T) {
+	runStringRule(t, ValidateHTTPGetPath, []stringRuleCase{
+		{"empty is left to tags", "", false},
+		{"simple", "/healthz", false},
+		{"percent escape", "/a%20b", false},
+		{"no leading slash", "healthz", true},
+		{"query", "/healthz?x=1", true},
+		{"fragment", "/healthz#x", true},
+		{"bad percent escape", "/a%2", true},
+	})
+}
+
+func TestValidateEnvVarName(t *testing.T) {
+	runStringRule(t, ValidateEnvVarName, []stringRuleCase{
+		{"empty is left to tags", "", false},
+		{"conventional", "HOME_DIR", false},
+		{"printable punctuation", "a.b-c", false},
+		{"equals sign", "A=B", true},
+		{"control character", "A\tB", true},
+		{"non-ASCII", "é", true},
+	})
+}
+
+func TestValidateProjectedPath(t *testing.T) {
+	runStringRule(t, ValidateProjectedPath, []stringRuleCase{
+		{"empty is left to tags", "", false},
+		{"relative file", "identity/name", false},
+		{"absolute", "/etc/name", true},
+		{"escape", "../name", true},
+	})
+}
+
+func TestValidateStorageVolumeID(t *testing.T) {
+	runStringRule(t, ValidateStorageVolumeID, []stringRuleCase{
+		{"empty", "", false},
+		{"plain", "projects/p/disks/d-1", false},
+		{"newline is allowed", "a\nb", false},
+		{"NUL", "a\x00b", true},
+		{"DEL", "a\x7fb", true},
+		{"C1 control", "a\u0085b", true},
+	})
+}
+
+func TestValidateVolumeType(t *testing.T) {
+	runStringRule(t, ValidateVolumeType, []stringRuleCase{
+		{"empty", "", false},
+		{"dns subdomain", "pd.csi.storage.gke.io", false},
+		{"substrate prefix", "substrate.io/gcs", false},
+		{"uppercase", "PD", true},
+		{"other prefix", "example.io/gcs", true},
+	})
+}
+
+func TestValidateCapabilities(t *testing.T) {
+	tests := []struct {
+		name     string
+		caps     []string
+		allowAll bool
+		wantErrs int
+	}{
+		{"valid names", []string{"NET_BIND_SERVICE", "SYS_PTRACE"}, false, 0},
+		{"ALL rejected for add", []string{"ALL"}, false, 1},
+		{"ALL accepted for drop", []string{"ALL"}, true, 0},
+		{"CAP_ prefix", []string{"CAP_NET_ADMIN"}, false, 1},
+		{"lowercase", []string{"net_admin"}, false, 1},
+		{"too long", []string{strings.Repeat("A", 64)}, false, 1},
+		{"each bad entry reported", []string{"CAP_X", "ok", "NET_ADMIN"}, false, 2},
+		{"unknown name", []string{"NET_ADIMN"}, false, 1},
+		{"unknown name in drop", []string{"NET_ADIMN"}, true, 1},
+		{"every known name", sets.List(linuxCapabilities), false, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if errs := ValidateCapabilities(field.NewPath("add"), tt.caps, tt.allowAll); len(errs) != tt.wantErrs {
+				t.Errorf("errs = %v, want %d", errs, tt.wantErrs)
+			}
+		})
+	}
+}
+
+func TestValidateNestedMountPaths(t *testing.T) {
+	path := field.NewPath("volume_mounts")
+	tests := []struct {
+		name  string
+		paths []string
+		want  field.ErrorList
+	}{
+		{name: "siblings", paths: []string{"/a", "/b", "/ab"}},
+		{name: "identical paths are left to the list key", paths: []string{"/a", "/a"}},
+		{name: "empty paths are skipped", paths: []string{"", "/a"}},
+		{
+			name:  "nested under an earlier mount",
+			paths: []string{"/a", "/a/b"},
+			want:  field.ErrorList{field.Invalid(path.Index(1).Child("mount_path"), nil, "")},
+		},
+		{
+			name:  "nested over an earlier mount",
+			paths: []string{"/a/b", "/a"},
+			want:  field.ErrorList{field.Invalid(path.Index(1).Child("mount_path"), nil, "")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field.ErrorMatcher{}.ByType().ByField().Test(t, tt.want, ValidateNestedMountPaths(path, tt.paths))
+		})
+	}
+}
+
+// TestValidateNestedMountPathsAt pins that each finding lands on the field
+// the caller maps its index to, which is how a caller spanning several lists
+// points at the right one.
+func TestValidateNestedMountPathsAt(t *testing.T) {
+	fields := []*field.Path{
+		field.NewPath("external_volume_mounts").Index(0).Child("mount_path"),
+		field.NewPath("image_volume_mounts").Index(0).Child("mount_path"),
+		field.NewPath("image_volume_mounts").Index(1).Child("mount_path"),
+	}
+	got := ValidateNestedMountPathsAt([]string{"/a", "/b", "/a/c"}, func(i int) *field.Path { return fields[i] })
+	want := field.ErrorList{field.Invalid(fields[2], nil, "")}
+	field.ErrorMatcher{}.ByType().ByField().Test(t, want, got)
+}
+
+func TestValidateCSIMap(t *testing.T) {
+	path := field.NewPath("publish_context")
+	many := make(map[string]string, 100)
+	for i := range 100 {
+		many[fmt.Sprintf("key-%03d", i)] = "v"
+	}
+	tests := []struct {
+		name string
+		m    map[string]string
+		want field.ErrorList
+	}{
+		{name: "nil"},
+		{name: "one long value", m: map[string]string{"token": strings.Repeat("x", 4000)}},
+		{name: "many small entries", m: many},
+		{name: "over the CSI spec limit, within the headroom", m: map[string]string{"k": strings.Repeat("x", 8*1024)}},
+		{name: "exactly the bound", m: map[string]string{"k": strings.Repeat("x", 40*1024-1)}},
+		{name: "one byte over", m: map[string]string{"k": strings.Repeat("x", 40*1024)}, want: field.ErrorList{field.TooLong(path, nil, 40*1024)}},
+		{name: "over across entries", m: map[string]string{"a": strings.Repeat("x", 20*1024), "b": strings.Repeat("y", 20*1024)}, want: field.ErrorList{field.TooLong(path, nil, 40*1024)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field.ErrorMatcher{}.ByType().ByField().Test(t, tt.want, ValidateCSIMap(path, tt.m))
+		})
+	}
+}
+
+func TestValidateHostPort(t *testing.T) {
+	runStringRule(t, ValidateHostPort, []stringRuleCase{
+		{name: "empty is left to presence tags", value: ""},
+		{name: "dns name", value: "atenet-egress.ate-system.svc:443"},
+		{name: "fully qualified dns name", value: "atenet-egress.ate-system.svc.cluster.local.:443"},
+		{name: "ipv4", value: "10.0.0.1:8080"},
+		{name: "ipv6", value: "[fd00::1]:443"},
+		{name: "missing port", value: "atenet-egress.ate-system.svc", wantErr: true},
+		{name: "empty host", value: ":443", wantErr: true},
+		{name: "bare dot host", value: ".:443", wantErr: true},
+		{name: "uppercase host", value: "Egress.Example:443", wantErr: true},
+		{name: "host with a path", value: "egress/../x:443", wantErr: true},
+		{name: "port zero", value: "egress.example:0", wantErr: true},
+		{name: "port too large", value: "egress.example:65536", wantErr: true},
+		{name: "named port", value: "egress.example:https", wantErr: true},
+		{name: "unbracketed ipv6", value: "fd00::1:443", wantErr: true},
+	})
+}
+
+func TestValidateSandboxAssetsDir(t *testing.T) {
+	orig := nodepath.ActorsDir
+	nodepath.ActorsDir = "/node/actors"
+	t.Cleanup(func() { nodepath.ActorsDir = orig })
+	for _, tc := range []struct {
+		name     string
+		actorUID string
+		dir      string
+		wantErr  bool
+	}{
+		{"the actor's own dir", "actor-a", "/node/actors/actor-a/sandbox-assets", false},
+		{"another actor's dir", "actor-a", "/node/actors/actor-b/sandbox-assets", true},
+		{"a dir elsewhere", "actor-a", "/usr/bin", true},
+		{"the root", "actor-a", "/", true},
+		{"a traversing uid", "../etc", "/node/etc/sandbox-assets", true},
+		{"an empty uid", "", "/node/actors/sandbox-assets", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateSandboxAssetsDir(tc.actorUID, tc.dir, field.NewPath("actor_dirs", "sandbox_assets_dir"))
+			if (len(errs) > 0) != tc.wantErr {
+				t.Errorf("ValidateSandboxAssetsDir(%q, %q) = %v, wantErr %v", tc.actorUID, tc.dir, errs, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A duplicate entry error carries the whole entry as its bad value, and the
+// error text renders it as JSON. The error is logged as a string, past the
+// logging handler's proto redaction, so a debug_redact field in the entry must
+// be masked before the text is built.
+func TestValidationErrorsRedactDebugRedactFields(t *testing.T) {
+	const secret = "sk-do-not-log"
+	env := []*ateapi.EnvVar{
+		{Name: "API_KEY", Value: secret},
+		{Name: "API_KEY", Value: secret},
+	}
+	errs := validate.PtrSliceUnique(context.Background(), operation.Operation{Type: operation.Create},
+		field.NewPath("env"), env, nil,
+		func(a, b *ateapi.EnvVar) bool { return a.Name == b.Name })
+	if len(errs) == 0 {
+		t.Fatal("PtrSliceUnique found no duplicate")
+	}
+
+	// A nil entry renders by panicking, so it is dropped and the rest of the
+	// list still reaches the message.
+	withNil := append(field.ErrorList{nil}, errs...)
+	for name, toErr := range map[string]func(field.ErrorList) error{
+		"ToAPIError":        ToAPIError,
+		"ToGRPCStatusError": ToGRPCStatusError,
+		"ToInternalError":   ToInternalError,
+	} {
+		for _, list := range []field.ErrorList{errs, withNil} {
+			msg := toErr(list).Error()
+			if strings.Contains(msg, secret) {
+				t.Errorf("%s: message %q contains the env value", name, msg)
+			}
+			if !strings.Contains(msg, "API_KEY") {
+				t.Errorf("%s: message %q does not name the duplicate", name, msg)
+			}
+		}
+		if msg := toErr(field.ErrorList{nil}).Error(); !strings.Contains(msg, "validation failed") {
+			t.Errorf("%s: message for a nil-only list = %q", name, msg)
+		}
+	}
+	if got := errs[0].BadValue.(*ateapi.EnvVar).GetValue(); got != secret {
+		t.Errorf("caller's error list was modified: value = %q", got)
 	}
 }

@@ -25,23 +25,41 @@ export NETWORK=default
 export SUBNETWORK=default
 
 export CLUSTER_NAME=substrate-poc
-# Supported: 1.36 (needs the beta APIs enabled at cluster creation, which
-# setup-gcp does) or 1.37+ (APIs served by default). Anything below 1.36 does
-# not work. GKE retires patch versions over time — if cluster creation rejects
+# Supported: 1.36 with the v1beta1 PodCertificate APIs enabled, which setup-gcp
+# does, or 1.37+, which serves them under v1. Anything below 1.36 does not
+# work. GKE retires patch versions over time — if cluster creation rejects
 # this pin, pick a current one from:
 #   gcloud container get-server-config --zone ${CLUSTER_LOCATION} --format="value(defaultClusterVersion)"
 # See tools/setup-gcp/README.md ("Create Cluster") for the full constraint.
 export CLUSTER_VERSION=1.36.3-gke.1767000
 export NODE_POOL_NAME=gvisor-pool
 export NODE_POOL_VERSION=1.36.3-gke.1767000
-export GVISOR_NODE_MACHINE_TYPE=c3-standard-4
+export NODE_MACHINE_TYPE=c3-standard-4
+# Enable nested virtualization (required for microVMs)
+export ENABLE_NESTED_VIRTUALIZATION=true
+# Boot disk customizations (optional; defaults to GKE's default boot disk)
+# export BOOT_DISK_SIZE_GB=500
+# export BOOT_DISK_TYPE=hyperdisk-balanced
 
 # Set this if you are using an existing cluster with a different context name.
 export KUBECTL_CONTEXT=
 
 export BUCKET_NAME=snapshot-substrate-test-${PROJECT_ID}
+# Cluster-wide location ate-api-server stores snapshots under.
+export SNAPSHOT_LOCATION="gs://${BUCKET_NAME}/"
+# Google service account snapshot transfers run as on GCS. setup-gcp creates
+# it, and ate-setup and hack/teardown.sh read the same name.
+export SNAPSHOT_TRANSFER_GSA_NAME=ate-snapshot-transfer
 
 export KO_DOCKER_REPO="gcr.io/${PROJECT_ID}/ate-images"
+
+# Credential provider the egress gateway injects credentials from, as JSON; the
+# install requires a choice. {"name":"k8s.io"} deploys the bundled Kubernetes
+# Secrets provider, with a NetworkPolicy that admits only the egress gateway;
+# {"enabled":false} turns egress credential injection off, and is the only choice
+# on the agentgateway dataplane; {"name":"<provider>","address":"<host>:<port>"}
+# uses a provider you deploy yourself. See docs/egress-credential-injection.md.
+export ATE_CREDENTIAL_PROVIDER='{"name":"k8s.io"}'
 
 # Set this if you want to override the default build platforms
 export KO_DEFAULTPLATFORMS=linux/amd64

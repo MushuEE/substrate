@@ -30,19 +30,18 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 )
 
-// TestConnect_DedicatedWatchPool covers the dual-pool path only Connect
-// takes (the rest of the suite uses NewPersistence, where feed traffic
-// shares the caller's pool): the watch pool must be distinct and owned, and
-// the watch must deliver through it end to end.
+// TestConnect_DedicatedWatchPool covers the auxiliary-pool path only Connect
+// takes (the rest of the suite uses NewPersistence, where every operation
+// shares the caller's pool).
 func TestConnect_DedicatedWatchPool(t *testing.T) {
 	requirePool(t) // ensures the container is up and containerDSN is set
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -55,8 +54,14 @@ func TestConnect_DedicatedWatchPool(t *testing.T) {
 	if !p.ownsWatchPool {
 		t.Fatal("Connect must own the watch pool so Close releases it")
 	}
+	if p.ownerPool == p.pool || p.ownerPool == p.watchPool || !p.ownsOwnerPool {
+		t.Fatal("Connect must own a dedicated owner pool")
+	}
 	if got := p.watchPool.Config().MaxConns; got != watchPoolMaxConns {
 		t.Fatalf("watch pool MaxConns = %d, want %d", got, watchPoolMaxConns)
+	}
+	if got := p.ownerPool.Config().MaxConns; got != ownerPoolMaxConns {
+		t.Fatalf("owner pool MaxConns = %d, want %d", got, ownerPoolMaxConns)
 	}
 
 	clearAll(t, p)
@@ -65,8 +70,8 @@ func TestConnect_DedicatedWatchPool(t *testing.T) {
 		t.Fatalf("WatchWorkers failed: %v", err)
 	}
 	defer watch.Close()
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "watchpool-worker"},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "watchpool-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "watchpool-pod",
@@ -89,7 +94,7 @@ func TestConnect_DedicatedWatchPool(t *testing.T) {
 // rolled-back write never produces an event, while a committed write always
 // does.
 func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
-	s := setupPostgresStore(t).(*Persistence)
+	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
 	watch, err := s.WatchWorkers(ctx)
@@ -99,8 +104,8 @@ func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
 	defer watch.Close()
 
 	const workerName = "6e4d2f81-b3a9-4c05-8e72-1f9d4a0c7b63"
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: workerName},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: workerName},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",
@@ -148,10 +153,10 @@ func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
 			t.Errorf("expected WorkerEventCreated, got %v", event.Type)
 		}
 		// CreateWorker assigns the uid, version and timestamps server-side.
-		want := proto.Clone(worker).(*ateapipb.Worker)
+		want := proto.Clone(worker).(*ateapi.Worker)
 		want.Metadata.Version = 1
 		if diff := cmp.Diff(want, event.Worker, protocmp.Transform(),
-			protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "uid", "create_time", "update_time")); diff != "" {
+			protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "uid", "create_time", "update_time")); diff != "" {
 			t.Errorf("event worker mismatch (-want +got):\n%s", diff)
 		}
 	case <-time.After(2 * time.Second):
@@ -167,7 +172,7 @@ func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
 // must instead hold the committed sibling back until the older
 // transaction resolves, then deliver both in order.
 func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
-	s := setupPostgresStore(t).(*Persistence)
+	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
 	watch, err := s.WatchWorkers(ctx)
@@ -178,8 +183,8 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 
 	mkPayload := func(pod string) []byte {
 		payload, err := marshalWorkerEvent(store.WorkerEventCreated,
-			&ateapipb.Worker{
-				Metadata:        &ateapipb.ResourceMetadata{Name: pod},
+			&ateapi.Worker{
+				Metadata:        &ateapi.ResourceMetadata{Name: pod},
 				WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: pod,
 			})
 		if err != nil {
@@ -351,8 +356,8 @@ func TestWorkerEvents_OneRowPerTransaction(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "one-row-worker"},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "one-row-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",
@@ -365,7 +370,7 @@ func TestWorkerEvents_OneRowPerTransaction(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		if _, err := s.UpdateWorker(ctx, "one-row-worker", store.PreconditionFrom(stored), func(*ateapipb.Worker) error {
+		if _, err := s.UpdateWorker(ctx, "one-row-worker", store.PreconditionFrom(stored), func(*ateapi.Worker) error {
 			return nil
 		}); err != nil {
 			t.Fatalf("UpdateWorker %d failed: %v", i, err)
@@ -385,8 +390,8 @@ func TestWorkerEvents_OneRowPerTransaction(t *testing.T) {
 }
 
 // TestWatchWorkers_DeliveryFencedByOldestTransaction documents the xmin
-// fence's real bound: one old transaction anywhere holds back delivery of
-// everything committed after it, for as long as it lives.
+// fence's real bound: one old transaction anywhere holds back outbox delivery
+// of everything committed after it, for as long as it lives.
 func TestWatchWorkers_DeliveryFencedByOldestTransaction(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
@@ -403,12 +408,13 @@ func TestWatchWorkers_DeliveryFencedByOldestTransaction(t *testing.T) {
 		t.Fatalf("Begin blocker failed: %v", err)
 	}
 	defer blocker.Rollback(ctx) //nolint:errcheck // released below
+
 	if _, err := blocker.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
 		t.Fatalf("assigning blocker xid failed: %v", err)
 	}
 
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "fenced-worker"},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "fenced-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "fenced",
@@ -417,9 +423,17 @@ func TestWatchWorkers_DeliveryFencedByOldestTransaction(t *testing.T) {
 		t.Fatalf("CreateWorker failed: %v", err)
 	}
 
+	// The commit-time copy is published in-process and never sees the fence.
+	// The fence governs the outbox copy that follows it.
+	select {
+	case <-watch.Events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit-time copy not delivered")
+	}
+
 	select {
 	case event := <-watch.Events:
-		t.Fatalf("event %+v delivered through the fence while an older transaction was in flight", event)
+		t.Fatalf("outbox copy of %+v delivered through the fence while an older transaction was in flight", event)
 	case <-time.After(600 * time.Millisecond):
 		// Expected: committed but fenced behind the blocker's xid.
 	}
@@ -613,8 +627,8 @@ func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
 	defer watch.Close()
 
 	// Deliver one event normally so the cursor is established.
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "trim-worker"},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "trim-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",
@@ -698,8 +712,8 @@ func TestPartitionCreation_UnwedgesFromStrayedDefault(t *testing.T) {
 		t.Fatalf("dropping current partition: %v", err)
 	}
 	// A write during the stall detours into DEFAULT.
-	worker := &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "wedge-worker"},
+	worker := &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "wedge-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "wedge-pod",
@@ -783,8 +797,8 @@ func TestOutboxMaintenance_NoDeadlockWithConcurrentWriters(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; writerCtx.Err() == nil; i++ {
-				w := &ateapipb.Worker{
-					Metadata:        &ateapipb.ResourceMetadata{Name: fmt.Sprintf("ddl-worker-%d-%d", g, i)},
+				w := &ateapi.Worker{
+					Metadata:        &ateapi.ResourceMetadata{Name: fmt.Sprintf("ddl-worker-%d-%d", g, i)},
 					WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: fmt.Sprintf("ddl-pod-%d-%d", g, i),
 				}
 				if _, err := s.CreateWorker(writerCtx, w); err != nil && writerCtx.Err() == nil {
@@ -850,7 +864,7 @@ func TestWatchWorkers_ClosesAfterPersistentPollFailure(t *testing.T) {
 
 	// Connect so the watcher has its own pool: killing it simulates a
 	// persistent outage without touching the shared container pool.
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -888,7 +902,7 @@ func TestWatchWorkers_ClosesAfterPersistentPollFailure(t *testing.T) {
 // fell-behind close never fired: silent loss. The baseline must only cover
 // settled history below the cursor's own xmin snapshot.
 func TestWatchWorkers_BaselineDoesNotMaskOwedTrims(t *testing.T) {
-	s := setupPostgresStore(t).(*Persistence)
+	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
 	// L: an old in-flight transaction pinning xmin — the fence stall.
@@ -915,8 +929,8 @@ func TestWatchWorkers_BaselineDoesNotMaskOwedTrims(t *testing.T) {
 
 	// C: a LATER xid that commits BEFORE the subscribe — the baseline poison:
 	// a visible outbox row whose xid exceeds W's.
-	if _, err := s.CreateWorker(ctx, &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "baseline-poison"},
+	if _, err := s.CreateWorker(ctx, &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "baseline-poison"},
 		WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "baseline-pod",
 	}); err != nil {
 		t.Fatalf("CreateWorker (C): %v", err)
@@ -963,8 +977,8 @@ func TestWatchWorkers_BaselineDoesNotMaskOwedTrims(t *testing.T) {
 // TestUnmarshalWorkerEvent_BoundaryAssertions pins the write-side invariants
 // asserted at the read boundary: known event-type byte and a keyable worker.
 func TestUnmarshalWorkerEvent_BoundaryAssertions(t *testing.T) {
-	valid, err := marshalWorkerEvent(store.WorkerEventUpdated, &ateapipb.Worker{
-		Metadata: &ateapipb.ResourceMetadata{Name: "w1"},
+	valid, err := marshalWorkerEvent(store.WorkerEventUpdated, &ateapi.Worker{
+		Metadata: &ateapi.ResourceMetadata{Name: "w1"},
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -978,7 +992,7 @@ func TestUnmarshalWorkerEvent_BoundaryAssertions(t *testing.T) {
 		"unknown type byte": {[]byte{0xff, 0x00}, true},
 		"type byte only":    {[]byte{byte(store.WorkerEventCreated)}, true}, // empty proto = nameless
 		"garbage proto":     {append([]byte{byte(store.WorkerEventCreated)}, 0xde, 0xad, 0xbe), true},
-		"nameless worker":   {func() []byte { b, _ := marshalWorkerEvent(store.WorkerEventDeleted, &ateapipb.Worker{}); return b }(), true},
+		"nameless worker":   {func() []byte { b, _ := marshalWorkerEvent(store.WorkerEventDeleted, &ateapi.Worker{}); return b }(), true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := unmarshalWorkerEvent(tc.payload)
@@ -993,7 +1007,7 @@ func TestUnmarshalWorkerEvent_BoundaryAssertions(t *testing.T) {
 // that fails the boundary checks must close the watch (loss surfaced,
 // relist repairs) rather than advance the cursor past it silently.
 func TestWatchWorkers_ClosesOnCorruptPayload(t *testing.T) {
-	s := setupPostgresStore(t).(*Persistence)
+	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
 	watch, err := s.WatchWorkers(ctx)
@@ -1015,5 +1029,133 @@ func TestWatchWorkers_ClosesOnCorruptPayload(t *testing.T) {
 		// Closed: the loss signal fired.
 	case <-time.After(5 * time.Second):
 		t.Fatal("watch stayed open past a corrupt payload (silent skip)")
+	}
+}
+
+// TestLocalPublishReachesWatchers pins the local fast-path contract: every
+// worker event — create, update, and delete — is on an active watcher's
+// channel by the time the write call returns, carrying the committed state.
+// Each read is non-blocking, so it can only be satisfied by the commit-time
+// publish; the poller needs at least one outboxPollInterval tick.
+func TestLocalPublishReachesWatchers(t *testing.T) {
+	requirePool(t)
+	ctx := context.Background()
+
+	p, err := Connect(ctx, testConnectConfig("public"))
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer p.pool.Close()
+	defer p.Close()
+	clearAll(t, p)
+
+	watch, err := p.WatchWorkers(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	// nextEvent takes the next buffered event of type want, skipping outbox
+	// copies of earlier writes. It never blocks, so only the commit-time
+	// publish can satisfy it: the poller needs at least one tick to run.
+	nextEvent := func(what string, want store.WorkerEventType) store.WorkerEvent {
+		t.Helper()
+		for {
+			select {
+			case ev, ok := <-watch.Events:
+				if !ok {
+					t.Fatalf("after %s: watch closed", what)
+				}
+				if ev.Type == want {
+					return ev
+				}
+			default:
+				t.Fatalf("after %s: no %v on the watch channel; the commit-time publish did not reach the watcher", what, want)
+				return store.WorkerEvent{}
+			}
+		}
+	}
+
+	created, err := p.CreateWorker(ctx, &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "local-publish-worker"},
+		WorkerNamespace: "ns",
+		WorkerPool:      "pool",
+		WorkerPod:       "pod",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+	ev := nextEvent("create", store.WorkerEventCreated)
+	if got, want := ev.Worker.GetMetadata().GetVersion(), created.GetMetadata().GetVersion(); got != want {
+		t.Errorf("created event version = %d, want committed version %d", got, want)
+	}
+
+	updated, err := p.UpdateWorker(ctx, created.GetMetadata().GetName(), store.PreconditionFrom(created), func(toUpdate *ateapi.Worker) error {
+		toUpdate.Labels = map[string]string{"tier": "batch"}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateWorker failed: %v", err)
+	}
+	ev = nextEvent("update", store.WorkerEventUpdated)
+	if got, want := ev.Worker.GetMetadata().GetVersion(), updated.GetMetadata().GetVersion(); got != want {
+		t.Errorf("updated event version = %d, want committed version %d", got, want)
+	}
+	if got := ev.Worker.GetLabels()["tier"]; got != "batch" {
+		t.Errorf("updated event carries label tier=%q, want the committed mutation", got)
+	}
+	// The watcher's copy must be isolated from the caller's returned Worker.
+	if ev.Worker == updated {
+		t.Error("locally published Worker aliases the caller's returned Worker; it must be a copy")
+	}
+
+	if _, err := p.DeleteWorker(ctx, created.GetMetadata().GetName(), store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteWorker failed: %v", err)
+	}
+	ev = nextEvent("delete", store.WorkerEventDeleted)
+	if ev.Worker.GetMetadata().GetName() != created.GetMetadata().GetName() {
+		t.Errorf("deleted event names worker %q, want %q", ev.Worker.GetMetadata().GetName(), created.GetMetadata().GetName())
+	}
+}
+
+// TestLocalPublishSurvivesWatchClose covers the close race the watcher
+// registry exists to prevent: a write publishing concurrently with a watch
+// shutting down must not send on a closed channel.
+func TestLocalPublishSurvivesWatchClose(t *testing.T) {
+	requirePool(t)
+	ctx := context.Background()
+
+	p, err := Connect(ctx, testConnectConfig("public"))
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer p.pool.Close()
+	defer p.Close()
+	clearAll(t, p)
+
+	for i := range 20 {
+		watch, err := p.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			watch.Close()
+		}()
+		name := fmt.Sprintf("close-race-worker-%d", i)
+		w, err := p.CreateWorker(ctx, &ateapi.Worker{
+			Metadata:        &ateapi.ResourceMetadata{Name: name},
+			WorkerNamespace: "ns",
+			WorkerPool:      "pool",
+			WorkerPod:       "pod",
+		})
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		if _, err := p.DeleteWorker(ctx, w.GetMetadata().GetName(), store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteWorker failed: %v", err)
+		}
+		<-done
 	}
 }

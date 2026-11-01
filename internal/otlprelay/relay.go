@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package otlprelay carries ateom's OTLP telemetry to the collector over a unix
+// Package otlprelay carries worker's OTLP telemetry to the collector over a unix
 // socket served by atelet, so a worker pod needs no network path of its own to
-// export spans and metrics.
+// export spans, metrics, and log records.
 //
-// Motivation. ateom runs inside the worker pod that hosts the actor, and until
+// Motivation. worker runs inside the worker pod that hosts the actor, and until
 // now exported OTLP straight to the collector over the pod's network (the
 // endpoint is injected by atecontroller, see workerpool_apply.go). That has four
 // costs the relay removes:
@@ -26,9 +26,9 @@
 //     reachable to anything that escapes the sandbox. A unix socket cannot leave
 //     the node, so the pod can be denied network egress entirely.
 //   - Connection count. Worker pods are heavily oversubscribed, so a node runs
-//     many ateoms, each holding its own gRPC connection to the collector. They
+//     many workers, each holding its own gRPC connection to the collector. They
 //     collapse into atelet's single per-node connection.
-//   - Interference. ateom installs a transparent redirect of actor egress to its
+//   - Interference. worker installs a transparent redirect of actor egress to its
 //     own atunnel listener; its own outbound traffic has to stay clear of the
 //     rules it installs. A unix socket is not IP traffic and cannot be caught.
 //   - Shutdown loss. Teardown frees the actor's network and then the pod goes
@@ -36,12 +36,12 @@
 //     in the batch processor. atelet outlives the worker pod.
 //
 // The relay forwards the OTLP request message verbatim rather than decoding it
-// into SDK records and re-exporting. Verbatim pass-through keeps each ateom's
+// into SDK records and re-exporting. Verbatim pass-through keeps each worker's
 // own resource (service.name, service.instance.id, pod attributes) intact, so
-// its spans stay attributed to ateom instead of being absorbed into atelet's.
-// Restricting this pass-through to verified ateom sources ensures that future
+// its spans stay attributed to worker instead of being absorbed into atelet's.
+// Restricting this pass-through to verified worker sources ensures that future
 // actor telemetry requiring identity rewrites (#761) will be added as an
-// explicit rewriting path alongside this forwarder; see ateomServices.
+// explicit rewriting path alongside this forwarder; see workerServices.
 //
 // Verbatim applies to the payload, not to the call around it. The request's
 // metadata is dropped and replaced with the headers atelet resolves from its own
@@ -71,6 +71,7 @@ import (
 	"k8s.io/utils/lru"
 
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -83,30 +84,33 @@ const (
 	endpointEnv        = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	tracesEndpointEnv  = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
 	metricsEndpointEnv = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+	logsEndpointEnv    = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 
 	// compressionEnv and its signal-specific overrides configure upstream
 	// gRPC compression (gzip or none).
 	compressionEnv        = "OTEL_EXPORTER_OTLP_COMPRESSION"
 	tracesCompressionEnv  = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION"
 	metricsCompressionEnv = "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION"
+	logsCompressionEnv    = "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION"
 
 	// headersEnv and its signal-specific overrides carry the headers the
 	// collector expects (an API key, a tenant id). Unlike the endpoint and the
 	// compression, these are per-call metadata rather than per-connection, so
-	// traces and metrics may legitimately differ and are resolved separately.
+	// traces, metrics, and logs may legitimately differ and are resolved separately.
 	headersEnv        = "OTEL_EXPORTER_OTLP_HEADERS"
 	tracesHeadersEnv  = "OTEL_EXPORTER_OTLP_TRACES_HEADERS"
 	metricsHeadersEnv = "OTEL_EXPORTER_OTLP_METRICS_HEADERS"
+	logsHeadersEnv    = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
 
 	// otlpDefaultPort matches atenet's normalizeOtlpCollector.
 	otlpDefaultPort = "4317"
 
 	// socketMode keeps the relay socket private to root: both atelet and the
-	// ateom worker pods run as root (runAsUser: 0). The socket lives inside
+	// worker pods run as root (runAsUser: 0). The socket lives inside
 	// BasePath, a root-owned host directory.
 	socketMode = 0o600
 
-	// maxRecvMsgSize bounds a single Export payload. One misbehaving ateom
+	// maxRecvMsgSize bounds a single Export payload. One misbehaving worker
 	// should not be able to make atelet allocate without limit; the OTel SDK's
 	// batch processor emits far smaller messages than this.
 	maxRecvMsgSize = 16 << 20 // 16 MiB
@@ -120,35 +124,35 @@ type Server struct {
 	sockPath string
 }
 
-// ateomServices are the only sources this relay carries, keyed by the
+// workerServices are the only sources this relay carries, keyed by the
 // service.name their resource declares — which the OTEL_* environment can
-// override out from under an ateom; see sourceGate for what that looks like.
+// override out from under a worker; see sourceGate for what that looks like.
 // Mirrors the serviceName constants in
-// cmd/ateom-gvisor and cmd/ateom-microvm, which are package main and cannot be
-// imported; TestAteomServicesMatchTheAteomBinaries guards the duplication.
+// cmd/ateworker-gvisor and cmd/ateworker-microvm, which are package main and cannot be
+// imported; TestWorkerServicesMatchTheWorkerBinaries guards the duplication.
 //
 // This allowlist is a protocol contract rather than a security boundary:
 // service.name is client-provided, so a compromised process could claim an
-// ateom name. Its purpose is to prevent accidental misuse (e.g. an actor SDK
+// worker name. Its purpose is to prevent accidental misuse (e.g. an actor SDK
 // pointed at the socket) and keep the pass-through contract explicit for #761.
 // Peer authentication, if needed, would require per-pod sockets or UDS peer
 // credentials (SO_PEERCRED) tied to #741.
-var ateomServices = map[string]bool{
-	"ateom-gvisor":  true,
-	"ateom-microvm": true,
+var workerServices = map[string]bool{
+	"ateworker-gvisor":  true,
+	"ateworker-microvm": true,
 }
 
-// sourceGate applies the ateomServices allowlist and reports the first
+// sourceGate applies the workerServices allowlist and reports the first
 // rejection of each service.name.
 //
 // The log matters because of how this failure presents. service.name is
 // whatever the resource declares, and resource.WithFromEnv() runs last in
 // serverboot.newResource, so OTEL_SERVICE_NAME or an OTEL_RESOURCE_ATTRIBUTES
-// entry set on a worker pod overrides the ateom's own name. The relay then
+// entry set on a worker pod overrides the worker's own name. The relay then
 // refuses every export with PermissionDenied, which the OTel SDK does not retry
 // — it drops the batch and reports through the SDK error handler. Telemetry from
-// that ateom simply stops, with nothing on the collector side to say why. One
-// line per distinct name on the node makes it greppable; the ateom itself is
+// that worker simply stops, with nothing on the collector side to say why. One
+// line per distinct name on the node makes it greppable; the worker itself is
 // unaffected, so this is a diagnosability problem rather than an outage.
 //
 // Dedup is keyed by name with an LRU cache bounded at 256 entries to prevent
@@ -169,7 +173,7 @@ func newSourceGate() *sourceGate {
 // unidentified source is the one the relay cannot vouch for.
 func (g *sourceGate) check(ctx context.Context, r *resourcepb.Resource) error {
 	name := resourceServiceName(r)
-	if ateomServices[name] {
+	if workerServices[name] {
 		return nil
 	}
 	if g.logged == nil {
@@ -177,19 +181,19 @@ func (g *sourceGate) check(ctx context.Context, r *resourcepb.Resource) error {
 	}
 	if _, seen := g.logged.Get(name); !seen {
 		g.logged.Add(name, struct{}{})
-		slog.WarnContext(ctx, "OTLP relay rejected telemetry from an unrecognized source; it is being dropped, not retried. If this is an ateom, check whether OTEL_SERVICE_NAME or OTEL_RESOURCE_ATTRIBUTES on the worker pod is overriding its service.name",
+		slog.WarnContext(ctx, "OTLP relay rejected telemetry from an unrecognized source; it is being dropped, not retried. If this is a worker, check whether OTEL_SERVICE_NAME or OTEL_RESOURCE_ATTRIBUTES on the worker pod is overriding its service.name",
 			slog.String("service.name", name),
 			slog.Any("allowed", allowedServices()),
 			slog.String("note", "logged once per distinct service.name"))
 	}
 	return status.Errorf(codes.PermissionDenied,
-		"the OTLP relay carries ateom telemetry only, got service.name %q; a source whose identity has to be rewritten (#761) must not be forwarded verbatim. If this is an ateom, an OTEL_SERVICE_NAME or OTEL_RESOURCE_ATTRIBUTES override on the worker pod would produce exactly this",
+		"the OTLP relay carries worker telemetry only, got service.name %q; a source whose identity has to be rewritten (#761) must not be forwarded verbatim. If this is a worker, an OTEL_SERVICE_NAME or OTEL_RESOURCE_ATTRIBUTES override on the worker pod would produce exactly this",
 		name)
 }
 
 func allowedServices() []string {
-	names := make([]string, 0, len(ateomServices))
-	for name := range ateomServices {
+	names := make([]string, 0, len(workerServices))
+	for name := range workerServices {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -206,7 +210,7 @@ func resourceServiceName(r *resourcepb.Resource) string {
 }
 
 // upstreamContext builds the metadata for the upstream call from atelet's own
-// configuration, dropping whatever the ateom sent.
+// configuration, dropping whatever the worker sent.
 //
 // The upstream leg is atelet's connection to the collector, so its credentials
 // belong to atelet: the relay resolves OTEL_EXPORTER_OTLP_HEADERS from its own
@@ -214,11 +218,11 @@ func resourceServiceName(r *resourcepb.Resource) string {
 // the client's headers instead would let anything that reached the socket choose
 // what atelet presents to the collector — a header set is not telemetry to be
 // passed through verbatim the way the resource is, and unlike service.name (see
-// ateomServices) it is not merely claimed identity but an actual credential.
+// workerServices) it is not merely claimed identity but an actual credential.
 //
 // Nothing is allow-listed through. atecontroller injects only
 // OTEL_EXPORTER_OTLP_ENDPOINT into worker pods (workerpool_apply.go), so no
-// ateom has a header to lose today; add an allowlist here, not a blanket
+// worker has a header to lose today; add an allowlist here, not a blanket
 // forward, if one ever needs to reach the collector.
 //
 // The incoming metadata is dropped by simply not copying it: gRPC never
@@ -286,10 +290,10 @@ func upstreamHeaders(signalEnv string) (metadata.MD, error) {
 	return md, nil
 }
 
-// The two OTLP services both declare a method named Export, with different
-// request types, so one type cannot implement both: the embedded Unimplemented
-// structs would give Server an ambiguous promoted Export and satisfy neither
-// interface. Each service gets its own tiny forwarder instead.
+// The OTLP services all declare a method named Export, with different request
+// types, so one type cannot implement more than one: the embedded Unimplemented
+// structs would give Server an ambiguous promoted Export and satisfy none of the
+// interfaces. Each service gets its own tiny forwarder instead.
 
 type traceRelay struct {
 	coltracepb.UnimplementedTraceServiceServer
@@ -297,8 +301,8 @@ type traceRelay struct {
 	// headers atelet presents to the collector; see upstreamContext. Resolved
 	// once at construction: they come from atelet's environment, not the call.
 	headers metadata.MD
-	// gate is shared with metricRelay so a misnamed ateom is reported once, not
-	// once per signal.
+	// gate is shared with metricRelay and logRelay so a misnamed worker is
+	// reported once, not once per signal.
 	gate *sourceGate
 }
 
@@ -335,13 +339,30 @@ func (m *metricRelay) Export(ctx context.Context, req *colmetricspb.ExportMetric
 	return m.upstream.Export(upstreamContext(ctx, m.headers), req)
 }
 
+type logRelay struct {
+	collogspb.UnimplementedLogsServiceServer
+	upstream collogspb.LogsServiceClient
+	headers  metadata.MD
+	gate     *sourceGate
+}
+
+// Export forwards a batch of log records to the collector unchanged.
+func (l *logRelay) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
+	for _, rl := range req.GetResourceLogs() {
+		if err := l.gate.check(ctx, rl.GetResource()); err != nil {
+			return nil, err
+		}
+	}
+	return l.upstream.Export(upstreamContext(ctx, l.headers), req)
+}
+
 // validateSocketPath rejects a relative path, which gRPC does not resolve:
 // "unix://foo/r.sock" parses as authority "foo", path "/r.sock". grpc.NewClient
 // being lazy, that wrong target is accepted at startup and fails per export
 // afterwards, which is why this errors rather than falling back.
 func validateSocketPath(sockPath string) error {
 	if !filepath.IsAbs(sockPath) {
-		return fmt.Errorf("the OTLP relay socket path %q is relative; it must be absolute, since atelet and ateom would otherwise resolve it against different working directories", sockPath)
+		return fmt.Errorf("the OTLP relay socket path %q is relative; it must be absolute, since atelet and the worker would otherwise resolve it against different working directories", sockPath)
 	}
 	return nil
 }
@@ -349,8 +370,8 @@ func validateSocketPath(sockPath string) error {
 // NewServer builds a relay that forwards to the collector named by the standard
 // OTLP endpoint environment variables. It returns (nil, nil) when sockPath is
 // empty (the relay is switched off) or when no endpoint is configured: a relay
-// with nowhere to forward to would accept an ateom's spans and drop them, which
-// is worse than ateom finding no socket and falling back to a direct export.
+// with nowhere to forward to would accept a worker's spans and drop them, which
+// is worse than the worker finding no socket and falling back to a direct export.
 func NewServer(ctx context.Context, sockPath string) (*Server, error) {
 	if sockPath == "" {
 		return nil, nil
@@ -376,12 +397,16 @@ func NewServer(ctx context.Context, sockPath string) (*Server, error) {
 	// Resolved before the socket exists: a header set atelet cannot parse would
 	// otherwise become a per-export failure against a collector that rejects the
 	// unauthenticated calls, which is harder to read than refusing to start the
-	// relay. ateom then finds no socket and exports directly.
+	// relay. worker then finds no socket and exports directly.
 	traceHeaders, err := upstreamHeaders(tracesHeadersEnv)
 	if err != nil {
 		return nil, err
 	}
 	metricHeaders, err := upstreamHeaders(metricsHeadersEnv)
+	if err != nil {
+		return nil, err
+	}
+	logHeaders, err := upstreamHeaders(logsHeadersEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -418,12 +443,18 @@ func NewServer(ctx context.Context, sockPath string) (*Server, error) {
 		headers:  metricHeaders,
 		gate:     gate,
 	})
+	collogspb.RegisterLogsServiceServer(s.grpc, &logRelay{
+		upstream: collogspb.NewLogsServiceClient(upstream),
+		headers:  logHeaders,
+		gate:     gate,
+	})
 	// Header names only: the values are credentials.
 	slog.InfoContext(ctx, "OTLP relay forwarding to collector",
 		slog.String("collector", target),
 		slog.String("compression", comp),
 		slog.Any("traceHeaders", headerNames(traceHeaders)),
-		slog.Any("metricHeaders", headerNames(metricHeaders)))
+		slog.Any("metricHeaders", headerNames(metricHeaders)),
+		slog.Any("logHeaders", headerNames(logHeaders)))
 	return s, nil
 }
 
@@ -444,7 +475,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("while opening the OTLP relay socket %q: %w", s.sockPath, err)
 	}
 	// net.Listen applies the umask, which on atelet would typically leave the
-	// socket group/other-unwritable and unreachable from an ateom running as a
+	// socket group/other-unwritable and unreachable from a worker running as a
 	// different uid. Widen it explicitly.
 	if err := os.Chmod(s.sockPath, socketMode); err != nil {
 		_ = lis.Close()
@@ -477,27 +508,9 @@ func headerNames(md metadata.MD) []string {
 // upstreamCompression resolves the compression algorithm (gzip or none) to use
 // for upstream export.
 func upstreamCompression() (string, error) {
-	generic := strings.TrimSpace(os.Getenv(compressionEnv))
-	traces := strings.TrimSpace(os.Getenv(tracesCompressionEnv))
-	metrics := strings.TrimSpace(os.Getenv(metricsCompressionEnv))
-
-	traceComp := generic
-	if traces != "" {
-		traceComp = traces
-	}
-	metricComp := generic
-	if metrics != "" {
-		metricComp = metrics
-	}
-
-	if traceComp != "" && metricComp != "" && traceComp != metricComp {
-		return "", fmt.Errorf("signal-specific compression settings conflict (%q for traces vs %q for metrics); the relay carries both signals over one connection",
-			traceComp, metricComp)
-	}
-
-	resolved := traceComp
-	if resolved == "" {
-		resolved = metricComp
+	resolved, err := resolvePerSignal("compression settings", compressionEnv, tracesCompressionEnv, metricsCompressionEnv, logsCompressionEnv)
+	if err != nil {
+		return "", err
 	}
 	switch resolved {
 	case "", "none":
@@ -512,37 +525,44 @@ func upstreamCompression() (string, error) {
 // upstreamTarget resolves the collector address the relay forwards to, from the
 // standard OTLP endpoint variables, into the bare host:port grpc.NewClient wants.
 //
-// The signal-specific variables must agree: the relay carries traces and metrics
-// over one connection, so it cannot honor two different collectors. Configuring
-// both differently is a misconfiguration rather than something to silently pick
+// The signal-specific variables must agree: the relay carries every signal over
+// one connection, so it cannot honor two different collectors. Configuring
+// them differently is a misconfiguration rather than something to silently pick
 // a winner for.
 func upstreamTarget() (string, error) {
-	generic := strings.TrimSpace(os.Getenv(endpointEnv))
-	traces := strings.TrimSpace(os.Getenv(tracesEndpointEnv))
-	metrics := strings.TrimSpace(os.Getenv(metricsEndpointEnv))
-
-	traceTarget := generic
-	if traces != "" {
-		traceTarget = traces
-	}
-	metricTarget := generic
-	if metrics != "" {
-		metricTarget = metrics
-	}
-
-	if traceTarget != "" && metricTarget != "" && traceTarget != metricTarget {
-		return "", fmt.Errorf("signal-specific endpoints conflict (%q for traces vs %q for metrics); the relay carries both signals over one connection",
-			traceTarget, metricTarget)
-	}
-
-	resolved := traceTarget
-	if resolved == "" {
-		resolved = metricTarget
+	resolved, err := resolvePerSignal("endpoints", endpointEnv, tracesEndpointEnv, metricsEndpointEnv, logsEndpointEnv)
+	if err != nil {
+		return "", err
 	}
 	if resolved == "" {
 		return "", nil
 	}
 	return normalizeEndpoint(resolved)
+}
+
+// resolvePerSignal resolves each signal to its own variable, falling back to
+// the generic one, and requires every resolved value to agree: the relay
+// carries every signal over one connection. The error names the variables the
+// two values came from, since a fallback pulls the generic in under a signal
+// that is not itself set.
+func resolvePerSignal(what, genericEnv string, signalEnvs ...string) (string, error) {
+	generic := strings.TrimSpace(os.Getenv(genericEnv))
+	resolved, resolvedEnv := "", ""
+	for _, env := range signalEnvs {
+		v, src := strings.TrimSpace(os.Getenv(env)), env
+		if v == "" {
+			v, src = generic, genericEnv
+		}
+		if v == "" {
+			continue
+		}
+		if resolved != "" && v != resolved {
+			return "", fmt.Errorf("signal-specific %s conflict: %s=%q vs %s=%q; the relay carries every signal over one connection",
+				what, resolvedEnv, resolved, src, v)
+		}
+		resolved, resolvedEnv = v, src
+	}
+	return resolved, nil
 }
 
 // normalizeEndpoint accepts both a bare "host:port" and the URL form the OTLP

@@ -31,7 +31,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
 )
 
 // The e2e suite reads this fixture's answers as evidence about the egress
@@ -195,7 +195,7 @@ func TestHealthServiceIsServing(t *testing.T) {
 	}
 }
 
-// The ingress Actor's readyz is an HTTP GET, so this handler is the only thing
+// The ingress Actor's wakeup probe is an HTTP GET, so this handler is the only thing
 // that gets it to PhaseReady — the gRPC port answers such a request with a
 // protocol error. A 404 from a mistyped path would look exactly like a template
 // that never boots.

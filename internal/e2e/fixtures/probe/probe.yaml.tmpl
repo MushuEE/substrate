@@ -25,10 +25,14 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ate-e2e-probe${FIXTURE_SUFFIX}
+  labels:
+    # Lets hack/cleanup-e2e.sh find and delete this namespace when a failed
+    # test leaves the fixture behind for debugging.
+    ate.dev/e2e: "true"
 
 ---
 
-apiVersion: ate.dev/v1alpha1
+apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
   name: probe
@@ -37,5 +41,5 @@ metadata:
     workload: probe${FIXTURE_SUFFIX}
 spec:
   replicas: 3
-  workerImage: ${ATEOM_IMAGE}
+  workerImage: ${WORKER_IMAGE}
 ${WORKERPOOL_RUNTIME}

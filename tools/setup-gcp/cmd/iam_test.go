@@ -14,9 +14,28 @@
 
 package cmd
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"cloud.google.com/go/resourcemanager/apiv3/resourcemanagerpb"
+)
 
 func TestValidateIamFlags(t *testing.T) {
+	origGetProject := getProjectFn
+	defer func() { getProjectFn = origGetProject }()
+
+	getProjectFn = func(ctx context.Context, name string) (*resourcemanagerpb.Project, error) {
+		return &resourcemanagerpb.Project{
+			Name:      "projects/123",
+			ProjectId: "test-project",
+		}, nil
+	}
+
+	tooLong := strings.Repeat("b", 57)
+	tooLongErr := `bucket name "` + tooLong + `" is too long: the asset bucket "` + tooLong + `-assets" would have 64 characters, and GCS allows 63`
+
 	tests := []struct {
 		name           string
 		cfg            Config
@@ -30,10 +49,16 @@ func TestValidateIamFlags(t *testing.T) {
 			want:           "--project-id is required",
 		},
 		{
-			name:           "missing project number",
+			name:           "missing project id when only project number provided",
+			cfg:            Config{ProjectNumber: "123"},
+			bucketBindings: true,
+			want:           "--project-id is required",
+		},
+		{
+			name:           "only project id provided, bucket missing",
 			cfg:            Config{ProjectID: "test-project"},
 			bucketBindings: true,
-			want:           "--project-number is required",
+			want:           "--bucket is required for bucket bindings",
 		},
 		{
 			name:           "missing bucket while bucket bindings are requested",
@@ -42,20 +67,32 @@ func TestValidateIamFlags(t *testing.T) {
 			want:           "--bucket is required for bucket bindings",
 		},
 		{
+			name:           "bucket name too long for the asset bucket",
+			cfg:            Config{ProjectID: "test-project", BucketName: tooLong},
+			bucketBindings: true,
+			want:           tooLongErr,
+		},
+		{
 			name:           "bucket not required when bucket bindings are disabled",
 			cfg:            Config{ProjectID: "test-project", ProjectNumber: "123"},
 			bucketBindings: false,
 		},
 		{
-			name:           "all required flags present",
+			name:           "all required flags present with both id and number",
 			cfg:            Config{ProjectID: "test-project", ProjectNumber: "123", BucketName: "test-bucket"},
+			bucketBindings: true,
+		},
+		{
+			name:           "all required flags present with only project id",
+			cfg:            Config{ProjectID: "test-project", BucketName: "test-bucket"},
 			bucketBindings: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateIamFlags(&tt.cfg, tt.bucketBindings)
+			cfgCopy := tt.cfg
+			err := validateIamFlags(t.Context(), &cfgCopy, tt.bucketBindings)
 			if tt.want == "" {
 				if err != nil {
 					t.Fatalf("validateIamFlags() = %v; want nil", err)

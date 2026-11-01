@@ -48,15 +48,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/portforward"
+	"go.ate.dev/substrate/internal/ateclient"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/portforward"
 )
 
 const (
-	// Where the gateway's CA lives, fixed by hack/install-ate.sh.
-	egressNamespace = "ate-system"
-
 	probeName = "egressprobe"
 )
 
@@ -163,6 +160,8 @@ func startProbe(t *testing.T, ctx context.Context) *probeClient {
 	}
 	manifest := filepath.Join(t.TempDir(), "egressprobe.yaml")
 	rendered := strings.ReplaceAll(string(tmpl), "${NAMESPACE}", ns)
+	rendered = strings.ReplaceAll(rendered, "${SYSTEM_NAMESPACE}", e2e.SystemNamespace())
+	rendered = strings.ReplaceAll(rendered, "${EGRESS_GATEWAY_SERVICE}", e2e.ResourceName("atenet-egress"))
 	if err := os.WriteFile(manifest, []byte(rendered), 0o644); err != nil {
 		t.Fatalf("writing rendered egressprobe manifest: %v", err)
 	}
@@ -175,7 +174,7 @@ func startProbe(t *testing.T, ctx context.Context) *probeClient {
 
 	waitForProbeReady(t, ctx, ns)
 
-	config, err := ateclient.LoadConfig(e2e.KubeConfig, e2e.KubeContext)
+	config, err := ateclient.LoadKubeConfig(e2e.KubeConfig, e2e.KubeContext)
 	if err != nil {
 		t.Fatalf("loading kubeconfig: %v", err)
 	}

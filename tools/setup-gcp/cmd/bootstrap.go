@@ -24,53 +24,58 @@ import (
 var bootstrapCmd = &cobra.Command{
 	Use:   "bootstrap",
 	Short: "Fully bootstrap the GCP environment",
-	Long:  `Runs all setup steps in order: enable APIs, create cluster, create bucket, grant IAM permissions, and create dashboards.`,
+	Long:  `Runs all setup steps in order: enable APIs, create cluster, create buckets, create the snapshot transfer service account, grant IAM permissions, and create dashboards.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if cfg.ProjectID == "" {
-			return errors.New("--project-id is required")
-		}
-		if cfg.ProjectNumber == "" {
-			return errors.New("--project-number is required")
+		ctx := cmd.Context()
+		warnDeprecatedMachineTypeEnv(cmd)
+		if err := resolveProjectID(ctx, &cfg); err != nil {
+			return err
 		}
 		if cfg.BucketName == "" {
 			return errors.New("--bucket-name is required")
 		}
-
-		ctx := cmd.Context()
+		if err := checkAssetBucketName(&cfg); err != nil {
+			return err
+		}
 
 		slog.Info("Starting full bootstrap...")
 
-		slog.Info("Step 1/7: Enabling required APIs...")
+		slog.Info("Step 1/8: Enabling required APIs...")
 		if err := enableRequiredAPIs(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 2/7: Creating GKE Cluster...")
+		slog.Info("Step 2/8: Creating GKE Cluster...")
 		if err := createClusterIdempotent(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 3/7: Creating GCS Bucket for snapshots...")
-		if err := createSnapshotBucket(ctx, &cfg); err != nil {
+		slog.Info("Step 3/8: Creating GCS buckets for snapshots and micro-VM assets...")
+		if err := createBuckets(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 4/7: Granting GKE Node permissions...")
+		slog.Info("Step 4/8: Granting GKE Node permissions...")
 		if err := grantGkeNodePermissions(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 5/7: Granting Atelet permissions...")
+		slog.Info("Step 5/8: Granting Atelet permissions...")
 		if err := grantAteletPermissions(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 6/7: Creating IAM policy bindings for bucket...")
+		slog.Info("Step 6/8: Creating the snapshot transfer service account...")
+		if err := setupTransferServiceAccount(ctx, &cfg, workloadIdentityPrincipal(&cfg, "ate-api-server")); err != nil {
+			return err
+		}
+
+		slog.Info("Step 7/8: Creating IAM policy bindings for the buckets...")
 		if err := createIamPolicyBindings(ctx, &cfg); err != nil {
 			return err
 		}
 
-		slog.Info("Step 7/7: Creating Monitoring Dashboards...")
+		slog.Info("Step 8/8: Creating Monitoring Dashboards...")
 		if err := createMonitoringDashboards(ctx, &cfg); err != nil {
 			return err
 		}
@@ -90,7 +95,11 @@ func init() {
 	bootstrapCmd.Flags().StringVar(&cfg.ClusterVersion, "cluster-version", getEnv("CLUSTER_VERSION", ""), "Kubernetes version [env: CLUSTER_VERSION]")
 	bootstrapCmd.Flags().StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name [env: NETWORK]")
 	bootstrapCmd.Flags().StringVar(&cfg.Subnetwork, "subnetwork", getEnv("SUBNETWORK", "default"), "VPC subnetwork name [env: SUBNETWORK]")
-	bootstrapCmd.Flags().StringVar(&cfg.MachineType, "machine-type", getEnv("GVISOR_NODE_MACHINE_TYPE", "c3-standard-4"), "Machine type for the gVisor node pool [env: GVISOR_NODE_MACHINE_TYPE]")
+	bootstrapCmd.Flags().StringVar(&cfg.MachineType, "machine-type", resolveMachineTypeDefault(), "Machine type for the node pool [env: NODE_MACHINE_TYPE]")
+	bootstrapCmd.Flags().BoolVar(&cfg.EnableNestedVirtualization, "enable-nested-virtualization", getEnv("ENABLE_NESTED_VIRTUALIZATION", true), "Create the node pool with nested virtualization, exposing /dev/kvm for micro-VM workers; needs a machine type that supports it. Turn off with --enable-nested-virtualization=false [env: ENABLE_NESTED_VIRTUALIZATION]")
+	bootstrapCmd.Flags().Int32Var(&cfg.BootDiskSizeGB, "boot-disk-size", getEnv("BOOT_DISK_SIZE_GB", int32(0)), "Boot disk size in GB for the node pool; 0 = GKE default (100 GB) [env: BOOT_DISK_SIZE_GB]")
+	bootstrapCmd.Flags().StringVar(&cfg.BootDiskType, "boot-disk-type", getEnv("BOOT_DISK_TYPE", ""), "Boot disk type for the node pool; empty = GKE default [env: BOOT_DISK_TYPE]")
 	bootstrapCmd.Flags().StringVar(&cfg.BucketName, "bucket-name", getEnv("BUCKET_NAME", ""), "Name of the GCS bucket for snapshots [env: BUCKET_NAME]")
+	addTransferGSANameFlag(bootstrapCmd)
 	bootstrapCmd.Flags().StringVar(&cfg.DashboardDir, "dashboard-dir", getEnv("DASHBOARD_DIR", "tools/setup-gcp/dashboards"), "Directory containing dashboard JSON files [env: DASHBOARD_DIR]")
 }

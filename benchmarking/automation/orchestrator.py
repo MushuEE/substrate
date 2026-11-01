@@ -18,9 +18,9 @@ Owns the generic benchmark lifecycle; everything specific to a test type
 lives in a testtypes/ module (see that package's docstring for the hook
 contract). The flow, with the type hooks marked:
 
-  1. Clone the substrate branch once; wait for the DIND sidecar.
-  2. Validate every tests.yaml entry before any cluster work
-     [hook: validate].
+  1. Pick the tests.yaml entries named by --test-name (default: all) and
+     validate them before any other work [hook: validate].
+  2. Clone the substrate branch once; wait for the DIND sidecar.
   3. Per test entry:
      a. Source the target cluster's env; gcloud/docker/kubectl setup and
         the runner image build [hook: build_image] are cached per
@@ -53,7 +53,14 @@ from typing import Any
 import yaml
 
 from testtypes import TYPES
-from util import parse_duration_seconds, run, run_no_check
+from util import (
+    isolate_block,
+    isolate_install_args,
+    isolate_workload_args,
+    parse_duration_seconds,
+    run,
+    run_no_check,
+)
 
 
 SUBSTRATE_DIR = "/workspace/substrate"
@@ -85,6 +92,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to the tests YAML file (mounted from a ConfigMap)",
     )
     p.add_argument(
+        "--test-name",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Run only the named test entry; repeatable. Default: all entries",
+    )
+    p.add_argument(
         "--target-cluster-dir",
         default=TARGET_CLUSTER_DIR,
         help="Directory containing target cluster configuration scripts (<cluster>.sh)",
@@ -99,6 +113,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to write a JUnit XML report summarizing test results and durations",
     )
     return p.parse_args()
+
+
+def select_tests(tests: list[dict], names: list[str]) -> list[dict]:
+    """Return the entries of tests named in names, in file order, or all of
+    them when names is empty. Raise ValueError on a name not in tests."""
+    if not names:
+        return tests
+    unknown = sorted(set(names) - {t.get("name") for t in tests})
+    if unknown:
+        raise ValueError(
+            f"--test-name values not in the tests file: {', '.join(unknown)}"
+        )
+    return [t for t in tests if t.get("name") in names]
 
 
 def source_env(path: str) -> None:
@@ -119,7 +146,7 @@ def apply_target_cluster(
     target_cluster: str, target_cluster_dir: str = TARGET_CLUSTER_DIR
 ) -> None:
     """Copy target_cluster_dir/<name>.sh into the cloned
-    substrate repo as .ate-dev-env.sh (so install-ate.sh / deploy.sh source
+    substrate repo as .ate-dev-env.sh (so ate-setup / deploy.sh source
     it) and merge it into this process's env (so the orchestrator's own
     gcloud / docker / kubectl calls see the same values). Resets os.environ
     to the startup baseline first so vars defined by a previous target
@@ -178,6 +205,63 @@ def test_type(test: dict[str, Any]) -> str:
     return test["type"]
 
 
+def _json_object(raw: str, what: str) -> dict[str, Any]:
+    """Parses raw as a JSON object, naming `what` in the error otherwise."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{what} is not valid JSON: {e}") from e
+    if not isinstance(value, dict):
+        raise ValueError(f"{what} must be a JSON object")
+    return value
+
+
+def run_metadata() -> dict[str, Any]:
+    """Free-form run facts handed to the runner as --metadata.
+
+    Read per test, after apply_target_cluster has reset os.environ;
+    BENCHMARK_METADATA survives that reset because it is part of the startup
+    env (_ORIG_ENV).
+    """
+    md: dict[str, Any] = {
+        k.lower(): os.environ[k]
+        for k in ("CLUSTER_NAME", "CLUSTER_LOCATION", "PROJECT_ID")
+        if os.environ.get(k)
+    }
+    raw = os.environ.get("BENCHMARK_METADATA")
+    if raw:
+        md.update(_json_object(raw, "BENCHMARK_METADATA"))
+    return md
+
+
+def split_metadata_flag(test: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    """Separates a test's own --metadata from the rest of its flags.
+
+    Accepts `--metadata <json>` and `--metadata=<json>`. With more than one,
+    later keys win. Raises ValueError when the value is missing or is not a
+    JSON object, rather than dropping it.
+    """
+    name = test.get("name")
+    rest: list[Any] = []
+    md: dict[str, Any] = {}
+    flags = list(test.get("flags", []))
+    i = 0
+    while i < len(flags):
+        flag = str(flags[i])
+        if flag == "--metadata":
+            if i + 1 >= len(flags):
+                raise ValueError(f"test {name!r}: --metadata needs a JSON value")
+            raw, i = str(flags[i + 1]), i + 2
+        elif flag.startswith("--metadata="):
+            raw, i = flag.split("=", 1)[1], i + 1
+        else:
+            rest.append(flags[i])
+            i += 1
+            continue
+        md.update(_json_object(raw, f"test {name!r}: --metadata"))
+    return rest, md
+
+
 def wait_for_docker(timeout: int = 120) -> None:
     print("Waiting for DIND sidecar...", flush=True)
     start = time.time()
@@ -196,6 +280,22 @@ def registry_host(ko_docker_repo: str) -> str:
 
 def sanitize(name: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+
+
+# Kubernetes copies a Job's name into the job-name label on the Job and its
+# pods, and a label value holds at most 63 bytes.
+MAX_JOB_NAME_LEN = 63
+
+
+def job_name(name: str, commit: str) -> str:
+    """Return a unique Job name for a test run that fits a Kubernetes label.
+
+    The commit and random suffix always survive; a long test name is cut to
+    make room, so two runs of the same test never collide.
+    """
+    suffix = f"-{commit[:7]}-{uuid.uuid4().hex[:6]}"
+    prefix = f"runner-{sanitize(name)}"
+    return prefix[: MAX_JOB_NAME_LEN - len(suffix)].rstrip("-") + suffix
 
 
 def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] = ()) -> str:
@@ -303,28 +403,46 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
+        if ttype == "locust":
+            # A malformed --metadata fails here rather than mid-sweep.
+            split_metadata_flag(t)
+        isolate_block(t)
+
+
+def substrate_args(test: dict[str, Any]) -> list[str]:
+    """Return the ate-setup deploy ate-system arguments for a
+    tests.yaml entry: its ateArgs, the fake data plane flag its isolate block
+    asks for, and --sandbox-classes=<sandboxClass> so gVisor runs do not need
+    write access to <BUCKET_NAME>-assets. The teardown needs no matching flag:
+    delete ate-system removes the fake data plane and any SandboxConfigs
+    whether or not they were installed."""
+    args = [*test.get("ateArgs", []), *isolate_install_args(test)]
+    if not any(a == "--sandbox-classes" or a.startswith("--sandbox-classes=") for a in args):
+        args.append(f"--sandbox-classes={test.get('sandboxClass', 'gvisor')}")
+    return args
+
+
+# ate-api-server enforces authorization, and the runner Job calls it with its
+# pod certificate as BENCHMARK_RUNNER_PRINCIPAL. Each test reinstalls
+# Substrate, so making the runner a bootstrap owner on every install grants it
+# global owner for exactly the life of that install. kubectl-ate's principal
+# stays an owner for the workload and teardown steps. The Envoy ingress router
+# also requires an allowlist of client SPIFFE IDs on every install.
+BENCHMARK_RUNNER_PRINCIPAL = "spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner"
+CLIENT_PRINCIPAL = "system:serviceaccount:ate-system:ate-client"
 
 
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
-    run(["hack/install-ate.sh", "--deploy-ate-system", *(str(a) for a in ate_args)])
+    env = {
+        **os.environ,
+        "ATE_API_AUTHZ_BOOTSTRAP_OWNERS": f"{CLIENT_PRINCIPAL},{BENCHMARK_RUNNER_PRINCIPAL}",
+        "ATE_INGRESS_ALLOWED_SPIFFE_IDS": BENCHMARK_RUNNER_PRINCIPAL,
+    }
+    run(["go", "run", "./cmd/ate-setup", "deploy", "ate-system", *(str(a) for a in ate_args)], env=env)
 
 
 def teardown_substrate() -> None:
-    run_no_check(["hack/install-ate.sh", "--delete-ate-system"])
-
-
-def install_microvm_deps() -> None:
-    """Stage kata/cloud-hypervisor assets and apply the cluster-wide
-    microvm SandboxConfig. Required before a microvm ActorTemplate can
-    boot; must run after deploy_substrate() (which installs the CRDs)."""
-    run(["hack/install-microvm-deps.sh", "--install"])
-
-
-def teardown_microvm_deps() -> None:
-    """Remove the microvm SandboxConfig. Must run before
-    teardown_substrate(), which deletes the SandboxConfig CRD (and would
-    prevent this from succeeding via kubectl)."""
-    run_no_check(["hack/install-microvm-deps.sh", "--delete"])
+    run_no_check(["go", "run", "./cmd/ate-setup", "delete", "ate-system"])
 
 
 def deploy_workloads(
@@ -332,6 +450,9 @@ def deploy_workloads(
     sandbox_class: str = "gvisor",
     actor_memory: str = "",
     wait_timeout_secs: int | str = "",
+    worker_memory: str = "",
+    fake_atelet_args: Iterable[str] = (),
+    actor_cpu: str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -341,14 +462,26 @@ def deploy_workloads(
         "--sandbox-class",
         sandbox_class,
     ]
-    # Empty keeps the default in workloads/deploy.sh (256Mi, the microvm
-    # minimum); RAM-consuming suites set actorMemory in tests.yaml.
+    # Empty keeps the default in workloads/deploy.sh (256Mi); RAM-consuming
+    # suites set actorMemory in tests.yaml.
     if actor_memory:
         cmd += ["--actor-memory", actor_memory]
+    # Empty keeps the default in workloads/deploy.sh (1 CPU). The scheduler
+    # books the limit against worker CPU capacity, so dense suites set
+    # actorCPU in tests.yaml to fit more actors per worker.
+    # str() because a whole number of cores (actorCPU: 1) parses as an int.
+    if actor_cpu:
+        cmd += ["--actor-cpu", str(actor_cpu)]
+    # Empty leaves the worker pods unsized; set workerMemory in tests.yaml to
+    # control how many workers the scheduler packs onto a node.
+    if worker_memory:
+        cmd += ["--worker-memory", worker_memory]
     # Empty keeps deploy.sh's own default; large fleets set workerWaitTimeout
     # (whole seconds).
     if wait_timeout_secs != "":
         cmd += ["--wait-timeout", str(wait_timeout_secs)]
+    # An isolate block's tuning of fake-atelet, on the fake data plane.
+    cmd += list(fake_atelet_args)
     # deploy.sh itself blocks until every template's golden snapshot exists.
     run(cmd)
 
@@ -365,9 +498,9 @@ def run_test(
     manifests_dir: str = MANIFESTS_DIR,
 ) -> str:
     name = test["name"]
-    job_name = f"runner-{sanitize(name)}-{commit[:7]}-{uuid.uuid4().hex[:6]}"
+    job = job_name(name, commit)
     subs = {
-        "JOB_NAME": job_name,
+        "JOB_NAME": job,
         "IMAGE": image,
         "TAG": commit,
         "NAME": name,
@@ -376,19 +509,26 @@ def run_test(
     mod = TYPES[test_type(test)]
     tmpl = mod.job_tmpl(manifests_dir)
     subs.update(mod.job_subs(test))
-    manifest = render_template(tmpl, subs, test.get("flags", []))
+    flags = list(test.get("flags", []))
+    # Only the locust runner knows --metadata. It keeps only the last one it
+    # is given, so a test's own --metadata is folded into a single merged
+    # flag; the test's keys win over the run's.
+    if test_type(test) == "locust":
+        flags, own = split_metadata_flag(test)
+        flags += ["--metadata", json.dumps({**run_metadata(), **own})]
+    manifest = render_template(tmpl, subs, flags)
     wait_for_no_active_runners()
-    print(f"Submitting Job {job_name}", flush=True)
+    print(f"Submitting Job {job}", flush=True)
     subprocess.run(
         ["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True
     )
     timeout = parse_duration_seconds(test["duration"]) + 1800
-    result = wait_for_job(job_name, timeout)
-    print(f"Job {job_name} result: {result}", flush=True)
+    result = wait_for_job(job, timeout)
+    print(f"Job {job} result: {result}", flush=True)
     run_no_check(
-        ["kubectl", "logs", f"job/{job_name}", "-n", NAMESPACE, "--tail=500"]
+        ["kubectl", "logs", f"job/{job}", "-n", NAMESPACE, "--tail=500"]
     )
-    run_no_check(["kubectl", "delete", "job", job_name, "-n", NAMESPACE])
+    run_no_check(["kubectl", "delete", "job", job, "-n", NAMESPACE])
     return result
 
 
@@ -435,6 +575,15 @@ def write_junit_xml(
 
 def main() -> None:
     args = parse_args()
+    tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
+    try:
+        tests = select_tests(tests, args.test_name)
+        print(f"Running {len(tests)} test(s)", flush=True)
+        validate_and_normalize_tests(tests)
+        # Checks BENCHMARK_METADATA only; cluster vars may not be set yet.
+        run_metadata()
+    except ValueError as e:
+        sys.exit(str(e))
 
     # Config-independent setup: DIND + clone the substrate branch once.
     wait_for_docker()
@@ -454,17 +603,10 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(f"Building commit {commit}", flush=True)
 
-    tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
-    print(f"Running {len(tests)} test(s)", flush=True)
-    try:
-        validate_and_normalize_tests(tests)
-    except ValueError as e:
-        sys.exit(str(e))
-
     # Per-target-cluster caches: re-running setup for the same target
     # cluster is wasted work, so we track what was last set up and only
     # redo it when the target cluster name changes (substrate images get
-    # rebuilt by install-ate.sh each test anyway via ko apply). Runner
+    # rebuilt by ate-setup each test anyway via ko). Runner
     # images are built lazily per test type, so a locust-only tests.yaml
     # never builds the nighthawk image and vice versa.
     last_target = None
@@ -501,11 +643,8 @@ def main() -> None:
             # fire that crashed mid-test (or any other process that left
             # state behind) would otherwise leak its substrate + workloads
             # into this run. All teardowns use --ignore-not-found, so
-            # this is cheap on a clean cluster. Order matters:
-            # microvm-deps deletes a SandboxConfig CR, which requires the
-            # SandboxConfig CRD that teardown_substrate removes.
+            # this is cheap on a clean cluster.
             teardown_workloads()
-            teardown_microvm_deps()
             teardown_substrate()
 
             sandbox_class = test.get("sandboxClass", "gvisor")
@@ -513,17 +652,16 @@ def main() -> None:
             failure_msg = None
             start_time = time.time()
             try:
-                deploy_substrate(test.get("ateArgs", []))
+                deploy_substrate(substrate_args(test))
                 TYPES[ttype].pre_test(test)
-                # install-microvm-deps needs the CRDs from deploy_substrate;
-                # deploy_workloads needs the microvm SandboxConfig.
-                if sandbox_class == "microvm":
-                    install_microvm_deps()
                 deploy_workloads(
                     test.get("workerCount", 1),
                     sandbox_class,
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
+                    test.get("workerMemory", ""),
+                    isolate_workload_args(test),
+                    test.get("actorCPU", ""),
                 )
                 try:
                     status = run_test(
@@ -544,10 +682,7 @@ def main() -> None:
             finally:
                 # Always tear down, even if deploy or run failed, so the
                 # next test (and the next CronJob fire) starts clean.
-                # microvm-deps must go before substrate for the same reason
-                # as above.
                 teardown_workloads()
-                teardown_microvm_deps()
                 teardown_substrate()
             duration = time.time() - start_time
             results.append((test["name"], status, duration, failure_msg))

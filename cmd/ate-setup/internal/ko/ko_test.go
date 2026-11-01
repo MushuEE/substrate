@@ -1,0 +1,258 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ko
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+)
+
+// Without --base-import-paths ko publishes cmd/atelet as "atelet-<md5>", and
+// images.ImageName -- which is how an --image-repo install addresses the same
+// component -- would be naming something that was never pushed. Nothing in an
+// install from source fails when the flag goes missing, because ko writes the
+// digests it just published straight into the manifest.
+func TestArgsAlwaysRequestBaseImportPaths(t *testing.T) {
+	// Keep the version stamp off git, so the flags are comparable.
+	t.Setenv("VERSION", "v0.0.0-test")
+	r := &Runner{Root: t.TempDir()}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"resolve", r.args("resolve", "-f", "manifests/ate-install")},
+		{"resolve from stdin", r.args("resolve", "-f", "-")},
+		{"build", r.args("build", "go.ate.dev/substrate/cmd/ateworker-gvisor")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !slices.Contains(tc.args, "--base-import-paths") {
+				t.Errorf("args = %v, want --base-import-paths", tc.args)
+			}
+			if !slices.Contains(tc.args, "--ldflags=-X=go.ate.dev/substrate/internal/version.Version=v0.0.0-test") {
+				t.Errorf("args = %v, want the version stamp", tc.args)
+			}
+		})
+	}
+}
+
+// The subcommand has to stay first, and its target has to stay with it: ko
+// takes the import path as a positional argument.
+func TestArgsKeepTheSubcommandAndTargetInFront(t *testing.T) {
+	r := &Runner{Root: t.TempDir()}
+
+	args := r.args("resolve", "-f", "-")
+	if got := args[:3]; !slices.Equal(got, []string{"resolve", "-f", "-"}) {
+		t.Errorf("args[:3] = %v, want [resolve -f -]", got)
+	}
+}
+
+func TestBuildVersionPrefersTheEnvironment(t *testing.T) {
+	t.Setenv("VERSION", "v1.2.3")
+	if got := BuildVersion(t.TempDir()); got != "v1.2.3" {
+		t.Errorf("BuildVersion() = %q, want v1.2.3", got)
+	}
+}
+
+// A source tarball has no git metadata, so BuildVersion falls back to "dev"
+// there rather than stamping an empty version.
+func TestBuildVersionFallsBackToDev(t *testing.T) {
+	t.Setenv("VERSION", "")
+	if got := BuildVersion(t.TempDir()); got != "dev" {
+		t.Errorf("BuildVersion() = %q, want dev", got)
+	}
+}
+
+// internal/version discards a stamped Version unless Commit is stamped too, so
+// a checkout with a commit stamps the commit and its time beside the version.
+// Without a commit only the version can be stamped.
+func TestLdflagsStampTheCommit(t *testing.T) {
+	t.Setenv("VERSION", "v1.2.3")
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "test"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	commit, date, ok := CommitStamp(dir)
+	if !ok || len(commit) != 40 || date == "" {
+		t.Fatalf("CommitStamp() = %q, %q, %v; want a commit and its date", commit, date, ok)
+	}
+
+	want := []string{
+		"-X=go.ate.dev/substrate/internal/version.Version=v1.2.3",
+		"-X=go.ate.dev/substrate/internal/version.Commit=" + commit,
+		"-X=go.ate.dev/substrate/internal/version.BuildDate=" + date,
+	}
+	got := Ldflags(dir)
+	if !slices.Equal(got, want) {
+		t.Errorf("Ldflags() = %v, want %v", got, want)
+	}
+	// ko splits --ldflags on commas, so no stamp may contain one.
+	for _, flag := range got {
+		if strings.Contains(flag, ",") {
+			t.Errorf("%s contains a comma, which ko would split", flag)
+		}
+	}
+
+	if got := Ldflags(t.TempDir()); len(got) != 1 {
+		t.Errorf("Ldflags() without a commit = %v, want only the version", got)
+	}
+}
+
+// fakeKo writes a ko stand-in that records its arguments, one per line, and
+// prints stdout.
+func fakeKo(t *testing.T, stdout string) (binary, argsFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	argsFile = filepath.Join(dir, "args")
+	binary = filepath.Join(dir, "ko")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\nprintf '" + stdout + "'\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, argsFile
+}
+
+// A release is only installable if every image carries the tag and the
+// --base-import-paths name that --image-repo looks it up by.
+func TestBuildTagged(t *testing.T) {
+	t.Setenv("VERSION", "v1.2.3")
+	binary, argsFile := fakeKo(t, "repo/ateapi:v1.2.3@sha256:a\\nrepo/atelet:v1.2.3@sha256:b\\n")
+	r := &Runner{Root: t.TempDir(), Stderr: os.Stderr, binary: binary}
+
+	refs, err := r.BuildTagged(t.Context(), "v1.2.3", []string{"org.example/source=https://example.com"}, "./cmd/ateapi", "./cmd/atelet")
+	if err != nil {
+		t.Fatalf("BuildTagged() error = %v", err)
+	}
+	if want := []string{"repo/ateapi:v1.2.3@sha256:a", "repo/atelet:v1.2.3@sha256:b"}; !slices.Equal(refs, want) {
+		t.Errorf("BuildTagged() = %q, want %q", refs, want)
+	}
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Fields(string(raw))
+	if got := args[:3]; !slices.Equal(got, []string{"build", "./cmd/ateapi", "./cmd/atelet"}) {
+		t.Errorf("args[:3] = %v, want [build ./cmd/ateapi ./cmd/atelet]", got)
+	}
+	for _, want := range []string{"--tags=v1.2.3", "--base-import-paths", "--image-label=org.example/source=https://example.com"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("args = %v, want %s", args, want)
+		}
+	}
+}
+
+// A ref missing from ko's output would leave a release short an image, so it
+// fails the build rather than printing an incomplete list.
+func TestBuildTaggedRejectsMissingRefs(t *testing.T) {
+	binary, _ := fakeKo(t, "repo/ateapi:v1@sha256:a\\n")
+	r := &Runner{Root: t.TempDir(), Stderr: os.Stderr, binary: binary}
+
+	if _, err := r.BuildTagged(t.Context(), "v1", nil, "./cmd/ateapi", "./cmd/atelet"); err == nil {
+		t.Error("BuildTagged() error = nil, want one for 1 ref from 2 packages")
+	}
+}
+
+// flakyKo writes a ko stand-in that fails the first failures builds of each
+// package, printing stderr, then prints a ref for it. It returns the
+// directory where it counts builds per package.
+func flakyKo(t *testing.T, failures int, stderr string) (binary, dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	binary = filepath.Join(dir, "ko")
+	script := "#!/bin/sh\n" +
+		"pkg=$(basename \"$2\")\n" +
+		"echo run >> " + dir + "/runs-$pkg\n" +
+		"if [ $(wc -l < " + dir + "/runs-$pkg) -le " + strconv.Itoa(failures) + " ]; then echo '" + stderr + "' >&2; exit 1; fi\n" +
+		"echo repo/$pkg:v1@sha256:a\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, dir
+}
+
+// koRuns returns how many times flakyKo built pkg.
+func koRuns(t *testing.T, dir, pkg string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "runs-"+pkg))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(raw), "run")
+}
+
+// fastBackoff shortens buildBackoff for the test.
+func fastBackoff(t *testing.T) {
+	t.Helper()
+	original := buildBackoff
+	buildBackoff = wait.Backoff{Steps: original.Steps, Duration: time.Millisecond, Factor: 1}
+	t.Cleanup(func() { buildBackoff = original })
+}
+
+const deniedStderr = "PATCH https://ghcr.io/v2/agent-substrate/substrate/ateapi/blobs/upload/1: DENIED: permission_denied: write_package"
+
+func TestBuildEachRetriesEachImage(t *testing.T) {
+	fastBackoff(t)
+	binary, dir := flakyKo(t, 2, deniedStderr)
+	r := &Runner{Root: t.TempDir(), binary: binary}
+
+	refs, err := r.BuildEach(t.Context(), "v1", nil, "./cmd/ateapi", "./cmd/atelet")
+	if err != nil {
+		t.Fatalf("BuildEach() error = %v", err)
+	}
+	if want := []string{"repo/ateapi:v1@sha256:a", "repo/atelet:v1@sha256:a"}; !slices.Equal(refs, want) {
+		t.Errorf("BuildEach() = %q, want %q", refs, want)
+	}
+	for _, pkg := range []string{"ateapi", "atelet"} {
+		if got := koRuns(t, dir, pkg); got != 3 {
+			t.Errorf("ko built %s %d times, want 3", pkg, got)
+		}
+	}
+}
+
+func TestBuildEachStopsAfterAttempts(t *testing.T) {
+	fastBackoff(t)
+	binary, dir := flakyKo(t, 100, deniedStderr)
+	r := &Runner{Root: t.TempDir(), binary: binary}
+
+	_, err := r.BuildEach(t.Context(), "v1", nil, "./cmd/ateapi", "./cmd/atelet")
+	if err == nil {
+		t.Error("BuildEach() error = nil, want one after 3 failed attempts")
+	}
+	if got := koRuns(t, dir, "ateapi"); got != 3 {
+		t.Errorf("ko built ateapi %d times, want 3", got)
+	}
+	if got := koRuns(t, dir, "atelet"); got != 0 {
+		t.Errorf("ko built atelet %d times, want 0", got)
+	}
+}

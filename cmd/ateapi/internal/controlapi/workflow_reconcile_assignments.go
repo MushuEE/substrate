@@ -1,0 +1,184 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controlapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+// needsAssignmentReconcile reports whether worker's registered epoch has risen
+// past the last one its earlier Actors were released for.
+func needsAssignmentReconcile(worker *ateapi.Worker) bool {
+	return worker.GetStatus().GetRegisteredEpoch() > worker.GetStatus().GetObservedEpoch()
+}
+
+// ReconcileAssignments brings a Worker's status.observed_epoch up to its
+// registered_epoch. A raised registered_epoch means a new worker process registered,
+// and every earlier one has exited and lost the sandboxes of the Actors that
+// ran under it, so those Actors are crashed and their assignments released
+// before observed_epoch records it. A failure leaves observed_epoch where it
+// was, so the next pass redoes the release.
+//
+// Nothing to do, including a Worker that is gone, is success.
+func (w *WorkerWorkflow) ReconcileAssignments(ctx context.Context, name string) (err error) {
+	ctx = preview.ContextWithOptIn(ctx)
+	ctx, done := stepSpan(ctx, "ReconcileAssignments")
+	defer func() { err = done(err) }()
+
+	worker, err := w.store.GetWorker(ctx, name)
+	if errors.Is(err, store.ErrNotFound) {
+		markSkipped(ctx, "worker not found")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("while fetching worker %s: %w", name, err)
+	}
+	if !needsAssignmentReconcile(worker) {
+		markSkipped(ctx, "epoch already observed")
+		return nil
+	}
+	epoch := worker.GetStatus().GetRegisteredEpoch()
+	if err := w.releaseAssignmentsBefore(ctx, worker, epoch); err != nil {
+		return err
+	}
+	return w.recordObservedEpoch(ctx, name, worker.GetMetadata().GetUid(), epoch)
+}
+
+// recordObservedEpochAttempts bounds how often recordObservedEpoch rereads a
+// Worker that other writes keep moving on.
+const recordObservedEpochAttempts = 5
+
+// recordObservedEpoch raises observed_epoch to epoch on the Worker incarnation
+// uid names. A Worker that is gone, or replaced by a new incarnation, is left
+// alone.
+//
+// A write that lands on the Worker after the sweep does not make the record
+// wrong, so a version conflict is retried against a fresh read. An Actor
+// recorded RUNNING under an epoch before epoch was bound, and its assignment
+// row written, before that epoch was activated, so the sweep found the row.
+func (w *WorkerWorkflow) recordObservedEpoch(ctx context.Context, name, uid string, epoch int64) error {
+	for attempt := 1; ; attempt++ {
+		worker, err := w.store.GetWorker(ctx, name)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("while re-fetching worker %s: %w", name, err)
+		}
+		_, err = w.store.UpdateWorker(ctx, name, store.Precondition{UID: uid, Version: worker.GetMetadata().GetVersion()}, func(toUpdate *ateapi.Worker) error {
+			toUpdate.Status.ObservedEpoch = max(toUpdate.GetStatus().GetObservedEpoch(), epoch)
+			return nil
+		})
+		switch {
+		case err == nil, errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrUIDConflict):
+			return nil
+		case errors.Is(err, store.ErrVersionConflict) && attempt < recordObservedEpochAttempts:
+			continue
+		default:
+			return fmt.Errorf("while recording observed epoch %d on worker %s: %w", epoch, name, err)
+		}
+	}
+}
+
+// errActorBusy reports an assignment skipped because an operation holds its
+// Actor's lease.
+var errActorBusy = errors.New("actor has an operation in progress")
+
+// releaseAssignmentsBefore releases every assignment on worker whose Actor ran
+// under an epoch before epoch. An assignment whose Actor is busy is skipped
+// until the rest are released, then reported, so the pass is retried.
+func (w *WorkerWorkflow) releaseAssignmentsBefore(ctx context.Context, worker *ateapi.Worker, epoch int64) error {
+	name := worker.GetMetadata().GetName()
+	busy := 0
+	// Releasing deletes rows mid-scan, which paging tolerates: the cursor is
+	// the last actor UID listed, not an offset.
+	for token := ""; ; {
+		page, err := w.store.ListWorkerAssignments(ctx, name, store.ListOptions{PageToken: token})
+		if err != nil {
+			return fmt.Errorf("while listing the assignments of worker %s: %w", name, err)
+		}
+		for _, assignment := range page.Items {
+			err := w.releaseEarlierAssignment(ctx, worker, assignment, epoch)
+			if errors.Is(err, errActorBusy) {
+				busy++
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if !page.HasNextPage() {
+			break
+		}
+		token = page.NextPageToken
+	}
+	if busy > 0 {
+		return fmt.Errorf("%d assignments on worker %s left for a retry: %w", busy, name, errActorBusy)
+	}
+	return nil
+}
+
+// releaseEarlierAssignment clears one assignment whose Actor ran under an epoch
+// of the Worker before epoch, under its Actor's lease so no operation on the
+// Actor is midway. An Actor recorded RUNNING under epoch or later is left
+// alone, and so is a RESUMING Actor, which is left to its resume. Any other
+// Actor is released by crashBoundActor, in the same write that changes it.
+func (w *WorkerWorkflow) releaseEarlierAssignment(ctx context.Context, worker *ateapi.Worker, assignment *ateapi.ActorAssignment, epoch int64) error {
+	name := worker.GetMetadata().GetName()
+	actorRef := resources.ActorRefFromObjectRef(assignment.GetActor())
+	lease, err := w.store.AcquireLease(ctx, actorLeaseKey(actorRef))
+	if errors.Is(err, store.ErrLeaseConflict) {
+		return errActorBusy
+	}
+	if err != nil {
+		return fmt.Errorf("while acquiring the lease of actor %s: %w", actorRef, err)
+	}
+	defer lease.Close()
+	ctx = lease.Context()
+
+	// The assignment was listed before the lease was taken. An Actor deleted,
+	// recreated, or released since then no longer points at this Worker, and
+	// its assignment went with that write.
+	actor, err := w.store.GetActor(ctx, actorRef)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("while getting actor to release from worker %s: %w", name, err)
+	}
+	if actor.GetMetadata().GetUid() != assignment.GetActorUid() ||
+		actor.GetStatus().GetWorkerAssignment().GetWorker().GetName() != name {
+		return nil
+	}
+
+	if actor.GetStatus().GetWorkerAssignment().GetWorkerEpoch() >= epoch {
+		return nil
+	}
+	if actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RESUMING {
+		// A RESUMING Actor is left to its resume, which records the epoch of
+		// the worker process that restores it, and restores it again if that
+		// process is gone, whether finalizeRunning finds it replaced or the
+		// Restore was cut short by the restart.
+		return nil
+	}
+	return w.crashBoundActor(ctx, worker, actorRef, actor, "Releasing actor from a restarted worker", crashMessageWorkerRestarted)
+}

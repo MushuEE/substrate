@@ -14,21 +14,32 @@
 
 // Package egress installs the egress demo, which exercises egress policy
 // enforcement through atenet.
+//
+// Its actors project the egress gateway trust bundle. A golden snapshot only
+// exists once an actor starts, and an actor whose trust bundle does not
+// resolve never does, so a timeout waiting for the golden is the symptom of a
+// missing egress gateway CA.
 package egress
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/internal/resources"
 )
 
+// namespace is the pool's k8s namespace; it doubles as the atespace holding
+// the demo's ActorTemplate.
 const namespace = "ate-demo-egress"
 
 func init() {
-	demos.Register(&demos.Simple{
-		DemoName:       "demo-egress",
-		Short:          "Egress policy enforcement through atenet",
-		Template:       "demos/egress/egress.yaml.tmpl",
-		Deployments:    []steps.TemplateRef{{Atespace: namespace, Name: "egress"}},
-		ActorTemplates: []steps.TemplateRef{{Atespace: namespace, Name: "egress"}},
+	demos.Register(&demos.Substrate{
+		DemoName:           "demo-egress",
+		Short:              "Egress policy enforcement through atenet",
+		WorkerPoolManifest: "demos/egress/egress.yaml.tmpl",
+		Deployments:        []steps.TemplateRef{{Atespace: namespace, Name: "egress"}},
+		Templates: []demos.SubstrateTemplate{{
+			Manifest: "demos/egress/egress-template.yaml.tmpl",
+			Ref:      resources.ActorTemplateRef{Atespace: namespace, Name: "egress"},
+		}},
 	})
 }

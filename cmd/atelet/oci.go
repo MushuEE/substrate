@@ -15,19 +15,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path"
 	"sort"
 	"strings"
 
-	"github.com/agent-substrate/substrate/internal/ateerrors"
-	"github.com/agent-substrate/substrate/internal/ateompath"
-	"github.com/agent-substrate/substrate/internal/imagecache"
-	"github.com/agent-substrate/substrate/internal/ocispec"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/moby/sys/user"
+	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
+	"go.ate.dev/substrate/internal/imagecache"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/errgroup"
@@ -35,7 +39,7 @@ import (
 
 const (
 	// capabilityAll is the sentinel a template may put in drop to clear the
-	// whole default set. It is rejected in add (see v1alpha1.Capabilities).
+	// whole default set. It is rejected in add (see ateapi.Capabilities).
 	capabilityAll = "ALL"
 )
 
@@ -76,30 +80,34 @@ func resolveCapabilities(caps *ateletpb.Capabilities) []string {
 	return out
 }
 
-func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, actorUID, containerName, ref string, command, args []string, env []string, netns string, volumes []*ateletpb.Volume, volumeMounts []*ateletpb.VolumeMount, capabilities []string, resources *ateletpb.ResourceLimits) error {
+// prepareOCIDirectory pulls the container's image and writes the overlay spec
+// the worker composes its rootfs from. It returns the image and the process's
+// working directory, which the worker creates through the overlay.
+func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, actorUID, containerName, ref string, volumes []*ateletpb.Volume, volumeMounts []*ateletpb.VolumeMount) (*imagecache.Image, string, error) {
 	tracer := otel.Tracer("prepareOCIDirectory")
 
 	ctx, span := tracer.Start(ctx, "prepareOCIDirectory")
 	span.SetAttributes(attribute.String("image", ref))
 	defer span.End()
 
-	bundlePath := ateompath.OCIBundlePath(actorUID, containerName)
+	bundlePath := ateletpath.OCIBundlePath(actorUID, containerName)
 
-	// Clear any previous bundle contents (belt and suspenders: resetActorDirs
-	// already wiped the bundle dir on the Run/Restore path).
+	// Clear any previous bundle contents (belt and suspenders:
+	// actordirs.ResetActorDirs already wiped the bundle dir on the Run/Restore
+	// path).
 	if err := imagecache.RemoveAllWritable(bundlePath); err != nil {
-		return fmt.Errorf("while clearing bundle %q: %w", bundlePath, err)
+		return nil, "", fmt.Errorf("while clearing bundle %q: %w", bundlePath, err)
 	}
 
-	// The bundle's rootfs is composed by ateom as an overlay mount just before
+	// The bundle's rootfs is composed by worker as an overlay mount just before
 	// the workload runs: the cached image layers are the read-only lowerdirs,
 	// and the bundle-local upper/work hold this actor's private writes (wiped
 	// between runs, preserving the pristine-rootfs-per-run contract the old
-	// full re-untar provided). atelet only prepares the (empty) directories —
-	// it deliberately runs with no capabilities, so it cannot mount.
+	// full re-untar provided). atelet only prepares the (empty) directories:
+	// it has no CAP_SYS_ADMIN, so it cannot mount.
 	for _, d := range []string{"rootfs", "upper", "work"} {
 		if err := os.MkdirAll(path.Join(bundlePath, d), 0o700); err != nil {
-			return fmt.Errorf("in os.MkdirAll for container bundle dir: %w", err)
+			return nil, "", fmt.Errorf("in os.MkdirAll for container bundle dir: %w", err)
 		}
 	}
 
@@ -111,7 +119,7 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 	g.Go(func() error {
 		var err error
 		if img, err = imageCache.EnsureImage(gctx, ref); err != nil {
-			return fmt.Errorf("in imageCache.EnsureImage: %w", err)
+			return fmt.Errorf("in imageCache.EnsureImage(%q): %w", ref, err)
 		}
 		return nil
 	})
@@ -121,23 +129,22 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 		return err
 	})
 	if err := g.Wait(); err != nil {
-		return err
+		return nil, "", err
 	}
-
-	// Argv and env need only the image config; resolve them before writing
-	// any spec so an invalid container config fails fast.
-	resolvedArgs, err := resolveProcessArgs(&img.Config, command, args)
+	cwd, err := resolveCwd(&img.Config)
 	if err != nil {
-		return fmt.Errorf("while resolving process args for container %q: %w", containerName, err)
+		return nil, "", fmt.Errorf("while resolving the working directory of container %q: %w", containerName, err)
 	}
-	resolvedEnv := resolveActorEnv(&img.Config, env)
 
-	// Every bind target must exist in the rootfs for the mount to attach;
-	// ateom creates them through the mounted overlay (they land in the
-	// actor's upper).
+	// Every bind target must exist in the rootfs for the mount to attach, and
+	// the working directory for the process to start; worker creates them
+	// through the mounted overlay (they land in the actor's upper).
 	var extraDirs []string
 	for _, vm := range volumeMounts {
 		extraDirs = append(extraDirs, vm.GetMountPath())
+	}
+	if cwd != "/" {
+		extraDirs = append(extraDirs, cwd)
 	}
 	if err := imagecache.WriteSpec(bundlePath, &imagecache.OverlaySpec{
 		ImageDigest:  img.Digest.String(),
@@ -145,25 +152,22 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 		ExtraDirs:    extraDirs,
 		ImageVolumes: imageVolumes,
 	}); err != nil {
-		return fmt.Errorf("while writing overlay spec: %w", err)
+		return nil, "", fmt.Errorf("while writing overlay spec: %w", err)
 	}
 
-	// Write the runtime-neutral OCI spec to config.json.
-	if err := ocispec.Save(bundlePath, ocispec.Build(ocispec.Options{
-		ActorUID:      actorUID,
-		ContainerName: containerName,
-		Args:          resolvedArgs,
-		Env:           resolvedEnv,
-		NetNSPath:     netns,
-		Volumes:       volumes,
-		VolumeMounts:  volumeMounts,
-		Capabilities:  capabilities,
-		Resources:     resources,
-	})); err != nil {
-		return fmt.Errorf("while writing OCI spec: %w", err)
-	}
+	return img, cwd, nil
+}
 
-	return nil
+// resolveCwd reads the image's WORKDIR; none means "/". The OCI spec requires
+// an absolute path.
+func resolveCwd(imageCfg *v1.Config) (string, error) {
+	if imageCfg == nil || imageCfg.WorkingDir == "" {
+		return "/", nil
+	}
+	if !path.IsAbs(imageCfg.WorkingDir) {
+		return "", fmt.Errorf("image WorkingDir %q is not absolute", imageCfg.WorkingDir)
+	}
+	return path.Clean(imageCfg.WorkingDir), nil
 }
 
 // resolveImageVolumes pulls the image behind every image-typed volume this
@@ -188,9 +192,10 @@ func resolveImageVolumes(ctx context.Context, imageCache *imagecache.Store, volu
 	g, gctx := errgroup.WithContext(ctx)
 	for i, vol := range wanted {
 		g.Go(func() error {
-			img, err := imageCache.EnsureImage(gctx, vol.GetImage().GetReference())
+			volRef := vol.GetImage().GetReference()
+			img, err := imageCache.EnsureImage(gctx, volRef)
 			if err != nil {
-				return fmt.Errorf("in imageCache.EnsureImage for volume %q: %w", vol.GetName(), err)
+				return fmt.Errorf("in imageCache.EnsureImage(%q) for volume %q: %w", volRef, vol.GetName(), err)
 			}
 			out[i] = imagecache.ImageVolumeOverlay{
 				Name:        vol.GetName(),
@@ -260,7 +265,56 @@ func resolveProcessArgs(imageCfg *v1.Config, command, args []string) ([]string, 
 	argv = append(argv, entrypoint...)
 	argv = append(argv, cmd...)
 	if len(argv) == 0 {
-		return nil, fmt.Errorf("%w: no command specified: image defines neither ENTRYPOINT nor CMD and the container sets neither command nor args", ateerrors.ReasonInvalidContainerConfig)
+		return nil, fmt.Errorf("no command specified: image defines neither ENTRYPOINT nor CMD and the container sets neither command nor args")
 	}
 	return argv, nil
+}
+
+// resolveImageUser resolves the image's USER against the image's own
+// /etc/passwd and /etc/group, either of which may be absent. No USER is root,
+// reported as nil.
+func resolveImageUser(img *imagecache.Image) (*ateworkerpb.ProcessUser, error) {
+	if img.Config.User == "" {
+		return nil, nil
+	}
+	passwd, err := readOptionalImageFile(img, "etc/passwd")
+	if err != nil {
+		return nil, err
+	}
+	group, err := readOptionalImageFile(img, "etc/group")
+	if err != nil {
+		return nil, err
+	}
+	return resolveUser(img.Config.User, passwd, group)
+}
+
+// readOptionalImageFile returns a nil reader for a file the image lacks.
+func readOptionalImageFile(img *imagecache.Image, name string) (io.Reader, error) {
+	b, err := img.ReadFile(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(b), nil
+}
+
+// resolveUser follows Docker's rules for USER "user[:group]": numeric ids as
+// is, a bare uid with its login group from passwd (gid 0 without an entry),
+// names looked up or an error, group memberships as supplementary groups.
+// Ids are bounded to int32. A nil reader means the image lacks the file.
+func resolveUser(userSpec string, passwd, group io.Reader) (*ateworkerpb.ProcessUser, error) {
+	if strings.Count(userSpec, ":") > 1 {
+		return nil, fmt.Errorf("image User %q: want user[:group]", userSpec)
+	}
+	u, err := user.GetExecUser(userSpec, nil, passwd, group)
+	if err != nil {
+		return nil, fmt.Errorf("image User %q: %w", userSpec, err)
+	}
+	identity := &ateworkerpb.ProcessUser{Uid: uint32(u.Uid), Gid: uint32(u.Gid)}
+	for _, gid := range u.Sgids {
+		identity.AdditionalGids = append(identity.AdditionalGids, uint32(gid))
+	}
+	return identity, nil
 }

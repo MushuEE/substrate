@@ -26,8 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
@@ -42,10 +42,38 @@ type Cache struct {
 	store          workerListWatcher
 	relistInterval time.Duration
 
-	mu      sync.RWMutex
-	workers map[string]*ateapipb.Worker
+	mu       sync.RWMutex
+	workers  map[string]*ateapi.Worker
+	handlers []func(*ateapi.Worker)
 
 	ready atomic.Bool
+}
+
+// AddHandler registers handler to be called with every Worker the cache holds
+// now, every Worker a watch event creates or updates, and every Worker a relist
+// finds new or at a different version, so a change a missed event carried
+// still reaches it. It runs on the goroutine applying the change and must not
+// block.
+func (c *Cache) AddHandler(handler func(*ateapi.Worker)) {
+	c.mu.Lock()
+	c.handlers = append(c.handlers, handler)
+	current := make([]*ateapi.Worker, 0, len(c.workers))
+	for _, w := range c.workers {
+		current = append(current, w)
+	}
+	c.mu.Unlock()
+	for _, w := range current {
+		handler(w)
+	}
+}
+
+// notify calls handlers with each of workers.
+func notify(handlers []func(*ateapi.Worker), workers ...*ateapi.Worker) {
+	for _, h := range handlers {
+		for _, w := range workers {
+			h(w)
+		}
+	}
 }
 
 // New creates a Cache backed by a given store. relistInterval controls how
@@ -55,7 +83,7 @@ func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 	return &Cache{
 		store:          store,
 		relistInterval: relistInterval,
-		workers:        make(map[string]*ateapipb.Worker),
+		workers:        make(map[string]*ateapi.Worker),
 	}
 }
 
@@ -63,7 +91,7 @@ func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 // package and nothing more.
 type workerListWatcher interface {
 	WatchWorkers(ctx context.Context) (*store.WorkerWatch, error)
-	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Worker], error)
+	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapi.Worker], error)
 }
 
 // Start syncs the cache synchronously, then spawns a background goroutine
@@ -83,13 +111,13 @@ func (c *Cache) Start(ctx context.Context) error {
 // slice and its elements must not be modified by the caller. Returns an error
 // if the cache is not ready (brief window during reconnect); callers are
 // expected to retry.
-func (c *Cache) Workers() ([]*ateapipb.Worker, error) {
+func (c *Cache) Workers() ([]*ateapi.Worker, error) {
 	if !c.ready.Load() {
 		return nil, fmt.Errorf("worker cache not ready")
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*ateapipb.Worker, 0, len(c.workers))
+	out := make([]*ateapi.Worker, 0, len(c.workers))
 	for _, w := range c.workers {
 		out = append(out, w)
 	}
@@ -97,7 +125,7 @@ func (c *Cache) Workers() ([]*ateapipb.Worker, error) {
 }
 
 // Worker returns the worker with the given name.
-func (c *Cache) Worker(name string) (*ateapipb.Worker, error) {
+func (c *Cache) Worker(name string) (*ateapi.Worker, error) {
 	if !c.ready.Load() {
 		return nil, fmt.Errorf("worker cache not ready")
 	}
@@ -133,7 +161,7 @@ func (c *Cache) sync(ctx context.Context) (*store.WorkerWatch, error) {
 }
 
 func (c *Cache) relist(ctx context.Context) error {
-	var workers []*ateapipb.Worker
+	var workers []*ateapi.Worker
 	pageToken := ""
 	for {
 		page, err := c.store.ListWorkers(ctx, store.ListOptions{PageSize: relistPageSize, PageToken: pageToken})
@@ -146,14 +174,23 @@ func (c *Cache) relist(ctx context.Context) error {
 		}
 		pageToken = page.NextPageToken
 	}
-	newMap := make(map[string]*ateapipb.Worker, len(workers))
+	newMap := make(map[string]*ateapi.Worker, len(workers))
 	for _, w := range workers {
 		newMap[workerKey(w)] = w
 	}
 	c.mu.Lock()
+	var changed []*ateapi.Worker
+	for key, w := range newMap {
+		old, ok := c.workers[key]
+		if !ok || old.GetMetadata().GetVersion() != w.GetMetadata().GetVersion() {
+			changed = append(changed, w)
+		}
+	}
 	c.workers = newMap
+	handlers := c.handlers
 	c.mu.Unlock()
-	slog.InfoContext(ctx, "worker cache synced", slog.Int("count", len(newMap)))
+	slog.InfoContext(ctx, "worker cache synced", slog.Int("count", len(newMap)), slog.Int("changed", len(changed)))
+	notify(handlers, changed...)
 	return nil
 }
 
@@ -213,7 +250,7 @@ func (c *Cache) resync(ctx context.Context) *store.WorkerWatch {
 func (c *Cache) applyEvent(event store.WorkerEvent) {
 	key := workerKey(event.Worker)
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	var handlers []func(*ateapi.Worker)
 	switch event.Type {
 	case store.WorkerEventDeleted:
 		delete(c.workers, key)
@@ -221,10 +258,13 @@ func (c *Cache) applyEvent(event store.WorkerEvent) {
 		existing, ok := c.workers[key]
 		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.GetMetadata().GetVersion() {
 			c.workers[key] = event.Worker
+			handlers = c.handlers
 		}
 	}
+	c.mu.Unlock()
+	notify(handlers, event.Worker)
 }
 
-func workerKey(w *ateapipb.Worker) string {
+func workerKey(w *ateapi.Worker) string {
 	return w.GetMetadata().GetName()
 }

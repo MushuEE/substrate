@@ -31,11 +31,25 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
+
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
 
 // versionPkg is the package whose Version variable receives the build stamp.
-// It matches VERSION_PKG in the Makefile.
-const versionPkg = "github.com/agent-substrate/substrate/internal/version"
+const versionPkg = "go.ate.dev/substrate/internal/version"
+
+// baseImportPaths publishes each image as the last element of its import path,
+// so cmd/atelet becomes $KO_DOCKER_REPO/atelet.
+//
+// ko's default instead appends an md5 of the full import path, which nothing
+// outside ko can predict. images.ImageName is the other half of this: it is
+// how `--image-repo` addresses a published image, and it can only be right if
+// the images were published under this naming.
+const baseImportPaths = "--base-import-paths"
 
 // Runner invokes ko with a fixed repository root and environment.
 type Runner struct {
@@ -84,12 +98,8 @@ func findBinary(root string) (string, error) {
 // path (or from stdinManifest when path is "-") and returns the manifest with
 // image references replaced by digests.
 func (r *Runner) Resolve(ctx context.Context, path string, stdinManifest []byte) ([]byte, error) {
-	args := []string{"resolve", "-f", path}
-	for _, flag := range r.ldflags() {
-		args = append(args, "--ldflags="+flag)
-	}
-
-	cmd := exec.CommandContext(ctx, r.binary, args...)
+	defer log.Elapsed(time.Now(), "ko resolve -f "+path)
+	cmd := exec.CommandContext(ctx, r.binary, r.args("resolve", "-f", path)...)
 	cmd.Dir = r.Root
 	cmd.Env = append(os.Environ(), r.Env...)
 	if path == "-" {
@@ -110,14 +120,11 @@ func (r *Runner) Resolve(ctx context.Context, path string, stdinManifest []byte)
 
 // Build builds and publishes one Go binary's image and returns its pushed
 // reference (the last line ko prints). Resolve covers everything a manifest
-// references; Build is for the images with no manifest names, such as the ateom
+// references; Build is for the images with no manifest names, such as the worker
 // worker images a WorkerPool points at through workerImage.
 func (r *Runner) Build(ctx context.Context, importPath string) (string, error) {
-	args := []string{"build", importPath}
-	for _, flag := range r.ldflags() {
-		args = append(args, "--ldflags="+flag)
-	}
-	cmd := exec.CommandContext(ctx, r.binary, args...)
+	defer log.Elapsed(time.Now(), "ko build "+importPath)
+	cmd := exec.CommandContext(ctx, r.binary, r.args("build", importPath)...)
 	cmd.Dir = r.Root
 	cmd.Env = append(os.Environ(), r.Env...)
 	var stdout bytes.Buffer
@@ -133,9 +140,60 @@ func (r *Runner) Build(ctx context.Context, importPath string) (string, error) {
 	return lines[len(lines)-1], nil
 }
 
-// ResolvePath resolves a manifest file or directory.
-func (r *Runner) ResolvePath(ctx context.Context, path string) ([]byte, error) {
-	return r.Resolve(ctx, path, nil)
+// BuildTagged builds and publishes the images for importPaths in one ko
+// invocation, tagging each with tag and setting each "key=value" in labels as
+// an image label, and returns their pushed references.
+func (r *Runner) BuildTagged(ctx context.Context, tag string, labels []string, importPaths ...string) ([]string, error) {
+	defer log.Elapsed(time.Now(), "ko build --tags="+tag)
+	args := append(r.args("build", importPaths...), "--tags="+tag)
+	for _, label := range labels {
+		args = append(args, "--image-label="+label)
+	}
+	cmd := exec.CommandContext(ctx, r.binary, args...)
+	cmd.Dir = r.Root
+	cmd.Env = append(os.Environ(), r.Env...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = r.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("while running ko build --tags=%s: %w", tag, err)
+	}
+	refs := strings.Fields(stdout.String())
+	if len(refs) != len(importPaths) {
+		return nil, fmt.Errorf("ko build printed %d image references for %d packages", len(refs), len(importPaths))
+	}
+	return refs, nil
+}
+
+// buildBackoff paces the retries of an image that fails to build or push: 3
+// attempts, 10s then 20s apart. ghcr.io can briefly deny pushes to a package it
+// has just created.
+var buildBackoff = wait.Backoff{Steps: 3, Duration: 10 * time.Second, Factor: 2}
+
+// BuildEach runs BuildTagged once per import path, retrying each failure per
+// buildBackoff. It returns the refs in importPaths order.
+func (r *Runner) BuildEach(ctx context.Context, tag string, labels []string, importPaths ...string) ([]string, error) {
+	refs := make([]string, 0, len(importPaths))
+	for _, path := range importPaths {
+		var ref string
+		logAndRetry := func(err error) bool {
+			log.Warnf("%s: %v", path, err)
+			return true
+		}
+		err := retry.OnError(buildBackoff, logAndRetry, func() error {
+			built, err := r.BuildTagged(ctx, tag, labels, path)
+			if err != nil {
+				return err
+			}
+			ref = built[0]
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
 }
 
 // ResolveBytes resolves an in-memory manifest, such as kustomize output.
@@ -143,15 +201,55 @@ func (r *Runner) ResolveBytes(ctx context.Context, manifest []byte) ([]byte, err
 	return r.Resolve(ctx, "-", manifest)
 }
 
-// ldflags returns the version stamp ko should bake into binaries. The shell
-// scripts shelled out to `make ldflags` for this; computing it here keeps the
-// value identical without depending on make.
-func (r *Runner) ldflags() []string {
-	return []string{fmt.Sprintf("-X=%s.Version=%s", versionPkg, BuildVersion(r.Root))}
+// args builds a ko command line: the subcommand and its target, then the flags
+// every invocation carries.
+func (r *Runner) args(subcommand string, target ...string) []string {
+	args := append([]string{subcommand}, target...)
+	args = append(args, baseImportPaths)
+	for _, flag := range r.ldflags() {
+		args = append(args, "--ldflags="+flag)
+	}
+	return args
 }
 
-// BuildVersion mirrors the Makefile's VERSION: `git describe`, or "dev" when
-// git has nothing to say. It is what ko stamps into the binaries.
+// ldflags returns the version stamp ko should bake into binaries.
+func (r *Runner) ldflags() []string {
+	return Ldflags(r.Root)
+}
+
+// Ldflags returns the -X flags that stamp a binary built from root with
+// internal/version's Version, and with Commit and BuildDate when root has a
+// commit checked out. internal/version replaces a stamped Version with the
+// module's build info unless Commit is stamped too. BuildDate is the commit's
+// time, so rebuilding one commit gives the same binary.
+func Ldflags(root string) []string {
+	flags := []string{fmt.Sprintf("-X=%s.Version=%s", versionPkg, BuildVersion(root))}
+	if commit, date, ok := CommitStamp(root); ok {
+		flags = append(flags,
+			fmt.Sprintf("-X=%s.Commit=%s", versionPkg, commit),
+			fmt.Sprintf("-X=%s.BuildDate=%s", versionPkg, date))
+	}
+	return flags
+}
+
+// CommitStamp returns the commit checked out at root and its committer date in
+// RFC 3339 form. ok is false when root has no commit, as in a source tarball.
+func CommitStamp(root string) (commit, date string, ok bool) {
+	cmd := exec.Command("git", "show", "-s", "--format=%H %cI", "HEAD")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "", false
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
+}
+
+// BuildVersion is the VERSION environment variable, else `git describe`, or
+// "dev" when git has nothing to say. It is what ko stamps into the binaries.
 func BuildVersion(root string) string {
 	if v := os.Getenv("VERSION"); v != "" {
 		return v

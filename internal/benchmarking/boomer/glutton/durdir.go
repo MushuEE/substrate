@@ -22,20 +22,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateinterceptors"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/boomerutil"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
-	bmetrics "github.com/agent-substrate/substrate/internal/benchmarking/boomer/metrics"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
-	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateinterceptors"
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/boomerutil"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/dynconfig"
+	bmetrics "go.ate.dev/substrate/internal/benchmarking/boomer/metrics"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -64,6 +64,7 @@ func init() {
 		Name:       "durdir",
 		LocustFile: "durdir.py",
 		UserClass:  durDirUserClass,
+		Config:     durDirCodec,
 		Init:       initDurDir,
 	})
 }
@@ -84,19 +85,14 @@ type durDirRuntime struct {
 }
 
 func (r *durDirRuntime) dynamicWait() time.Duration {
-	cfg := r.cfg.Dyn.Load()
-	if cfg.MaxWait <= cfg.MinWait {
-		return cfg.MinWait
-	}
-	jitter := cfg.MaxWait - cfg.MinWait
-	return cfg.MinWait + time.Duration(rand.Float64()*float64(jitter))
+	return dynconfig.Get[durDirKnobs](r.cfg.Dyn).WaitTime.Draw()
 }
 
 func (r *durDirRuntime) iterate() {
 	gid := boomerutil.GoroutineID()
 	val, loaded := r.users.Load(gid)
 	if !loaded {
-		dynCfg := r.cfg.Dyn.Load()
+		dynCfg := dynconfig.Get[durDirKnobs](r.cfg.Dyn)
 		u, err := r.startUser(context.Background(), dynCfg)
 		if err != nil {
 			slog.Warn("durdir on_start failed; goroutine will retry next iter",
@@ -108,15 +104,15 @@ func (r *durDirRuntime) iterate() {
 	}
 	user := val.(*durDirUser)
 
-	dynCfg := r.cfg.Dyn.Load()
+	dynCfg := dynconfig.Get[durDirKnobs](r.cfg.Dyn)
 	ctx := context.Background()
 	user.step(ctx, dynCfg)
 
 	time.Sleep(r.dynamicWait())
 }
 
-func (r *durDirRuntime) startUser(ctx context.Context, dynCfg dynconfig.Config) (*durDirUser, error) {
-	tmpl := dynCfg.DurDirTemplate
+func (r *durDirRuntime) startUser(ctx context.Context, dynCfg durDirKnobs) (*durDirUser, error) {
+	tmpl := dynCfg.Template
 	if tmpl == "" {
 		tmpl = defaultDurTemplate
 	}
@@ -127,7 +123,6 @@ func (r *durDirRuntime) startUser(ctx context.Context, dynCfg dynconfig.Config) 
 		templateName: tmpl,
 		userClass:    durDirUserClass,
 	}
-	u.hostHeader = u.actorName + "." + u.cfg.Atespace + "." + actorDomain
 	bmetrics.UpdateUsers(durDirUserClass, 1)
 	if err := u.ensureAtespace(ctx); err != nil {
 		bmetrics.UpdateUsers(durDirUserClass, -1)
@@ -138,7 +133,7 @@ func (r *durDirRuntime) startUser(ctx context.Context, dynCfg dynconfig.Config) 
 		return nil, err
 	}
 	if err := u.bootstrap(ctx, dynCfg); err != nil {
-		u.suspendAndDelete(ctx)
+		u.hibernateAndDelete(ctx, dynCfg)
 		bmetrics.UpdateUsers(durDirUserClass, -1)
 		return nil, err
 	}
@@ -146,9 +141,10 @@ func (r *durDirRuntime) startUser(ctx context.Context, dynCfg dynconfig.Config) 
 }
 
 func (r *durDirRuntime) shutdown(ctx context.Context) {
+	dynCfg := dynconfig.Get[durDirKnobs](r.cfg.Dyn)
 	r.users.Range(func(_, val any) bool {
 		u := val.(*durDirUser)
-		u.suspendAndDelete(ctx)
+		u.hibernateAndDelete(ctx, dynCfg)
 		bmetrics.UpdateUsers(durDirUserClass, -1)
 		return true
 	})
@@ -157,22 +153,21 @@ func (r *durDirRuntime) shutdown(ctx context.Context) {
 type durDirUser struct {
 	cfg            *userclass.Config
 	actorName      string
-	hostHeader     string
 	templateName   string
 	userClass      string
 	expectedDigest string
 	expectedSize   int64
 }
 
-func (u *durDirUser) ref() *ateapipb.ObjectRef {
-	return &ateapipb.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
+func (u *durDirUser) ref() *ateapi.ObjectRef {
+	return &ateapi.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
 }
 
 func (u *durDirUser) ensureAtespace(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateAtespace", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
-			Atespace: &ateapipb.Atespace{
-				Metadata: &ateapipb.ResourceMetadata{
+		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapi.CreateAtespaceRequest{
+			Atespace: &ateapi.Atespace{
+				Metadata: &ateapi.ResourceMetadata{
 					Name: u.cfg.Atespace,
 				},
 			},
@@ -189,10 +184,10 @@ func (u *durDirUser) ensureAtespace(ctx context.Context) error {
 
 func (u *durDirUser) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
-			Actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: u.templateName},
+		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapi.CreateActorRequest{
+			Actor: &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateAtespace, Name: u.templateName},
 			},
 		}, grpc.Trailer(tr))
 		return err
@@ -205,7 +200,7 @@ func (u *durDirUser) resume(ctx context.Context, mode string) bool {
 		return true
 	}
 	err := u.tracedCall(ctx, "ResumeActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
+		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapi.ResumeActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
 		return err
@@ -213,29 +208,55 @@ func (u *durDirUser) resume(ctx context.Context, mode string) bool {
 	return err == nil
 }
 
-func (u *durDirUser) suspend(ctx context.Context) {
-	_ = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor: u.ref(),
+func (u *durDirUser) pause(ctx context.Context) {
+	_ = u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
 }
 
-// suspendAndDelete suspends the actor before deleting it. DeleteActor requires
-// SUSPENDED or CRASHED; deleting a running actor leaks it. The suspend is
-// unmetered (teardown precondition, not benchmark latency), while the delete
-// is metered so true leaks still surface in failures.csv.
-func (u *durDirUser) suspendAndDelete(ctx context.Context) {
-	_, _ = u.cfg.APIStub.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-		Actor: u.ref(),
+func (u *durDirUser) suspend(ctx context.Context) {
+	_ = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+		}, grpc.Trailer(tr))
+		return err
 	})
+}
+
+func (u *durDirUser) hibernate(ctx context.Context, dynCfg durDirKnobs) {
+	if dynCfg.LifecycleMode == dynconfig.LifecycleModeSync {
+		u.suspend(ctx)
+	} else {
+		u.pause(ctx)
+	}
+}
+
+// hibernateAndDelete hibernates (suspends or pauses) the actor before deleting it.
+// The hibernate call is unmetered (teardown precondition, not benchmark latency),
+// while the delete is metered so true leaks still surface in failures.csv.
+func (u *durDirUser) hibernateAndDelete(ctx context.Context, dynCfg durDirKnobs) {
+	if dynCfg.LifecycleMode == dynconfig.LifecycleModeSync {
+		_, _ = u.cfg.APIStub.SuspendActor(ctx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+		})
+	} else {
+		_, _ = u.cfg.APIStub.SuspendActor(ctx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
+		})
+	}
 	u.delete(ctx)
 }
 
 func (u *durDirUser) delete(ctx context.Context) {
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
+		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapi.DeleteActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
 		return err
@@ -249,13 +270,13 @@ func (u *durDirUser) tracedCall(ctx context.Context, name string, do func(contex
 	start := time.Now()
 	var tr metadata.MD
 	err := do(ctx, &tr)
-	clientLatency := time.Since(start)
+	latency := time.Since(start)
 
-	latency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, clientLatency)
-	if source == boomerutil.SourceServer {
-		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(latency)))
+	// Report wall clock; the server's own elapsed time stays on the span.
+	if serverLatency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, 0); source == boomerutil.SourceServer {
+		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(serverLatency)))
 	}
-	boomerutil.LogSampledTrace(span, name, latency, source, err)
+	boomerutil.LogSampledTrace(span, name, latency, boomerutil.SourceClient, err)
 	if err != nil {
 		bmetrics.RecordFailure("grpc", name, u.userClass, latency, err.Error())
 		return err
@@ -264,23 +285,23 @@ func (u *durDirUser) tracedCall(ctx context.Context, name string, do func(contex
 	return nil
 }
 
-func (u *durDirUser) params(dynCfg dynconfig.Config) (int64, gluttonpb.ReadMode) {
-	fileSize := dynCfg.DurDirFileSize
+func (u *durDirUser) params(dynCfg durDirKnobs) (int64, gluttonpb.ReadMode) {
+	fileSize := dynCfg.FileSize
 	if fileSize <= 0 {
 		fileSize = defaultFileSize
 	}
 	readMode := gluttonpb.ReadMode_READ_MODE_DATA
-	if dynCfg.DurDirReadMode == dynconfig.ReadModeDigest {
+	if dynCfg.ReadMode == readModeDigest {
 		readMode = gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY
 	}
 	return fileSize, readMode
 }
 
-func (u *durDirUser) step(ctx context.Context, dynCfg dynconfig.Config) {
+func (u *durDirUser) step(ctx context.Context, dynCfg durDirKnobs) {
 	fileSize, readMode := u.params(dynCfg)
 
-	// 1. Suspend actor
-	u.suspend(ctx)
+	// 1. Suspend or pause actor
+	u.hibernate(ctx, dynCfg)
 
 	// 2. Resume — a no-op in implicit mode, where router traffic wakes the actor.
 	if !u.resume(ctx, dynCfg.ResumeMode) {
@@ -303,7 +324,7 @@ func (u *durDirUser) step(ctx context.Context, dynCfg dynconfig.Config) {
 	}
 }
 
-func (u *durDirUser) bootstrap(ctx context.Context, dynCfg dynconfig.Config) error {
+func (u *durDirUser) bootstrap(ctx context.Context, dynCfg durDirKnobs) error {
 	fileSize, readMode := u.params(dynCfg)
 
 	if !u.resume(ctx, dynCfg.ResumeMode) {
@@ -413,8 +434,8 @@ func (u *durDirUser) httpProtoCall(ctx context.Context, metricName, route string
 		bmetrics.RecordFailure("http", metricName, u.userClass, 0, err.Error())
 		return nil, err
 	}
-	httpReq.Host = u.hostHeader
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 
 	start := time.Now()

@@ -15,6 +15,7 @@
 package controlapi
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -24,22 +25,33 @@ import (
 	"errors"
 	"math/big"
 	"net/url"
+	"slices"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"go.ate.dev/substrate/internal/atelet"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/substratex509"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 )
 
 const testAteletSPIFFEID = "spiffe://cluster.local/ns/ate-system/sa/atelet"
+
+// ateletPort is the port every atelet dial target should carry.
+var ateletPort = strconv.Itoa(atelet.DefaultPort)
 
 // makeTestCA mints a self-signed CA and returns it along with an X.509 bundle
 // containing it as the sole authority for the cluster.local trust domain.
@@ -134,41 +146,17 @@ func makeLeafCert(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, o
 	return cert
 }
 
-// newDialerForPods builds an AteletDialer for testing.
-func newDialerForPods(t *testing.T, workerPod, ateletPod *corev1.Pod) *AteletDialer {
+// dialerWithAtelets builds an AteletDialer over the given atelet pods, dialing
+// with insecure test credentials.
+func dialerWithAtelets(t *testing.T, pods ...*corev1.Pod) *AteletDialer {
 	t.Helper()
-
-	workerIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
-		byNamespaceAndName: func(obj any) ([]string, error) {
-			pod := obj.(*corev1.Pod)
-			return []string{pod.ObjectMeta.Namespace + "/" + pod.ObjectMeta.Name}, nil
-		},
-	})
-	if err := workerIndexer.Add(workerPod); err != nil {
-		t.Fatalf("adding worker pod to indexer: %v", err)
-	}
-
-	ateletIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
-		byNode: func(obj any) ([]string, error) {
-			pod := obj.(*corev1.Pod)
-			return []string{pod.Spec.NodeName}, nil
-		},
-	})
-	if err := ateletIndexer.Add(ateletPod); err != nil {
-		t.Fatalf("adding atelet pod to indexer: %v", err)
-	}
-
-	return &AteletDialer{
-		workerIndexer: workerIndexer,
-		ateletIndexer: ateletIndexer,
-		ateletConns:   newAteletConnCache(16),
-		dialCredentials: func(string) (credentials.TransportCredentials, error) {
+	return NewAteletDialer(newTestAteletIndexer(t, pods...), installdefaults.SystemNamespace, "", "",
+		WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
 			return insecure.NewCredentials(), nil
-		},
-	}
+		}))
 }
 
-func TestDialForWorkerTarget(t *testing.T) {
+func TestDialForAteletOnNodeTarget(t *testing.T) {
 	tests := []struct {
 		name       string
 		ateletIP   string
@@ -177,36 +165,32 @@ func TestDialForWorkerTarget(t *testing.T) {
 		{
 			name:       "IPv4 atelet",
 			ateletIP:   "10.244.1.7",
-			wantTarget: "10.244.1.7:8085",
+			wantTarget: "10.244.1.7:" + ateletPort,
 		},
 		{
 			name:       "IPv6 atelet is bracketed",
 			ateletIP:   "fd00:10:244::7",
-			wantTarget: "[fd00:10:244::7]:8085",
+			wantTarget: "[fd00:10:244::7]:" + ateletPort,
 		},
 		{
 			name:       "IPv6 loopback is bracketed",
 			ateletIP:   "::1",
-			wantTarget: "[::1]:8085",
+			wantTarget: "[::1]:" + ateletPort,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			workerPod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "worker-1", UID: "worker-uid"},
-				Spec:       corev1.PodSpec{NodeName: "node-1"},
-			}
 			ateletPod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Namespace: ateletNamespace, Name: "atelet-abc", UID: "atelet-uid"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-abc", UID: "atelet-uid"},
 				Spec:       corev1.PodSpec{NodeName: "node-1"},
 				Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: tc.ateletIP}}},
 			}
 
-			d := newDialerForPods(t, workerPod, ateletPod)
-			conn, err := d.DialForWorker("team-a", "worker-1")
+			d := dialerWithAtelets(t, ateletPod)
+			conn, err := d.DialForAteletOnNode("node-1")
 			if err != nil {
-				t.Fatalf("DialForWorker returned error: %v", err)
+				t.Fatalf("DialForAteletOnNode returned error: %v", err)
 			}
 			t.Cleanup(func() { conn.Close() })
 
@@ -217,34 +201,15 @@ func TestDialForWorkerTarget(t *testing.T) {
 	}
 }
 
-func TestDialForWorkerErrors(t *testing.T) {
-	workerPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "worker-1", UID: "worker-uid"},
+func TestDialForAteletOnNodeNoIPs(t *testing.T) {
+	ateletPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-abc", UID: "atelet-uid"},
 		Spec:       corev1.PodSpec{NodeName: "node-1"},
 	}
-
-	t.Run("unknown worker pod", func(t *testing.T) {
-		ateletPod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ateletNamespace, Name: "atelet-abc", UID: "atelet-uid"},
-			Spec:       corev1.PodSpec{NodeName: "node-1"},
-			Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.244.1.7"}}},
-		}
-		d := newDialerForPods(t, workerPod, ateletPod)
-		if _, err := d.DialForWorker("team-a", "no-such-worker"); !errors.Is(err, ErrWorkerPodNotFound) {
-			t.Fatalf("DialForWorker error = %v, want ErrWorkerPodNotFound", err)
-		}
-	})
-
-	t.Run("atelet without assigned IPs", func(t *testing.T) {
-		ateletPod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ateletNamespace, Name: "atelet-abc", UID: "atelet-uid"},
-			Spec:       corev1.PodSpec{NodeName: "node-1"},
-		}
-		d := newDialerForPods(t, workerPod, ateletPod)
-		if _, err := d.DialForWorker("team-a", "worker-1"); err == nil {
-			t.Fatal("DialForWorker succeeded, want error for atelet with no IPs")
-		}
-	})
+	d := dialerWithAtelets(t, ateletPod)
+	if _, err := d.DialForAteletOnNode("node-1"); err == nil {
+		t.Fatal("DialForAteletOnNode succeeded, want error for atelet with no IPs")
+	}
 }
 
 func TestVerifyAteletServerCert(t *testing.T) {
@@ -336,6 +301,48 @@ func TestVerifyAteletServerCert(t *testing.T) {
 	})
 }
 
+// nodeGetter answers like the API server: the named nodes exist, others are
+// NotFound, and lookupErr, when set, fails every read.
+func nodeGetter(lookupErr error, names ...string) func(context.Context, string) error {
+	return func(_ context.Context, node string) error {
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if slices.Contains(names, node) {
+			return nil
+		}
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, node)
+	}
+}
+
+func TestNodeGone(t *testing.T) {
+	spiffeID := installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace)
+	atelet := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ate-system", Name: "atelet-1"},
+		Spec:       corev1.PodSpec{NodeName: "node1"},
+	}
+	unavailable := apierrors.NewServiceUnavailable("etcd is down")
+	for _, tc := range []struct {
+		name     string
+		dialer   *AteletDialer
+		wantGone bool
+		wantErr  bool
+	}{
+		{name: "node deleted", dialer: NewAteletDialer(newTestAteletIndexer(t), spiffeID, "", "", WithNodeGetter(nodeGetter(nil, "node2"))), wantGone: true},
+		{name: "node exists", dialer: NewAteletDialer(newTestAteletIndexer(t), spiffeID, "", "", WithNodeGetter(nodeGetter(nil, "node1")))},
+		{name: "lookup fails", dialer: NewAteletDialer(newTestAteletIndexer(t), spiffeID, "", "", WithNodeGetter(nodeGetter(unavailable))), wantErr: true},
+		{name: "atelet registered meanwhile", dialer: NewAteletDialer(newTestAteletIndexer(t, atelet), spiffeID, "", "", WithNodeGetter(nodeGetter(nil)))},
+		{name: "no node getter", dialer: NewAteletDialer(newTestAteletIndexer(t), spiffeID, "", "")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gone, err := tc.dialer.NodeGone(context.Background(), "node1")
+			if gone != tc.wantGone || (err != nil) != tc.wantErr {
+				t.Fatalf("NodeGone = %v, %v; want %v, error %v", gone, err, tc.wantGone, tc.wantErr)
+			}
+		})
+	}
+}
+
 // newTestAteletIndexer builds an indexer with the production byNode index
 // shape, holding the given atelet pods.
 func newTestAteletIndexer(t *testing.T, pods ...*corev1.Pod) cache.Indexer {
@@ -363,17 +370,17 @@ func TestDialForAteletOnNode(t *testing.T) {
 	}
 
 	t.Run("no atelet on node", func(t *testing.T) {
-		d := NewAteletDialer(nil, newTestAteletIndexer(t), "", "")
+		d := NewAteletDialer(newTestAteletIndexer(t), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "")
 		if _, err := d.DialForAteletOnNode("node1"); !errors.Is(err, ErrNoAteletOnNode) {
 			t.Fatalf("DialForAteletOnNode = %v, want ErrNoAteletOnNode", err)
 		}
 	})
 
 	t.Run("more than one atelet on node", func(t *testing.T) {
-		d := NewAteletDialer(nil, newTestAteletIndexer(t,
+		d := NewAteletDialer(newTestAteletIndexer(t,
 			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
 			ateletPod("atelet-2", "uid-2", "node1", "10.0.0.2"),
-		), "", "")
+		), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "")
 		_, err := d.DialForAteletOnNode("node1")
 		if err == nil || errors.Is(err, ErrNoAteletOnNode) {
 			t.Fatalf("DialForAteletOnNode = %v, want a non-ErrNoAteletOnNode error", err)
@@ -381,9 +388,9 @@ func TestDialForAteletOnNode(t *testing.T) {
 	})
 
 	t.Run("dials and caches the node's atelet", func(t *testing.T) {
-		d := NewAteletDialer(nil, newTestAteletIndexer(t,
+		d := NewAteletDialer(newTestAteletIndexer(t,
 			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
-		), "", "")
+		), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "")
 		var credsUID string
 		d.dialCredentials = func(expectedPodUID string) (credentials.TransportCredentials, error) {
 			credsUID = expectedPodUID
@@ -406,11 +413,92 @@ func TestDialForAteletOnNode(t *testing.T) {
 		}
 	})
 
+	t.Run("redials when the atelet pod's IP changes", func(t *testing.T) {
+		idx := newTestAteletIndexer(t, ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"))
+		d := NewAteletDialer(idx, installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+			WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+				return insecure.NewCredentials(), nil
+			}))
+
+		old, err := d.DialForAteletOnNode("node1")
+		if err != nil {
+			t.Fatalf("DialForAteletOnNode: %v", err)
+		}
+
+		// Same pod UID, new IP, as after a node restart.
+		if err := idx.Update(ateletPod("atelet-1", "uid-1", "node1", "10.0.0.9")); err != nil {
+			t.Fatalf("updating pod in indexer: %v", err)
+		}
+		fresh, err := d.DialForAteletOnNode("node1")
+		if err != nil {
+			t.Fatalf("DialForAteletOnNode after IP change: %v", err)
+		}
+		t.Cleanup(func() { fresh.Close() })
+
+		if fresh == old {
+			t.Fatal("DialForAteletOnNode returned the stale connection after the IP changed")
+		}
+		if got, want := fresh.Target(), "10.0.0.9:"+ateletPort; got != want {
+			t.Errorf("dial target = %q, want %q", got, want)
+		}
+		if got := old.GetState(); got != connectivity.Shutdown {
+			t.Errorf("stale conn state = %v, want %v", got, connectivity.Shutdown)
+		}
+		if d.ateletConns.Len() != 1 {
+			t.Errorf("cache holds %d conns, want 1", d.ateletConns.Len())
+		}
+		if again, err := d.DialForAteletOnNode("node1"); err != nil || again != fresh {
+			t.Errorf("DialForAteletOnNode = %v, %v, want the new cached connection", again, err)
+		}
+	})
+
+	t.Run("concurrent callers share one conn after the IP changes", func(t *testing.T) {
+		idx := newTestAteletIndexer(t, ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"))
+		d := NewAteletDialer(idx, installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+			WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+				return insecure.NewCredentials(), nil
+			}))
+		if _, err := d.DialForAteletOnNode("node1"); err != nil {
+			t.Fatalf("DialForAteletOnNode: %v", err)
+		}
+		if err := idx.Update(ateletPod("atelet-1", "uid-1", "node1", "10.0.0.9")); err != nil {
+			t.Fatalf("updating pod in indexer: %v", err)
+		}
+
+		const callers = 32
+		conns := make([]*grpc.ClientConn, callers)
+		var wg sync.WaitGroup
+		for i := range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conn, err := d.DialForAteletOnNode("node1")
+				if err != nil {
+					t.Errorf("DialForAteletOnNode: %v", err)
+				}
+				conns[i] = conn
+			}()
+		}
+		wg.Wait()
+
+		for i, conn := range conns {
+			if conn != conns[0] {
+				t.Fatalf("caller %d got a different conn than caller 0", i)
+			}
+		}
+		if got := conns[0].GetState(); got == connectivity.Shutdown {
+			t.Error("shared conn was closed by a concurrent caller")
+		}
+		if d.ateletConns.Len() != 1 {
+			t.Errorf("cache holds %d conns, want 1", d.ateletConns.Len())
+		}
+	})
+
 	t.Run("closes conns evicted from the cache", func(t *testing.T) {
-		d := NewAteletDialer(nil, newTestAteletIndexer(t,
+		d := NewAteletDialer(newTestAteletIndexer(t,
 			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
 			ateletPod("atelet-2", "uid-2", "node2", "10.0.0.2"),
-		), "", "", WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+		), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "", WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
 			return insecure.NewCredentials(), nil
 		}))
 		d.ateletConns = newAteletConnCache(1)

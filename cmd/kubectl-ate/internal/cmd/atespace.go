@@ -1,0 +1,126 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/kubectl-ate/internal/printer"
+)
+
+var getAtespacesCmd = &cobra.Command{
+	Use:     "atespace [atespace-name ...]",
+	Aliases: []string{"atespaces"},
+	Short:   "List all atespaces or get one or more atespaces",
+	Args:    cobra.ArbitraryArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		apiClient, err := newAPIClient(cmd)
+		if err != nil {
+			return fmt.Errorf("failed to connect to ate-api-server: %w", err)
+		}
+		defer apiClient.Close()
+
+		if len(args) > 0 {
+			atespaces := make([]*ateapi.Atespace, 0, len(args))
+			for _, atespaceName := range args {
+				resp, err := apiClient.GetAtespace(ctx, &ateapi.GetAtespaceRequest{Atespace: &ateapi.ObjectRef{Name: atespaceName}})
+				if err != nil {
+					return fmt.Errorf("failed to get atespace %q: %w", atespaceName, err)
+				}
+				atespaces = append(atespaces, resp)
+			}
+			if len(atespaces) == 1 {
+				return printer.PrintAtespaceTo(cmd.OutOrStdout(), atespaces[0], outputFmt)
+			}
+			return printer.PrintAtespacesTo(cmd.OutOrStdout(), atespaces, outputFmt)
+		}
+
+		var allAtespaces []*ateapi.Atespace
+		pageToken := ""
+		for {
+			resp, err := apiClient.ListAtespaces(ctx, &ateapi.ListAtespacesRequest{
+				Options: &ateapi.ListOptions{PageSize: 1000, PageToken: pageToken},
+			})
+			if err != nil {
+				return fmt.Errorf("failed to list atespaces: %w", err)
+			}
+			allAtespaces = append(allAtespaces, resp.GetAtespaces()...)
+
+			pageToken = resp.GetNextPageToken()
+			if pageToken == "" {
+				break
+			}
+		}
+		return printer.PrintAtespacesTo(cmd.OutOrStdout(), allAtespaces, outputFmt)
+	},
+}
+
+var createAtespaceCmd = &cobra.Command{
+	Use:   "atespace <atespace-name>",
+	Short: "Create an atespace",
+	Args:  exactlyOneArg("<atespace-name>"),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		apiClient, err := newAPIClient(cmd)
+		if err != nil {
+			return fmt.Errorf("failed to connect to ate-api-server: %w", err)
+		}
+		defer apiClient.Close()
+
+		resp, err := apiClient.CreateAtespace(ctx, &ateapi.CreateAtespaceRequest{
+			Atespace: &ateapi.Atespace{
+				Metadata: &ateapi.ResourceMetadata{
+					Name: args[0],
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create atespace: %w", err)
+		}
+
+		return printer.PrintAtespaceTo(cmd.OutOrStdout(), resp, outputFmt)
+	},
+}
+
+var deleteAtespaceCmd = &cobra.Command{
+	Use:   "atespace <atespace-name>",
+	Short: "Delete an empty atespace (fails if any actors remain)",
+	Args:  exactlyOneArg("<atespace-name>"),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		apiClient, err := newAPIClient(cmd)
+		if err != nil {
+			return fmt.Errorf("failed to connect to ate-api-server: %w", err)
+		}
+		defer apiClient.Close()
+
+		name := args[0]
+		if _, err := apiClient.DeleteAtespace(ctx, &ateapi.DeleteAtespaceRequest{Atespace: &ateapi.ObjectRef{Name: name}}); err != nil {
+			return fmt.Errorf("failed to delete atespace: %w", err)
+		}
+
+		fmt.Printf("atespace %q deleted\n", name)
+		return nil
+	},
+}
+
+func init() {
+	getCmd.AddCommand(getAtespacesCmd)
+	createCmd.AddCommand(createAtespaceCmd)
+	deleteCmd.AddCommand(deleteAtespaceCmd)
+}

@@ -26,14 +26,13 @@ import (
 	"path"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
-	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/substratex509"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/signercontroller"
+	"go.ate.dev/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/substratex509"
+	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 )
 
@@ -41,17 +40,14 @@ const Name = "podidentity.podcert.ate.dev/identity"
 const CTBPrefix = "podidentity.podcert.ate.dev:identity:"
 
 type Impl struct {
-	kc     kubernetes.Interface
-	caPool localca.Pool
-
-	clock clock.PassiveClock
+	pcrClient *podcertificate.Client
+	caPool    localca.Pool
 }
 
-func NewImpl(kc kubernetes.Interface, caPool localca.Pool, clock clock.PassiveClock) *Impl {
+func NewImpl(caPool localca.Pool, pcrClient *podcertificate.Client) *Impl {
 	return &Impl{
-		kc:     kc,
-		caPool: caPool,
-		clock:  clock,
+		pcrClient: pcrClient,
+		caPool:    caPool,
 	}
 }
 
@@ -61,7 +57,7 @@ func (h *Impl) SignerName() string {
 	return Name
 }
 
-func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
+func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
 	trustAnchors, err := h.caPool.TrustAnchors()
@@ -78,35 +74,30 @@ func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle,
 		_, _ = wantTrustBundle.Write(block)
 	}
 
-	wantCTB := &certsv1beta1.ClusterTrustBundle{
+	wantCTB := &certsv1.ClusterTrustBundle{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Labels: map[string]string{
 				"podcert.ate.dev/canarying": "live",
 			},
 		},
-		Spec: certsv1beta1.ClusterTrustBundleSpec{
+		Spec: certsv1.ClusterTrustBundleSpec{
 			SignerName:  Name,
 			TrustBundle: wantTrustBundle.String(),
 		},
 	}
 
-	return []*certsv1beta1.ClusterTrustBundle{
+	return []*certsv1.ClusterTrustBundle{
 		wantCTB,
 	}, nil
 }
 
 func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
-	// Fetch the pod to get its ServiceAccount
-	pod, err := h.kc.CoreV1().Pods(pcr.ObjectMeta.Namespace).Get(ctx, pcr.Spec.PodName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("while getting pod %s/%s: %w", pcr.ObjectMeta.Namespace, pcr.Spec.PodName, err)
-	}
-
-	if pod.ObjectMeta.UID != pcr.Spec.PodUID {
-		return fmt.Errorf("pod UID mismatch: expected %s, got %s", pcr.Spec.PodUID, pod.ObjectMeta.UID)
-	}
-
+	// The identity comes from the PCR spec alone. kube-apiserver attests it
+	// for kubelet-created requests (the pod, ServiceAccount and node exist and
+	// belong together); anyone else needs RBAC permission to create
+	// PodCertificateRequests and may name any identity, which is how
+	// non-kubelet clients such as the e2e suites obtain certificates.
 	subjectPublicKey, err := podcertificate.PublicKey(pcr)
 	if err != nil {
 		return err
@@ -118,7 +109,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		lifetime = requestedLifetime
 	}
 
-	notBefore := h.clock.Now().Add(-2 * time.Minute)
+	notBefore := time.Now().Add(-2 * time.Minute)
 	notAfter := notBefore.Add(lifetime)
 	beginRefreshAt := notAfter.Add(-30 * time.Minute)
 
@@ -147,7 +138,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		// AuthorityKeyID is automatically set to the SubjectKeyID of the parent
-		// certificate.
+		// certificate, as long as we are not self-signing a root.
 	}
 
 	// Fields are sourced from the PCR spec (attested by kube-apiserver) rather
@@ -188,7 +179,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 			Status:             metav1.ConditionTrue,
 			Reason:             "Reason",
 			Message:            "Issued",
-			LastTransitionTime: metav1.NewTime(h.clock.Now()),
+			LastTransitionTime: metav1.NewTime(time.Now()),
 		},
 	}
 	pcr.Status.CertificateChain = chainPEM.String()
@@ -196,7 +187,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 	pcr.Status.BeginRefreshAt = ptr.To(metav1.NewTime(beginRefreshAt))
 	pcr.Status.NotAfter = ptr.To(metav1.NewTime(notAfter))
 
-	_, err = h.kc.CertificatesV1beta1().PodCertificateRequests(pcr.ObjectMeta.Namespace).UpdateStatus(ctx, pcr, metav1.UpdateOptions{})
+	err = h.pcrClient.UpdateStatus(ctx, pcr)
 	if err != nil {
 		return fmt.Errorf("while updating PodCertificateRequest: %w", err)
 	}

@@ -25,14 +25,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/portforward"
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"k8s.io/client-go/kubernetes"
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // grpcEchoFixtureManifests name the fixture this suite installs to get a
@@ -46,7 +45,7 @@ var grpcEchoFixtureManifests = e2e.SubstrateFixtureManifests{
 
 // TestIngressProtocolDowngrade pins the ingress protocol contract end to end:
 // a client that negotiates HTTP/2 with the router must still be able to reach
-// an HTTP/1.1-only actor (the counter demo), because the atunnel leg
+// an HTTP/1.1-only actor (the counter demo), because ingress
 // downgrades non-gRPC traffic to HTTP/1.1. A gRPC-shaped request, by
 // contrast, is carried to the actor as real HTTP/2 — so against this
 // non-gRPC actor it must fail loudly rather than silently fall back to
@@ -56,20 +55,21 @@ var grpcEchoFixtureManifests = e2e.SubstrateFixtureManifests{
 // actor that really does speak gRPC.
 func TestIngressProtocolDowngrade(t *testing.T) {
 	ctx := context.Background()
-	actorName, _ := createAndResumeSubstrateActor(t, ctx, "protodowngrade", e2e.SubstrateCounterFixture())
+	_, actorName, _ := createAndResumeSubstrateActor(t, ctx, "protodowngrade", e2e.SubstrateCounterFixture())
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
 
-	base := "http://" + routerAddress(t, ctx)
-
-	h1 := &http.Client{Timeout: 30 * time.Second}
-	h2c := &http.Client{Transport: h2cTransport(), Timeout: 30 * time.Second}
+	rc := mustRouterClient(t, ctx)
+	t.Cleanup(rc.Close)
+	base := rc.BaseURL()
+	h1 := &http.Client{Transport: routerTransport(rc, false), Timeout: 30 * time.Second}
+	h2 := &http.Client{Transport: routerTransport(rc, true), Timeout: 30 * time.Second}
 
 	request := func(client *http.Client, method, path, contentType string) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, method, base+path, http.NoBody)
 		if err != nil {
 			return nil, err
 		}
-		req.Host = resources.ActorDNSName(actorRef)
+		req.Header.Set(atenet.TargetActorHeader, actorRef.String())
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
@@ -83,9 +83,9 @@ func TestIngressProtocolDowngrade(t *testing.T) {
 	})
 
 	t.Run("h2 client reaches h1-only actor", func(t *testing.T) {
-		resp, err := request(h2c, http.MethodGet, "/readyz", "")
+		resp, err := request(h2, http.MethodGet, "/readyz", "")
 		if err != nil {
-			t.Fatalf("h2c request through ingress: %v", err)
+			t.Fatalf("h2 request through ingress: %v", err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -93,24 +93,29 @@ func TestIngressProtocolDowngrade(t *testing.T) {
 			t.Errorf("downstream proto = %s, want HTTP/2.0 (the client really negotiated h2)", resp.Proto)
 		}
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("h2c GET = %d (body %q), want 200: non-gRPC HTTP/2 must be downgraded for HTTP/1.1-only actors", resp.StatusCode, body)
+			t.Fatalf("h2 GET = %d (body %q), want 200: non-gRPC HTTP/2 must be downgraded for HTTP/1.1-only actors", resp.StatusCode, body)
 		}
 		if !strings.Contains(string(body), "ok") {
-			t.Errorf("h2c GET body = %q, want the actor's readyz payload", body)
+			t.Errorf("h2 GET body = %q, want the actor's health payload", body)
 		}
 	})
 
 	t.Run("grpc to non-grpc actor fails loudly", func(t *testing.T) {
-		resp, err := request(h2c, http.MethodPost, "/count", "application/grpc")
+		resp, err := request(h2, http.MethodPost, "/count", "application/grpc")
 		if err != nil {
 			t.Fatalf("gRPC-shaped request through ingress: %v", err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// atunnel forwards gRPC as real h2c, which the HTTP/1.1-only counter
-		// cannot speak — a 502 from atunnel, not a silently-downgraded 200.
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("gRPC-shaped POST = %d (body %q), want 502: gRPC must not be silently downgraded to HTTP/1.1", resp.StatusCode, body)
+		// The counter cannot speak h2c. Both dataplanes reach atunnel through
+		// a CONNECT tunnel, where the failure is gRPC's Unavailable status. An
+		// HTTP 502 means Envoy went through atunnel's HTTPS listener instead.
+		grpcStatus := resp.Header.Get("Grpc-Status")
+		if grpcStatus == "" {
+			grpcStatus = resp.Trailer.Get("Grpc-Status")
+		}
+		if resp.StatusCode != http.StatusOK || grpcStatus != "14" {
+			t.Fatalf("gRPC-shaped POST = %d, grpc-status %q (body %q), want gRPC Unavailable: gRPC must not be silently downgraded to HTTP/1.1", resp.StatusCode, grpcStatus, body)
 		}
 	})
 }
@@ -132,26 +137,26 @@ func TestIngressProtocolDowngrade(t *testing.T) {
 // deploys as a plain pod, so the two directions cannot disagree about what a
 // working RPC is.
 func TestIngressGRPC(t *testing.T) {
-	env, err := e2e.CheckEnv("BUCKET_NAME", "KO_DOCKER_REPO")
-	if err != nil {
+	if _, err := e2e.CheckEnv("KO_DOCKER_REPO"); err != nil {
 		t.Fatalf("CheckEnv failed: %v", err)
 	}
 	ctx := context.Background()
 
-	fixture := deployGRPCEchoTemplate(t, ctx, env["BUCKET_NAME"])
-	actorName, _ := createAndResumeSubstrateActor(t, ctx, "grpcingress", fixture)
+	fixture := deployGRPCEchoTemplate(t, ctx)
+	_, actorName, _ := createAndResumeSubstrateActor(t, ctx, "grpcingress", fixture)
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
-
-	// Cleartext h2c to the router's HTTP port, with the Actor's DNS name as the
-	// :authority — the same routing key every other ingress test in this suite
-	// uses, just carried by a gRPC client instead of an HTTP one. The h2 ALPN
-	// offer is about the *TLS* listener; nothing here needs it.
-	conn, err := grpc.NewClient(routerAddress(t, ctx),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithAuthority(resources.ActorDNSName(actorRef)),
+	ctx = metadata.AppendToOutgoingContext(ctx,
+		atenet.TargetActorHeader, actorRef.String(),
 	)
+
+	// h2 negotiated by ALPN on the router's TLS port. Explicit metadata
+	// identifies the Actor; the conventional actor authority remains
+	// application metadata.
+	rc := mustRouterClient(t, ctx)
+	t.Cleanup(rc.Close)
+	conn, err := grpc.NewClient(rc.Address(), grpc.WithTransportCredentials(credentials.NewTLS(rc.TLSConfig())))
 	if err != nil {
-		t.Fatalf("creating the gRPC client for %s: %v", resources.ActorDNSName(actorRef), err)
+		t.Fatalf("creating the gRPC client for %s: %v", actorRef, err)
 	}
 	defer conn.Close()
 	client := grpcechopb.NewEchoClient(conn)
@@ -256,9 +261,9 @@ func TestIngressGRPC(t *testing.T) {
 // under test, waits for its golden snapshot and returns it. The suite gets its
 // own copy of the fixture: suite packages run as concurrent processes, so a
 // shared one would be deleted out from under another.
-func deployGRPCEchoTemplate(t *testing.T, ctx context.Context, bucket string) e2e.SubstrateFixture {
+func deployGRPCEchoTemplate(t *testing.T, ctx context.Context) e2e.SubstrateFixture {
 	t.Helper()
-	atespace, _ := e2e.DeploySubstrateFixture(t, ctx, e2e.GetClients(), grpcEchoFixtureManifests, bucket, "networking", false)
+	atespace, _ := e2e.DeploySubstrateFixture(t, ctx, e2e.GetClients(), grpcEchoFixtureManifests, "networking", nil)
 	return e2e.SubstrateFixture{
 		Atespace:   atespace,
 		Name:       "grpcecho",
@@ -289,37 +294,21 @@ func waitForGRPCRouteReady(t *testing.T, ctx context.Context, client grpcechopb.
 	}
 }
 
-// routerAddress port-forwards to atenet-router's HTTP port and returns the
-// local host:port, torn down when the test ends.
+// routerTransport returns an HTTP transport for rc's router listener that
+// speaks HTTP/2, negotiated by ALPN, when http2 is set and HTTP/1.1 otherwise.
 //
-// e2e.RouterClient is not usable here: it speaks HTTP/1.1 only, and the whole
-// point of both tests in this file is to control the protocol the client
-// negotiates with the router.
-func routerAddress(t *testing.T, ctx context.Context) string {
-	t.Helper()
-	config, err := ateclient.LoadConfig(e2e.KubeConfig, e2e.KubeContext)
-	if err != nil {
-		t.Fatalf("loading kubeconfig: %v", err)
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		t.Fatalf("creating k8s client: %v", err)
-	}
-	localPort, stop, err := portforward.ServicePortForward(ctx, config, clientset, "ate-system", "atenet-router", 80)
-	if err != nil {
-		t.Fatalf("port-forwarding to the router: %v", err)
-	}
-	t.Cleanup(stop)
-	return fmt.Sprintf("127.0.0.1:%d", localPort)
-}
-
-// h2cTransport is an HTTP transport that speaks cleartext HTTP/2 by prior
-// knowledge, so a test can reach the router's plain HTTP port as an h2 client
-// without any ALPN negotiation.
-func h2cTransport() *http.Transport {
+// e2e.RouterClient's own client is not usable here: it speaks HTTP/1.1 only,
+// and the whole point of both tests in this file is to control the protocol
+// the client negotiates with the router.
+func routerTransport(rc *e2e.RouterClient, http2 bool) *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = rc.TLSConfig()
 	protocols := new(http.Protocols)
-	protocols.SetUnencryptedHTTP2(true)
+	if http2 {
+		protocols.SetHTTP2(true)
+	} else {
+		protocols.SetHTTP1(true)
+	}
 	transport.Protocols = protocols
 	return transport
 }

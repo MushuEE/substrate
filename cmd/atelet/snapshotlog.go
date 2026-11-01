@@ -15,16 +15,13 @@
 package main
 
 import (
-	"errors"
 	"log/slog"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/status"
 )
-
-// errRestoreUnwound stands in for a restore that left through a panic, where the
-// named error is still nil. Carries no reason, so it reports as UNKNOWN.
-var errRestoreUnwound = errors.New("restore did not run to completion")
 
 // snapshotLogAttrs renders what recordPhases measures as a per-actor record. The
 // histograms cannot be one: actor identity is barred from metric labels
@@ -35,6 +32,12 @@ var errRestoreUnwound = errors.New("restore did not run to completion")
 // the values are seconds and not the nanoseconds slog.Duration writes: that
 // instrument declares unit s. Identity stays out of snapshotOp so no edit here
 // can route it into a datapoint.
+//
+// err is the operation's outcome. The record is written on the way out of a
+// failed operation too, so that its completed phases are not lost; error.type
+// (the gRPC code, as on the ateapi instruments) marks it so a reader does not
+// average a timed-out download in with the successful ones. Absence means
+// success, as on the instruments.
 func snapshotLogAttrs(a resources.ActorAttribution, op snapshotOp, durationKey string, err error, phases []phase) []slog.Attr {
 	attrs := ateattr.ActorLogAttrs(a)
 
@@ -53,12 +56,21 @@ func snapshotLogAttrs(a resources.ActorAttribution, op snapshotOp, durationKey s
 		attrs = append(attrs, slog.String(string(kv.Key), kv.Value.String()))
 	}
 
-	// Absence means success, as on the instruments. There is no ate.snapshot.phase:
-	// on a datapoint it names the one step timed, and this record carries them all.
 	if err != nil {
-		attrs = append(attrs, ateattr.FailureLogAttrs(ateattr.FailureReason(err))...)
+		// The code atelet chose, or the context's (a timed-out download, a
+		// cancelled restore); failing that, the code of a failed upstream
+		// call, which tells its failures apart even though atelet's caller
+		// only sees Internal.
+		s, ok := apierror.FromError(err)
+		code := s.Code()
+		if !ok {
+			code = status.Code(err)
+		}
+		attrs = append(attrs, slog.String(string(ateattr.ErrorTypeKey), code.String()))
 	}
 
+	// There is no ate.snapshot.phase key: on a datapoint it names the one step
+	// timed, and this record carries them all.
 	for _, p := range phases {
 		if p.d == 0 {
 			continue

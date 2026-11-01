@@ -26,8 +26,9 @@
 registry_version: 1
 
 # The version of the upstream semantic conventions that Substrate borrows from.
-# Substrate takes error.type, file.name and the rpc.* attributes from it. This
-# is the only version that the code imports under cmd/, internal/ and pkg/.
+# Substrate takes error.type, file.name, the rpc.* attributes and server.port
+# from it. This is the only version that the code imports under cmd/, internal/
+# and pkg/.
 # It is not the version of this registry: manifest.yaml holds that.
 upstream_semconv_version: 1.40.0
 
@@ -124,9 +125,9 @@ bridged_metric_families:
 # -----------------------------------------------------------------------------
 # The rules that keep the number of series small
 #
-# No rule is enforced at this time. This PR adds the registry only. Each rule
-# says what could enforce it, so that a reader knows the difference between a
-# rule that a machine holds and a rule that a person holds.
+# No rule is enforced at this time. Each rule says what could enforce it, so
+# that a reader knows the difference between a rule that a machine holds and a
+# rule that a person holds.
 # -----------------------------------------------------------------------------
 cardinality_rules:
   - id: no-actor-identity
@@ -147,59 +148,34 @@ cardinality_rules:
       - ate.atespace
       - ate.actor.version
       - ate.actor.container.name
+      - ate.actor.epoch
   - id: bounded-or-catalog-scoped
     brief: >
       Each ate.* metric label has a list of permitted values, or it names an
       object that an operator made. The names of the templates and the pools
-      never come from a request.
+      never come from a request. One exception: on
+      atenet.router.route.duration, ate.template.atespace and ate.template.name
+      hold the literal "unknown" when the router has no template to name. The
+      router sends that constant in place of the empty string. It does not send
+      a value that the request gave.
     enforced: false
     could_be_enforced_by: >
       A Weaver Rego policy can make each ate.* attribute of type string give a
       reason. Only `weaver registry live-check` can count the values that occur.
   - id: error-type-not-parallel-counters
     brief: >
-      A component reports a failure with error.type or ate.failure.reason on the
-      same instrument. If the key is absent, the operation was correct. There
-      are no separate counters for the failures.
+      A component reports a failure with error.type on the same instrument. If
+      the key is absent, the operation was correct. There are no separate
+      counters for the failures.
     enforced: false
     could_be_enforced_by: >
       A Weaver Rego policy can refuse a metric name that ends with errors_total
       and has a counterpart without the suffix.
-  - id: failure-keys-paired
-    brief: >
-      A component sets ate.failure.reason and ate.failure.domain together, or it
-      sets neither. ateattr.FailureAttributes and ateattr.FailureLogAttrs return
-      the pair, and a producer uses one of them rather than the keys.
-      The domain is a strict function of the reason, so it adds no series. It is
-      a key and not a rule in the consumer because the reasons of a component
-      ahead of the control plane can be unknown to the control plane, which
-      makes them UNKNOWN, and a consumer that matched on the names of the
-      reasons would count each of those as an infrastructure fault.
-    enforced: false
-    could_be_enforced_by: >
-      A Weaver Rego policy can make the two keys occur together in this
-      registry. Only live-check can see a component that sends one key.
-  - id: workload-domain-is-a-report
-    brief: >
-      Some of the reasons in the workload domain are what the actor reported
-      about itself: an exit code, or a probe that never passes. The actor
-      chooses those, thus it decides the value. It can raise the count of the
-      failures of its own template and pool, and it can exit 0 to hide a fault.
-      A dashboard says "reported" for those, and an alert on them has a rate
-      limit; one report for each activation is the bound. The reasons that
-      Substrate measures, such as a template that resolves to no runnable
-      process, carry no such caveat.
-    enforced: false
-    could_be_enforced_by: >
-      Nothing. This is a property of a multi-tenant platform and not of the
-      registry. It is here so that a reader of the panel knows what the number
-      is.
   - id: pool-keys-paired
     brief: >
       A component sets ate.workerpool.namespace and ate.workerpool.name
       together, or it sets no pool key. One key alone does not identify a pool.
-      ate.scheduler.eligible_workers is the one exception. It sends both keys
-      empty to show that no worker is available.
+      No instrument is an exception.
     enforced: false
     could_be_enforced_by: >
       A Weaver Rego policy can make the two keys occur together in this
@@ -250,17 +226,35 @@ blind_spots:
       The hit and miss counter exists. But the garbage collector (the 85% and
       80% limits) and the time to prepare an image send nothing. Thus you cannot
       see the disk pressure from the layer pool.
-  - area: atenet-dns
-    code: cmd/atenet/internal/dns.go
-    brief: >
-      There are no instruments, and the Corefile has no prometheus plugin. If a
-      reload fails, the answers stay old and no signal shows it.
   - area: podcertcontroller
     code: cmd/podcertcontroller
     brief: This component has no metrics.
+  - area: egress gateway access log
+    code: manifests/ate-install/atenet-egress.yaml
+    brief: >
+      The MITM and cleartext chains log only requests with status 400 or
+      above, gRPC requests with a grpc-status other than OK, any response
+      flag, and a 1% sample of the rest. The runtime keys
+      access_log.min_status and access_log.sample on the admin port restore
+      full logging while you debug.
+  - area: ate-idp-server
+    code: cmd/ate-idp-server
+    brief: >
+      This component has no metrics. A relying party that cannot fetch the
+      discovery document or key set sees only failed token verification; check
+      the server's "Cannot publish the actor JWT keys" logs.
   - area: golden snapshot pipeline
     code: cmd/ateapi/internal/controlapi/template_reconciler.go
     brief: The template reconciler in ate-api has no instruments. Thus nothing measures a build of a golden image.
   - area: router shutdown outcome
     code: cmd/atenet/internal/router/drain.go
     brief: The code has two TODOs. Nothing counts a drain that ends with an error.
+  - area: CPU of short activations
+    code: cmd/atelet/statspoller.go
+    brief: >
+      ate.actor.stats.cpu.time counts only the samples atelet reads while an
+      actor is hosted. It loses the end of each activation, up to one poll
+      interval plus one ateworker sample interval. Thus an activation shorter than
+      that, as a checkpoint-when-idle agent, can show little or no CPU here.
+      Its ate.actor.usage_sampled records keep it. Issue #2362 moves the
+      counter to the ateworkers.

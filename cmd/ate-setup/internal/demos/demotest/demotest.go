@@ -18,13 +18,14 @@
 package demotest
 
 import (
+	"os"
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kube"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // Env builds an Env with no cluster connection. The render paths only read
@@ -35,7 +36,21 @@ func Env(t *testing.T) *steps.Env {
 	if err != nil {
 		t.Fatalf("RepoRoot: %v", err)
 	}
-	return &steps.Env{Cfg: &config.Config{Root: root, BucketName: "ate-snapshots"}}
+	// Resolve from the process environment so a test can steer a demo's own
+	// settings with t.Setenv, the way an operator would with an export.
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	r, err := config.Resolve(nil, config.ResolveOptions{Env: env})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	cfg := &config.Config{Root: root}
+	cfg.SetResolved(r)
+	return &steps.Env{Cfg: cfg}
 }
 
 // AssertRendered checks that every placeholder in a rendered template was
@@ -56,7 +71,7 @@ func AssertRendered(t *testing.T, manifest []byte) {
 
 // AssertRenderedActorTemplate checks that a rendered protojson ActorTemplate
 // manifest has every placeholder resolved and strictly parses into the
-// ateapipb.ActorTemplate it will be created as, and that it names the given
+// ateapi.ActorTemplate it will be created as, and that it names the given
 // (atespace, name). ko:// image references are left as written: they are
 // plain strings to the proto, resolved only at deploy time.
 func AssertRenderedActorTemplate(t *testing.T, manifest []byte, want resources.ActorTemplateRef) {
@@ -69,6 +84,10 @@ func AssertRenderedActorTemplate(t *testing.T, manifest []byte, want resources.A
 	}
 	if got := resources.ActorTemplateRefFromActorTemplate(template); got != want {
 		t.Errorf("manifest names template %s, want %s", got, want)
+	}
+	// The API rejects storageLocation without its preview gate.
+	if got := template.GetSnapshotConfig().GetStorageLocation(); got != "" {
+		t.Errorf("manifest sets storageLocation %q, want none", got)
 	}
 }
 

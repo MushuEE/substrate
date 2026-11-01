@@ -32,19 +32,48 @@
 #                  deploy that runs before this test. The orchestrator
 #                  redeploys workloads between tests, so each test can
 #                  pick its own scale.
-#   actorMemory    Optional (default "256Mi", the smallest size microvm
-#                  admits). Memory limit on the benchmark ActorTemplates;
+#   actorMemory    Optional (default "256Mi"). Memory limit on the
+#                  benchmark ActorTemplates;
 #                  raise it for suites that exercise glutton's WriteRAM path.
+#   actorCPU       Optional (default "1"). CPU limit on the benchmark
+#                  ActorTemplates. The scheduler books it against each
+#                  worker's CPU capacity, so it caps the actors a worker
+#                  hosts at once; lower it for dense suites.
+#   workerMemory   Optional (default unset: the worker pods have no requests
+#                  or limits). Memory request and limit on each WorkerPool
+#                  pod. Use it to fix how many workers share a node: one per
+#                  node needs more than half the node's allocatable memory.
+#                  The limit, less what the worker keeps for itself, is
+#                  the memory it reports as its actor capacity.
 #   workerWaitTimeout
 #                  Optional (default 300, set by workloads/deploy.sh).
 #                  Whole seconds to wait after the WorkerPool deploy for
-#                  the ateom worker pods to become ready. Raise it for
+#                  the worker pods to become ready. Raise it for
 #                  large workerCount fleets whose image pulls or scheduling
 #                  outrun the default.
 #   ateArgs        Optional. List of strings appended verbatim to
-#                  `hack/install-ate.sh --deploy-ate-system` when this
-#                  test's substrate is deployed (e.g. ["--atenet-router=agentgateway"]
-#                  or ["--experimental-use-sdsmint"]).
+#                  `ate-setup deploy ate-system` when this
+#                  test's substrate is deployed (e.g. ["--atenet-dataplane=agentgateway"]).
+#                  The deploy requires --credential-provider; set it here
+#                  as one YAML string, '--credential-provider={"name":"k8s.io"}'
+#                  (no shell quoting: the args are passed without a shell),
+#                  or as ATE_CREDENTIAL_PROVIDER in .ate-dev-env.sh.
+#   isolate        Optional. Isolate mode: installs substrate with the fake
+#                  data plane (ate-setup deploy ate-system --fake-data-plane), which
+#                  serves the WorkerPool without worker pods: fake-atelet
+#                  takes atelet's place on every atelet node and answers each
+#                  lifecycle call after a delay, and fake-workersync honors
+#                  the pool with workerCount fake Workers on them, each
+#                  reporting the capacity a real worker would.
+#                  ate-api-server and Postgres can then be driven past what
+#                  real nodes restore. The keys tune fake-atelet, through
+#                  workloads/deploy.sh --fake-atelet-env: delay (default 0s),
+#                  delayRun, delayRestore, delayCheckpoint,
+#                  delayPromoteSnapshot, and delayTerminate, which
+#                  override delay for one call, and mintActorCertificate
+#                  (default true). A bare `isolate:` selects the mode with
+#                  the defaults. Actors do not exist, so the entry's user
+#                  class must send them no requests.
 #
 # ---- type: locust -----------------------------------------------------------
 #
@@ -53,6 +82,13 @@
 # orchestrator's --dest flag. `file`, `duration` and `users` are required.
 # Optional `flags` is a list of arbitrary strings appended to runner.py's
 # argv; runner.py forwards them to locust verbatim.
+#
+# Optional `runnerCpu` (default "500m") and `runnerMemory` (default "512Mi")
+# are the runner pod's requests. They are requests only, no limits, so the
+# pod lands on a node with that much free and may burst beyond it. Raise
+# them for boomer-driven classes at thousands of users: agentsession holds
+# one goroutine per session and marshals up to 32Mi per in-flight ingest,
+# so 1000+ sessions want on the order of 4 CPU and 8Gi on a node that has it.
 #
 # `file` is one path, or a comma-separated list of paths that locust reads as
 # one test. Give the test first, then each load shape. A shape changes the
@@ -68,6 +104,33 @@
 # when the step starts, and the new rate stays until another step changes it.
 # `--trace-probability` in `flags` is the rate before the first such step.
 # Thus a ladder with no probability in any step keeps the rate of the flag.
+#
+# A step can end in `@target_rps` (e.g. `200:3m@4000`), which caps the
+# requests per second of the whole boomer worker from the step's start; 0
+# removes the cap. Boomer users that pace themselves (resumepaused) honor it.
+# Keep `users` at or above the rate times the p99 of one user iteration in
+# seconds, or the step falls short of its rate. A resumepaused iteration is a
+# resume plus a pause, so size it by the p99 of both together.
+#
+# An optional `controlPlane:` block shapes the control plane for a capacity
+# run; pre_test applies it after the deploy. Its `apiServer:` section, which
+# is required, sizes ate-api-server:
+#   cpu            Required. CPU of each replica, set as both request and
+#                  limit (e.g. 2 or "1500m").
+#   memory         Optional. Memory request and limit of each replica.
+#   replicas       Optional.
+#   poolMaxConns   Optional. pgxpool max connections per replica, set
+#                  through ateapi's env ConfigMap.
+# An optional knob left unset keeps the installed value.
+# Its optional `postgres:` section:
+#   stats          Optional (default true). Load pg_stat_statements and add
+#                  a postgres_exporter sidecar, scraped by monitoring.yaml.
+#   args           Optional. Postgres settings as name=value (e.g.
+#                  commit_delay=100), applied in the restart stats makes.
+# The block leaves placement to the install. A capacity run sets
+# --cordon-system-infra-components in ateArgs, which keeps ate-api-server and
+# Postgres off the nodes that run the load, on the tainted pools that flag
+# expects.
 #
 # ---- type: nighthawk-ingress --------------------------------------------------------
 #
@@ -87,6 +150,23 @@ tests:
     users: 1
     workerCount: 1
     flags:
+      - "--lifecycle-mode"
+      - "sync"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_baseline_1_user_pause
+    type: locust
+    description: "Glutton baseline (pause): 1 concurrent user for 1 minute"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--lifecycle-mode"
+      - "async"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -95,9 +175,9 @@ tests:
   # GluttonUser fills the actor's RAM to --mem-target through the
   # glutton WriteRAM API before the first suspend, so every suspend/resume
   # cycle is measured against a realistically-sized actor. actorMemory =
-  # target + headroom (glutton itself, the guest, and on microvm the 128Mi
-  # VMM reserve). The golden snapshot and cold boot stay small: the working
-  # set exists from the first fill onward. --mem-churn re-randomizes 64Mi
+  # target + headroom (glutton itself and the guest). The golden snapshot
+  # and cold boot stay small: the working set exists from the first fill
+  # onward. --mem-churn re-randomizes 64Mi
   # each cycle through an advancing window (WriteRAM rotate), so repeated
   # suspends snapshot changing memory rather than a static set and the dirty
   # window moves across the array. --mem-read walks the whole working set
@@ -114,6 +194,30 @@ tests:
     workerCount: 1
     actorMemory: "1536Mi"
     flags:
+      - "--lifecycle-mode"
+      - "sync"
+      - "--mem-target"
+      - "1Gi"
+      - "--mem-churn"
+      - "64Mi"
+      - "--mem-read"
+      - "all"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_mem_1gi_gvisor_pause
+    type: locust
+    description: "Large-memory (pause): 1Gi resident working set, gvisor"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    actorMemory: "1536Mi"
+    flags:
+      - "--lifecycle-mode"
+      - "async"
       - "--mem-target"
       - "1Gi"
       - "--mem-churn"
@@ -155,6 +259,30 @@ tests:
     workerCount: 1
     actorMemory: "2560Mi"
     flags:
+      - "--lifecycle-mode"
+      - "sync"
+      - "--mem-target"
+      - "2Gi"
+      - "--mem-churn"
+      - "64Mi"
+      - "--mem-read"
+      - "all"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_mem_2gi_gvisor_pause
+    type: locust
+    description: "Large-memory (pause): 2Gi resident working set, gvisor"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    actorMemory: "2560Mi"
+    flags:
+      - "--lifecycle-mode"
+      - "async"
       - "--mem-target"
       - "2Gi"
       - "--mem-churn"
@@ -195,6 +323,23 @@ tests:
     users: 5
     workerCount: 5
     flags:
+      - "--lifecycle-mode"
+      - "sync"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_baseline_5_users_pause
+    type: locust
+    description: "Glutton baseline (pause): 5 concurrent users for 1 minute"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 5
+    workerCount: 5
+    flags:
+      - "--lifecycle-mode"
+      - "async"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -208,6 +353,23 @@ tests:
     users: 10
     workerCount: 10
     flags:
+      - "--lifecycle-mode"
+      - "sync"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_baseline_10_users_pause
+    type: locust
+    description: "Glutton baseline (pause): 10 concurrent users for 1 minute"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 10
+    workerCount: 10
+    flags:
+      - "--lifecycle-mode"
+      - "async"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -305,6 +467,29 @@ tests:
     flags:
       - "--durdir-template"
       - "glutton-durdir-data"
+      - "--lifecycle-mode"
+      - "sync"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-file-size-bytes"
+      - "8388608"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_data_pause
+    type: locust
+    description: "DurDir data baseline (pause): 1 concurrent user, 8 MiB file, pause lifecycle"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--lifecycle-mode"
+      - "async"
       - "--resume-mode"
       - "explicit"
       - "--durdir-file-size-bytes"
@@ -324,6 +509,29 @@ tests:
     flags:
       - "--durdir-template"
       - "glutton-durdir-full"
+      - "--lifecycle-mode"
+      - "sync"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-file-size-bytes"
+      - "8388608"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_full_pause
+    type: locust
+    description: "DurDir full baseline (pause): 1 concurrent user, 8 MiB file, full memory restore comparison"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-full"
+      - "--lifecycle-mode"
+      - "async"
       - "--resume-mode"
       - "explicit"
       - "--durdir-file-size-bytes"
@@ -404,6 +612,8 @@ tests:
     flags:
       - "--durdir-template"
       - "glutton-durdir-data"
+      - "--lifecycle-mode"
+      - "sync"
       - "--resume-mode"
       - "explicit"
       - "--durdir-read-mode"
@@ -414,6 +624,44 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  - name: durdir_size_64mb_pause
+    type: locust
+    description: "DurDir file size sweep (64 MiB, pause): 1 concurrent user, digest read mode"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--lifecycle-mode"
+      - "async"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: spawn_smoke_10_actors
+    type: locust
+    description: "Spawn benchmark smoke: 10 actors created with concurrency 2"
+    targetCluster: dev
+    file: /app/tests/spawn.py,/app/shapes/spawn_shape.py
+    duration: 5m
+    users: 1
+    workerCount: 10
+    flags:
+      - "--total-actors"
+      - "10"
+      - "--spawn-concurrency"
+      - "2"
+      - "--actor-deadline"
+      - "120"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress
@@ -450,3 +698,68 @@ tests:
     nighthawk-ingress:
       envoyCpu: 16
       tailLatencySloMs: 25
+  # ate-api-server and Postgres cold resume ceiling on the fake data plane.
+  # Each user owns one actor: its first iteration creates the actor and
+  # makes it cold, in the step that adds the user, and every later one
+  # resumes it and pauses it again. fake-atelet answers each call, restore
+  # and checkpoint alike, after 150 ms on every atelet node, so a cycle
+  # spends 300 ms in the data plane, after minting the actor's certificate
+  # on each restore as ateom does. The 200 fake Workers hold 1000 actors
+  # each, and at 10m CPU an actor books next to nothing of a Worker's CPU,
+  # which a fake Worker reports as its node's allocatable, so placement
+  # never binds on any node size. resumepaused sends the actors no
+  # requests, which the fake data plane needs.
+  - name: ateapi_cold_resume_pause_fake_2cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 2 CPUs: rate ladder 100-1500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 1000
+    workerCount: 200
+    actorCPU: "10m"
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cordon-system-infra-components"
+    controlPlane:
+      apiServer:
+        replicas: 1
+        cpu: 2
+        memory: 4Gi
+        poolMaxConns: 64
+    flags:
+      - "--ladder-spawn-rate"
+      - "1000"
+      - "--ladder"
+      - "1000:3m@100,1000:3m@200,1000:3m@400,1000:3m@600,1000:3m@800,1000:3m@1000,1000:3m@1500"
+  # Smoke for the cold resume setup above: the same fake data plane and
+  # ate-api-server shape at a load far below its ceiling, to check a change
+  # end to end in minutes. 50 users, each a cycle of about 300 ms, can make
+  # some 150 cold resumes/s, so both steps reach their rate.
+  - name: ateapi_cold_resume_pause_fake_smoke
+    type: locust
+    description: "ate-api-server cold resume smoke on the fake data plane, ate-api-server at 2 CPUs: 50 actors, 20 then 50 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 6m
+    users: 50
+    workerCount: 2
+    actorCPU: "10m"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cordon-system-infra-components"
+    controlPlane:
+      apiServer:
+        replicas: 1
+        cpu: 2
+        memory: 4Gi
+        poolMaxConns: 64
+    flags:
+      - "--ladder-spawn-rate"
+      - "50"
+      - "--ladder"
+      - "50:2m@20,50:2m@50"

@@ -16,12 +16,12 @@
 
 // Package tarutil archives and restores a directory tree as a tar file,
 // preserving the metadata a workload's data directory depends on: modes,
-// ownership, modification times, symlinks, hardlinks, FIFOs, device nodes,
-// and user.* / trusted.overlay.* extended attributes (as PAX SCHILY.xattr
+// ownership, modification times, symlinks, hardlinks, FIFOs, overlay
+// whiteouts, and user.* / overlay extended attributes (as PAX SCHILY.xattr
 // records).
 //
 // It exists for snapshotting durable-dir volumes and rootfs overlay uppers
-// (see cmd/ateom-microvm): the contents are written by the sandboxed workload
+// (see cmd/ateworker-microvm): the contents are written by the sandboxed workload
 // under arbitrary uids, shipped to object storage, and restored — possibly
 // onto another node — where the workload must see them unchanged. The upper
 // is why device nodes and overlay xattrs matter: the host kernel's overlayfs
@@ -30,7 +30,9 @@
 // resurrects deleted content after a resume.
 //
 // Extraction is confined to the destination with os.Root, so a crafted archive
-// cannot write outside it via "..", an absolute path, or a symlink.
+// cannot write outside it via "..", an absolute path, or a symlink. It also
+// refuses device nodes other than whiteouts and restores only the xattrs
+// keepXattr allows.
 package tarutil
 
 import (
@@ -80,6 +82,34 @@ func copyPooled(dst io.Writer, src io.Reader) (int64, error) {
 	return io.CopyBuffer(writerOnly{dst}, readerOnly{src}, *bp)
 }
 
+// writeBehindChunk is how much of an archive may be dirty in the page cache
+// before we write it out and drop it. Dirty pages can't be reclaimed, and
+// piling up a whole archive of them can run a worker pod out of memory.
+const writeBehindChunk = 8 << 20
+
+// writeBehind writes to f, writing out and dropping each full chunk.
+type writeBehind struct {
+	f       *os.File
+	written int64
+	flushed int64
+}
+
+func (w *writeBehind) Write(p []byte) (int, error) {
+	n, err := w.f.Write(p)
+	w.written += int64(n)
+	if err != nil || w.written-w.flushed < writeBehindChunk {
+		return n, err
+	}
+	fd, off, size := int(w.f.Fd()), w.flushed, w.written-w.flushed
+	if err := unix.SyncFileRange(fd, off, size, unix.SYNC_FILE_RANGE_WAIT_BEFORE|unix.SYNC_FILE_RANGE_WRITE|unix.SYNC_FILE_RANGE_WAIT_AFTER); err != nil {
+		return n, fmt.Errorf("while writing out archive: %w", err)
+	}
+	// best effort, the range is on disk already
+	_ = unix.Fadvise(fd, off, size, unix.FADV_DONTNEED)
+	w.flushed = w.written
+	return n, nil
+}
+
 type writerOnly struct{ io.Writer }
 type readerOnly struct{ io.Reader }
 
@@ -87,10 +117,11 @@ type readerOnly struct{ io.Reader }
 // relative to srcDir, so extracting into another directory reproduces the tree.
 // srcDir itself is not an entry.
 //
-// Regular files, directories, symlinks, FIFOs, and device nodes are archived
-// with their mode, ownership, modification time, and user.* / trusted.overlay.*
-// xattrs. A file with multiple links inside srcDir is archived once and
-// referenced as a hardlink thereafter. Sockets are skipped (see writeTree).
+// Regular files, directories, symlinks, FIFOs, and overlay whiteouts are
+// archived with their mode, ownership, modification time, and the xattrs
+// keepXattr allows. A file with multiple links inside srcDir is archived once
+// and referenced as a hardlink thereafter. Sockets and other device nodes are
+// skipped (see writeTree).
 func Create(ctx context.Context, tarPath, srcDir string) error {
 	return CreateFiltered(ctx, tarPath, srcDir, nil)
 }
@@ -103,6 +134,22 @@ type SkipFunc func(rel string) bool
 // CreateFiltered is Create with entries omitted where skip returns true. A nil
 // skip archives everything.
 func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) error {
+	return create(ctx, tarPath, srcDir, skip, false)
+}
+
+// CreateWithRoot is Create plus a "./" entry carrying srcDir's own mode,
+// ownership, modification time, and xattrs, which Extract applies to dstDir.
+func CreateWithRoot(ctx context.Context, tarPath, srcDir string) error {
+	return CreateFilteredWithRoot(ctx, tarPath, srcDir, nil)
+}
+
+// CreateFilteredWithRoot is CreateWithRoot with entries omitted where skip
+// returns true. The root entry is never skipped.
+func CreateFilteredWithRoot(ctx context.Context, tarPath, srcDir string, skip SkipFunc) error {
+	return create(ctx, tarPath, srcDir, skip, true)
+}
+
+func create(ctx context.Context, tarPath, srcDir string, skip SkipFunc, includeRoot bool) error {
 	f, err := os.Create(tarPath)
 	if err != nil {
 		return fmt.Errorf("creating tar %q: %w", tarPath, err)
@@ -110,59 +157,68 @@ func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) 
 	defer f.Close()
 
 	bw := tarWriterPool.Get().(*bufio.Writer)
-	bw.Reset(f)
+	bw.Reset(&writeBehind{f: f})
 	defer func() {
 		bw.Reset(nil)
 		tarWriterPool.Put(bw)
 	}()
 	tw := tar.NewWriter(bw)
-	if err := writeTree(ctx, tw, srcDir, skip); err != nil {
+	if err := writeTree(ctx, tw, srcDir, skip, includeRoot); err != nil {
 		return err
 	}
 	if err := tw.Close(); err != nil {
 		return fmt.Errorf("closing tar %q: %w", tarPath, err)
 	}
-	// The buffer has to reach the file before the sync below, or the sync
-	// durably persists a truncated archive.
+	// The end of the archive is still in the buffer; flush it before returning.
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("flushing tar %q: %w", tarPath, err)
 	}
-	// Durable-dir tars are handed to atelet for upload as soon as we return, so
-	// flush to disk rather than trusting the page cache to outlive us.
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("syncing tar %q: %w", tarPath, err)
+	// No fsync: local-only snapshots aren't guaranteed to survive a node
+	// restart, and atelet doesn't trust a local snapshot written before the
+	// current boot (#3050). fsync here also waits behind other actors' writes
+	// in the shared ext4 journal. See #1954.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing %q: %w", tarPath, err)
 	}
 	return nil
 }
 
-// writeTree walks srcDir in lexical order (filepath.WalkDir) and writes one
-// entry per path, omitting entries (and, for directories, subtrees) that skip
-// selects. The deterministic order keeps archives of identical trees
-// byte-comparable, which makes snapshot diffs meaningful.
-func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc) error {
+// writeTree walks srcDir in lexical order and writes one entry per path,
+// omitting entries (and, for directories, subtrees) that skip selects. srcDir
+// itself is written as "./" only if includeRoot is set. The deterministic
+// order keeps archives of identical trees byte-comparable, which makes
+// snapshot diffs meaningful.
+//
+// Every read goes through an os.Root rooted at srcDir, so an entry swapped for
+// a symlink mid-walk cannot make the archive capture a file outside srcDir.
+func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc, includeRoot bool) error {
+	root, err := os.OpenRoot(srcDir)
+	if err != nil {
+		return fmt.Errorf("opening %q: %w", srcDir, err)
+	}
+	defer root.Close()
+
 	// Maps an already-archived multi-link inode to the name it was archived
 	// under, so later links become tar hardlink entries instead of copies.
 	linked := map[inodeKey]string{}
 
-	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
+		if rel == "." && !includeRoot {
 			return nil
 		}
-		if skip != nil && skip(filepath.ToSlash(rel)) {
+		if rel != "." && skip != nil && skip(rel) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
+		path := filepath.Join(srcDir, rel)
 
-		info, err := d.Info()
+		// Not d.Info(): that re-stats by full path, outside the root.
+		info, err := root.Lstat(rel)
 		if err != nil {
 			return err
 		}
@@ -184,7 +240,7 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 
 		link := ""
 		if info.Mode()&os.ModeSymlink != 0 {
-			if link, err = os.Readlink(path); err != nil {
+			if link, err = root.Readlink(rel); err != nil {
 				return fmt.Errorf("reading symlink %q: %w", path, err)
 			}
 		}
@@ -192,8 +248,8 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 		if err != nil {
 			return fmt.Errorf("building tar header for %q: %w", path, err)
 		}
-		hdr.Name = filepath.ToSlash(rel)
-		if d.IsDir() {
+		hdr.Name = rel
+		if info.IsDir() {
 			hdr.Name += "/"
 		}
 		setOwner(hdr, info)
@@ -205,7 +261,7 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 		// Symlinks are exempt: Linux refuses user.* xattrs on them, and
 		// overlay metadata never targets them.
 		if info.Mode()&os.ModeSymlink == 0 {
-			xattrs, err := readOverlayXattrs(path)
+			xattrs, err := readOverlayXattrs(root, rel)
 			if err != nil {
 				return fmt.Errorf("reading xattrs of %q: %w", path, err)
 			}
@@ -230,17 +286,31 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 				}
 				linked[key] = hdr.Name
 			}
+			in, err := openRegular(root, rel)
+			if err != nil {
+				return fmt.Errorf("opening %q: %w", path, err)
+			}
+			defer in.Close()
 			if err := tw.WriteHeader(hdr); err != nil {
 				return fmt.Errorf("writing tar header for %q: %w", path, err)
 			}
-			return copyFileInto(tw, path)
+			if _, err := copyPooled(tw, in); err != nil {
+				return fmt.Errorf("archiving contents of %q: %w", path, err)
+			}
+			return nil
 
-		case d.IsDir(), info.Mode()&os.ModeSymlink != 0, info.Mode()&os.ModeNamedPipe != 0,
-			info.Mode()&os.ModeDevice != 0:
-			// FileInfoHeader already populated the Typeflag (and, for devices,
-			// the major/minor) with size 0. Devices are archived rather than
-			// rejected because an overlay upper legitimately contains them:
-			// every deleted lower-layer file is a 0:0 char-device whiteout.
+		case info.Mode()&os.ModeDevice != 0:
+			// Only overlay whiteouts are archived; Extract refuses any other
+			// device, so archiving one would make the snapshot unrestorable.
+			if !isWhiteout(hdr) {
+				slog.WarnContext(ctx, "Skipping device node while archiving directory",
+					slog.String("path", path), slog.String("root", srcDir))
+				return nil
+			}
+			return tw.WriteHeader(hdr)
+
+		case info.IsDir(), info.Mode()&os.ModeSymlink != 0, info.Mode()&os.ModeNamedPipe != 0:
+			// FileInfoHeader already populated the Typeflag with size 0.
 			return tw.WriteHeader(hdr)
 
 		default:
@@ -249,17 +319,24 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 	})
 }
 
-// copyFileInto streams path's contents into the archive.
-func copyFileInto(tw *tar.Writer, path string) error {
-	in, err := os.Open(path)
+// openRegular opens name under root for reading without following a symlink
+// at it, and fails unless it is still a regular file. O_NONBLOCK keeps a FIFO
+// swapped in since the walk from blocking the open.
+func openRegular(root *os.Root, name string) (*os.File, error) {
+	f, err := root.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return fmt.Errorf("opening %q: %w", path, err)
+		return nil, err
 	}
-	defer in.Close()
-	if _, err := copyPooled(tw, in); err != nil {
-		return fmt.Errorf("archiving contents of %q: %w", path, err)
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
 	}
-	return nil
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("no longer a regular file (%v)", fi.Mode().Type())
+	}
+	return f, nil
 }
 
 // Extract unpacks tarPath into dstDir, which must already exist. Modes,
@@ -310,6 +387,10 @@ func Extract(tarPath, dstDir string) error {
 			return fmt.Errorf("invalid entry in tar %q: %w", tarPath, err)
 		}
 		if skip {
+			// A "./" entry (see CreateWithRoot) carries dstDir's own metadata.
+			if hdr.Name != "" && hdr.Typeflag == tar.TypeDir {
+				dirs["."] = hdr
+			}
 			continue
 		}
 		if err := extractEntry(root, tr, hdr, name, dirs); err != nil {
@@ -358,7 +439,7 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 		}
 		// Only ownership applies to a symlink itself; its mode is meaningless
 		// and its times would follow the target.
-		return lchownEntry(root, name, hdr)
+		return Lchown(root, name, hdr)
 
 	case tar.TypeFifo:
 		if err := replaceExisting(root, name); err != nil {
@@ -383,6 +464,13 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 		return nil
 
 	case tar.TypeChar, tar.TypeBlock:
+		// A real device node would hand whoever can reach the extracted tree
+		// access to host hardware. Overlay whiteouts are the only devices a
+		// snapshot legitimately carries.
+		if !isWhiteout(hdr) {
+			return fmt.Errorf("refusing device node %q (%d:%d): only 0:0 character devices (overlay whiteouts) are allowed",
+				name, hdr.Devmajor, hdr.Devminor)
+		}
 		if err := replaceExisting(root, name); err != nil {
 			return err
 		}
@@ -394,6 +482,12 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 	default:
 		return fmt.Errorf("unsupported tar entry type %q at %q", string([]byte{hdr.Typeflag}), name)
 	}
+}
+
+// isWhiteout reports whether hdr is an overlayfs whiteout: a 0:0 character
+// device.
+func isWhiteout(hdr *tar.Header) bool {
+	return hdr.Typeflag == tar.TypeChar && hdr.Devmajor == 0 && hdr.Devminor == 0
 }
 
 // replaceExisting removes whatever currently occupies name so the new entry
@@ -415,13 +509,18 @@ func replaceExisting(root *os.Root, name string) error {
 // restoreDirMeta applies the archived modes, ownership, and times to extracted
 // directories, deepest first: a directory's path is always longer than its
 // parent's, so length-descending order restores children before the parent's
-// mode can make them unreachable.
+// mode can make them unreachable. The root ("."), if archived, goes last.
 func restoreDirMeta(root *os.Root, dirs map[string]*tar.Header) error {
 	names := make([]string, 0, len(dirs))
 	for name := range dirs {
 		names = append(names, name)
 	}
-	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	sort.Slice(names, func(i, j int) bool {
+		if names[i] == "." || names[j] == "." {
+			return names[j] == "."
+		}
+		return len(names[i]) > len(names[j])
+	})
 	for _, name := range names {
 		if err := restoreMeta(root, name, dirs[name]); err != nil {
 			return err
@@ -430,28 +529,16 @@ func restoreDirMeta(root *os.Root, dirs map[string]*tar.Header) error {
 	return nil
 }
 
-// restoredMode is the mode an extracted entry ends up with: the permission bits
-// plus setuid, setgid, and sticky, which FileMode.Perm() alone would drop.
-//
-// The archive records them, so dropping them would make the round trip silently
-// lossy. The case that bites is a setgid data directory (0o2775): the workload
-// relies on group inheritance for files its different uids create, and losing
-// the bit only surfaces later, when the next file lands with the wrong group.
-// These bits govern behavior inside the sandbox — the host never executes a
-// workload's files — and a running workload can set them on its own data
-// anyway, so carrying them across a suspend/resume grants it nothing new.
-func restoredMode(hdr *tar.Header) os.FileMode {
-	return hdr.FileInfo().Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
-}
-
 // restoreMeta applies ownership, mode, and modification time to an extracted
 // path. Ownership is applied first because chowning a file clears its setuid
-// and setgid bits, which the chmod below then puts back.
+// and setgid bits, which the chmod below then puts back. Restoring a snapshot
+// grants nothing new with those bits: a running workload can set them on its
+// own files anyway.
 func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
-	if err := lchownEntry(root, name, hdr); err != nil {
+	if err := Lchown(root, name, hdr); err != nil {
 		return err
 	}
-	if err := root.Chmod(name, restoredMode(hdr)); err != nil {
+	if err := root.Chmod(name, Mode(hdr)); err != nil {
 		return fmt.Errorf("restoring mode on %q: %w", name, err)
 	}
 	if !hdr.ModTime.IsZero() {
@@ -462,10 +549,9 @@ func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 	return restoreOverlayXattrs(root, name, hdr)
 }
 
-// restoreOverlayXattrs re-applies the user.* and trusted.overlay.* xattrs
-// recorded in the entry's PAX records (writeTree's SCHILY.xattr.* — the
-// overlayfs deletion metadata plus workload-owned user attrs). Writing
-// trusted.* requires CAP_SYS_ADMIN; extraction runs as root in ateom, and the
+// restoreOverlayXattrs re-applies the xattrs recorded in the entry's PAX
+// records (writeTree's SCHILY.xattr.*) that keepXattr allows. Writing
+// trusted.* requires CAP_SYS_ADMIN; extraction runs as root in worker, and the
 // tests gate on it.
 //
 // The target is addressed THROUGH its parent directory opened via root (the
@@ -479,13 +565,14 @@ func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 func restoreOverlayXattrs(root *os.Root, name string, hdr *tar.Header) error {
 	var attrs map[string]string
 	for k, v := range hdr.PAXRecords {
-		if strings.HasPrefix(k, "SCHILY.xattr.user.") ||
-			strings.HasPrefix(k, "SCHILY.xattr.trusted.overlay.") {
-			if attrs == nil {
-				attrs = map[string]string{}
-			}
-			attrs[strings.TrimPrefix(k, "SCHILY.xattr.")] = v
+		attr, ok := strings.CutPrefix(k, "SCHILY.xattr.")
+		if !ok || !keepXattr(attr) {
+			continue
 		}
+		if attrs == nil {
+			attrs = map[string]string{}
+		}
+		attrs[attr] = v
 	}
 	if len(attrs) == 0 {
 		return nil
@@ -508,13 +595,44 @@ func restoreOverlayXattrs(root *os.Root, name string, hdr *tar.Header) error {
 	return nil
 }
 
-// readOverlayXattrs returns path's user.* and trusted.overlay.* extended
-// attributes. Filesystems without xattr support report none rather than
-// failing: tarutil archives arbitrary workload trees, and only those two
-// namespaces carry state the round trip must preserve (trusted.overlay.* is
-// the host kernel's overlay deletion metadata; reading it requires root,
-// which archiving in ateom always has).
-func readOverlayXattrs(path string) (map[string]string, error) {
+// overlayXattrs are the trusted.overlay.* attributes the round trip keeps: the
+// path-based ones the rootfs overlay mount writes to its upper (see
+// kata.StageMergedRootfs). The rest are either file handles that go stale on
+// another node (origin, upper) or belong to features the mount turns off
+// (metacopy, index), and the kernel trusts all of them when it mounts the
+// upper, so a crafted archive must not be able to plant them.
+var overlayXattrs = map[string]bool{
+	"trusted.overlay.opaque":   true,
+	"trusted.overlay.redirect": true,
+	"trusted.overlay.impure":   true,
+}
+
+// keepXattr reports whether attr is archived and restored: any user.* attribute
+// (workload data, which the workload can set itself) or one of overlayXattrs.
+// Everything else, notably security.capability, is dropped.
+func keepXattr(attr string) bool {
+	return strings.HasPrefix(attr, "user.") || overlayXattrs[attr]
+}
+
+// readOverlayXattrs returns the extended attributes of name under root that
+// keepXattr allows. Filesystems without xattr support report none rather than
+// failing: tarutil archives arbitrary workload trees. Reading trusted.*
+// requires root, which archiving in worker always has.
+//
+// name is addressed through its parent directory opened via root, like
+// restoreOverlayXattrs, and the L* calls do not follow a final symlink.
+func readOverlayXattrs(root *os.Root, name string) (map[string]string, error) {
+	dir, base := filepath.Split(name)
+	if dir == "" {
+		dir = "."
+	}
+	parent, err := root.Open(filepath.Clean(dir))
+	if err != nil {
+		return nil, fmt.Errorf("opening parent directory of %q: %w", name, err)
+	}
+	defer parent.Close()
+	path := fmt.Sprintf("/proc/self/fd/%d/%s", parent.Fd(), base)
+
 	sz, err := unix.Llistxattr(path, nil)
 	if err != nil {
 		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
@@ -532,7 +650,7 @@ func readOverlayXattrs(path string) (map[string]string, error) {
 
 	var attrs map[string]string
 	for _, attr := range strings.Split(string(buf[:sz]), "\x00") {
-		if !strings.HasPrefix(attr, "user.") && !strings.HasPrefix(attr, "trusted.overlay.") {
+		if !keepXattr(attr) {
 			continue
 		}
 		vsz, err := unix.Lgetxattr(path, attr, nil)

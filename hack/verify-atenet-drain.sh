@@ -33,9 +33,10 @@
 # the e2e runner executes suites in parallel, so this check must run alone.
 #
 # Prerequisites: a cluster with the ate system and the counter demo installed
-# (hack/install-ate-kind.sh --deploy-ate-system --deploy-demo-counter), and no
-# actors currently running on the counter demo pool (the pool is scaled to 1
-# for the duration of the check and restored afterwards).
+# (go run ./cmd/ate-setup --kind deploy ate-system --credential-provider='{"name":"k8s.io"}', then
+# go run ./cmd/ate-setup --kind deploy demo counter),
+# and no actors currently running on the counter demo pool (the pool is scaled
+# to 1 for the duration of the check and restored afterwards).
 #
 # Respects KUBECTL_CONTEXT like the other hack scripts.
 
@@ -55,7 +56,7 @@ SUFFIX="$(date +%s)"
 ACTOR_BUSY="busy-${SUFFIX}"    # occupies the only worker
 ACTOR_PARKED="parked-${SUFFIX}" # its request parks, then survives the drain
 LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-18080}"
-LOCAL_METRICS_PORT="${LOCAL_METRICS_PORT:-19090}"
+LOCAL_HEALTH_PORT="${LOCAL_HEALTH_PORT:-19091}"
 # Xs must be the trailing characters: BSD (macOS) mktemp rejects suffixes.
 LOG_FILE="$(mktemp /tmp/atenet-drain-check-log.XXXXXX)"
 CURL_OUT="$(mktemp /tmp/atenet-drain-check-out.XXXXXX)"
@@ -94,17 +95,17 @@ log_step "preflight"
 # Ready means the template's golden snapshot exists; protojson omits empty
 # fields, so the key is only present once it is set.
 run_kubectl_ate get actor-template "${DEMO_POOL}" -a "${ATESPACE}" -o json 2>/dev/null \
-  | grep -q '"goldenSnapshot"' \
+  | grep -q '"goldenTag"' \
   || fail "actor template ${ATESPACE}/${DEMO_POOL} has no golden snapshot; install the counter demo first"
 # Column 4 is STATUS; the header row's "ASSIGNED ACTOR" column name must not
 # trip the check.
 if run_kubectl_ate get workers 2>/dev/null | awk 'NR>1 && $4=="ASSIGNED"' | grep -q .; then
   fail "workers on the ${DEMO_POOL} pool are ASSIGNED; the check scales the pool to 1 and would crash running actors — suspend them first"
 fi
-for port in "${LOCAL_HTTP_PORT}" "${LOCAL_METRICS_PORT}"; do
+for port in "${LOCAL_HTTP_PORT}" "${LOCAL_HEALTH_PORT}"; do
   if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
     exec 3>&- 3<&-
-    fail "local port ${port} is already in use (a stale port-forward?); free it or set LOCAL_HTTP_PORT/LOCAL_METRICS_PORT"
+    fail "local port ${port} is already in use (a stale port-forward?); free it or set LOCAL_HTTP_PORT/LOCAL_HEALTH_PORT"
   fi
 done
 
@@ -116,8 +117,8 @@ run_kubectl patch workerpool -n "${DEMO_NS}" "${DEMO_POOL}" --type merge -p '{"s
 run_kubectl rollout status "deploy/${DEMO_POOL}" -n "${DEMO_NS}" --timeout=180s >/dev/null
 
 log_step "creating actors ${ACTOR_BUSY} + ${ACTOR_PARKED} in atespace ${ATESPACE}"
-run_kubectl_ate create actor "${ACTOR_BUSY}" -a "${ATESPACE}" --template-ref "${DEMO_POOL}" >/dev/null
-run_kubectl_ate create actor "${ACTOR_PARKED}" -a "${ATESPACE}" --template-ref "${DEMO_POOL}" >/dev/null
+run_kubectl_ate create actor "${ACTOR_BUSY}" -a "${ATESPACE}" --template "${DEMO_POOL}" >/dev/null
+run_kubectl_ate create actor "${ACTOR_PARKED}" -a "${ATESPACE}" --template "${DEMO_POOL}" >/dev/null
 
 log_step "occupying the only worker with ${ACTOR_BUSY}"
 for i in $(seq 1 20); do
@@ -137,12 +138,12 @@ run_kubectl logs -n "${ROUTER_NS}" "${POD}" -c atenet-router -f > "${LOG_FILE}" 
 BG_PIDS+=($!)
 run_kubectl port-forward -n "${ROUTER_NS}" svc/atenet-router "${LOCAL_HTTP_PORT}:80" >/dev/null 2>&1 &
 BG_PIDS+=($!)
-run_kubectl port-forward -n "${ROUTER_NS}" "${POD}" "${LOCAL_METRICS_PORT}:9090" >/dev/null 2>&1 &
+run_kubectl port-forward -n "${ROUTER_NS}" "${POD}" "${LOCAL_HEALTH_PORT}:9091" >/dev/null 2>&1 &
 BG_PIDS+=($!)
 sleep 3
 
-readyz() { curl -s -o /dev/null -w '%{http_code}' "localhost:${LOCAL_METRICS_PORT}/readyz"; }
-healthz() { curl -s -o /dev/null -w '%{http_code}' "localhost:${LOCAL_METRICS_PORT}/healthz"; }
+readyz() { curl -s -o /dev/null -w '%{http_code}' "localhost:${LOCAL_HEALTH_PORT}/readyz"; }
+healthz() { curl -s -o /dev/null -w '%{http_code}' "localhost:${LOCAL_HEALTH_PORT}/healthz"; }
 
 # The port-forwards need a moment to come up; retry before judging.
 for i in $(seq 1 20); do
@@ -157,7 +158,7 @@ echo "steady state: /readyz=200 /healthz=200"
 
 log_step "firing the request that will park (single worker is busy)"
 ( curl -s --max-time 30 -w '\nHTTP=%{http_code}\n' \
-    -H "Host: ${ACTOR_PARKED}.${ATESPACE}.actors.resources.substrate.ate.dev" \
+  -H "ate-target-actor: ${ATESPACE}/${ACTOR_PARKED}" \
     "http://localhost:${LOCAL_HTTP_PORT}/" > "${CURL_OUT}" 2>&1 ) &
 CURL_PID=$!
 sleep 1  # inside the 5s park budget; the request is parked on the router
@@ -177,7 +178,7 @@ run_kubectl_ate suspend actor "${ACTOR_BUSY}" -a "${ATESPACE}" >/dev/null
 
 wait "${CURL_PID}" || true
 grep -q "HTTP=200" "${CURL_OUT}" || fail "parked request did not return 200 through the Terminating pod: $(cat "${CURL_OUT}")"
-grep -q "hello from" "${CURL_OUT}" || fail "parked request body missing the counter greeting: $(cat "${CURL_OUT}")"
+grep -q "preserved memory count:" "${CURL_OUT}" || fail "parked request body missing the counter response: $(cat "${CURL_OUT}")"
 echo "parked request served by the Terminating pod:"
 sed 's/^/  /' "${CURL_OUT}"
 

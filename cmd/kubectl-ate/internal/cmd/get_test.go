@@ -15,59 +15,90 @@
 package cmd
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/spf13/cobra"
 )
 
-func TestGetCommandArgs(t *testing.T) {
-	tests := []struct {
-		name    string
-		command *cobra.Command
-		args    []string
-		wantErr bool
-	}{
-		{name: "actors list", command: getActorsCmd},
-		{name: "actors get", command: getActorsCmd, args: []string{"actor-1"}},
-		{name: "actors get multiple", command: getActorsCmd, args: []string{"actor-1", "actor-2"}},
-		{name: "actortemplates list", command: getActorTemplatesCmd},
-		{name: "actortemplates get", command: getActorTemplatesCmd, args: []string{"counter"}},
-		{name: "actortemplates get multiple", command: getActorTemplatesCmd, args: []string{"counter", "counter-microvm"}},
-		{name: "atespaces list", command: getAtespacesCmd},
-		{name: "atespaces get", command: getAtespacesCmd, args: []string{"team-a"}},
-		{name: "atespaces get multiple", command: getAtespacesCmd, args: []string{"team-a", "team-b"}},
-		{name: "workers list", command: getWorkersCmd},
-		{name: "workers reject argument", command: getWorkersCmd, args: []string{"worker-1"}, wantErr: true},
-		{name: "top workers list", command: topWorkersCmd},
-		{name: "top workers reject argument", command: topWorkersCmd, args: []string{"worker-1"}, wantErr: true},
-	}
+func TestGetScopeBeforeConnecting(t *testing.T) {
+	previousKubeconfig := kubeconfig
+	kubeconfig = filepath.Join(t.TempDir(), "missing-kubeconfig")
+	t.Cleanup(func() { kubeconfig = previousKubeconfig })
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var err error
-			if test.command.Args != nil {
-				err = test.command.Args(test.command, test.args)
-			}
-			if (err != nil) != test.wantErr {
-				t.Fatalf("Args(%q) error = %v, wantErr %t", test.args, err, test.wantErr)
+	for _, resource := range []struct {
+		name     string
+		command  *cobra.Command
+		atespace *string
+		all      *bool
+	}{
+		{"actors", getActorsCmd, &getActorAtespaceFlag, &getActorAllAtespacesFlag},
+		{"actor templates", getActorTemplatesCmd, &getActorTemplateAtespaceFlag, &getActorTemplateAllAtespacesFlag},
+		{"tags", getTagsCmd, &getTagAtespaceFlag, &getTagAllAtespacesFlag},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			previousAtespace, previousAll := *resource.atespace, *resource.all
+			previousContext := resource.command.Context()
+			resource.command.SetContext(t.Context())
+			t.Cleanup(func() {
+				*resource.atespace, *resource.all = previousAtespace, previousAll
+				resource.command.SetContext(previousContext)
+			})
+
+			for _, test := range []struct {
+				name     string
+				args     []string
+				atespace string
+				all      bool
+				wantErr  string
+			}{
+				{
+					name: "get without atespace", args: []string{"counter"},
+					wantErr: "-a/--atespace is required when getting",
+				},
+				{
+					name: "get with all atespaces", args: []string{"counter"}, all: true,
+					wantErr: "-A/--all-atespaces cannot be used when getting",
+				},
+				{
+					name: "get with both scopes", args: []string{"counter"}, atespace: "demo", all: true,
+					wantErr: "-A/--all-atespaces cannot be used when getting",
+				},
+				{
+					name:    "list without scope",
+					wantErr: "-a/--atespace <name> or -A/--all-atespaces is required",
+				},
+				{
+					name: "list with both scopes", atespace: "demo", all: true,
+					wantErr: "-a/--atespace and -A/--all-atespaces are mutually exclusive",
+				},
+				// Valid scopes reach client initialization, where the missing kubeconfig fails.
+				{
+					name: "get in atespace", args: []string{"counter"}, atespace: "demo",
+					wantErr: "failed to load kubeconfig",
+				},
+				{
+					name: "get multiple in atespace", args: []string{"counter", "other"}, atespace: "demo",
+					wantErr: "failed to load kubeconfig",
+				},
+				{
+					name: "list in atespace", atespace: "demo",
+					wantErr: "failed to load kubeconfig",
+				},
+				{
+					name: "list all atespaces", all: true,
+					wantErr: "failed to load kubeconfig",
+				},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					*resource.atespace, *resource.all = test.atespace, test.all
+					err := resource.command.RunE(resource.command, test.args)
+					if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+						t.Fatalf("RunE() error = %v, want error containing %q", err, test.wantErr)
+					}
+				})
 			}
 		})
-	}
-}
-
-func TestParseActorSnapshotFlags(t *testing.T) {
-	if got, err := parseActorSnapshotTagScope("published"); err != nil || got != ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_PUBLISHED {
-		t.Fatalf("parseActorSnapshotTagScope(published) = (%v, %v)", got, err)
-	}
-	if _, err := parseActorSnapshotTagScope("global"); err == nil {
-		t.Fatal("parseActorSnapshotTagScope(global) succeeded")
-	}
-	ref, err := parseNamespacedName("team-a/before-upgrade")
-	if err != nil || ref.GetAtespace() != "team-a" || ref.GetName() != "before-upgrade" {
-		t.Fatalf("parseNamespacedName = (%v, %v)", ref, err)
-	}
-	if _, err := parseNamespacedName("before-upgrade"); err == nil {
-		t.Fatal("parseNamespacedName without atespace succeeded")
 	}
 }

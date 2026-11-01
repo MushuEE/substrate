@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,11 +28,15 @@ import (
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+	"k8s.io/utils/ptr"
 
-	"github.com/agent-substrate/substrate/internal/ateomcapacity"
-	"github.com/agent-substrate/substrate/internal/ateompath"
-	"github.com/agent-substrate/substrate/internal/deviceplugin"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/deviceplugin"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/workercapacity"
 )
 
 func TestBuildDeploymentApplyConfig(t *testing.T) {
@@ -69,7 +74,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	tests := []struct {
 		name string
-		wp   *atev1alpha1.WorkerPool
+		wp   *atev1.WorkerPool
 		want *appsv1ac.DeploymentApplyConfiguration
 	}{
 		{
@@ -79,7 +84,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 		},
 		{
 			name: "with node selector",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				NodeSelector: map[string]string{
 					"accelerator": "gpu",
 					"topology":    "high-mem",
@@ -94,10 +99,12 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 		},
 		{
 			name: "with tolerations",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				Tolerations: []corev1.Toleration{toleration},
 			}),
 			want: expectedDeploymentApplyConfig(func(podSpecAC *corev1ac.PodSpecApplyConfiguration) {
+				// Template tolerations come first; the sandbox class toleration
+				// is appended after them.
 				podSpecAC.Tolerations = []corev1ac.TolerationApplyConfiguration{
 					*corev1ac.Toleration().
 						WithKey("dedicated").
@@ -105,12 +112,13 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 						WithValue("workerpool").
 						WithEffect(corev1.TaintEffectNoSchedule).
 						WithTolerationSeconds(300),
+					sandboxClassTolerationAC(atev1.SandboxClassGvisor),
 				}
 			}),
 		},
 		{
 			name: "with node affinity",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				NodeAffinity: requiredNodeAffinity,
 			}),
 			want: expectedDeploymentApplyConfig(func(podSpecAC *corev1ac.PodSpecApplyConfiguration) {
@@ -130,7 +138,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 		},
 		{
 			name: "with priority class name",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				PriorityClassName: "interactive-workerpool",
 			}),
 			want: expectedDeploymentApplyConfig(func(podSpecAC *corev1ac.PodSpecApplyConfiguration) {
@@ -138,8 +146,17 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 			}),
 		},
 		{
+			name: "with service account name",
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
+				ServiceAccountName: ptr.To("substrate-worker"),
+			}),
+			want: expectedDeploymentApplyConfig(func(podSpecAC *corev1ac.PodSpecApplyConfiguration) {
+				podSpecAC.WithServiceAccountName("substrate-worker")
+			}),
+		},
+		{
 			name: "with resources",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				Resources: &corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("500m"),
@@ -165,7 +182,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 		},
 		{
 			name: "with combined scheduling fields",
-			wp: testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+			wp: testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 				NodeSelector: map[string]string{
 					"accelerator": "gpu",
 					"topology":    "high-mem",
@@ -186,6 +203,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 						WithValue("workerpool").
 						WithEffect(corev1.TaintEffectNoSchedule).
 						WithTolerationSeconds(300),
+					sandboxClassTolerationAC(atev1.SandboxClassGvisor),
 				}
 				podSpecAC.WithPriorityClassName("interactive-workerpool")
 				podSpecAC.WithAffinity(corev1ac.Affinity().WithNodeAffinity(
@@ -206,7 +224,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{})
+			got := buildDeploymentApplyConfig(tt.wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("buildDeploymentApplyConfig() mismatch (-want +got):\n%s", diff)
 			}
@@ -215,8 +233,8 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 }
 
 func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
-	wp := testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
-		Labels: map[string]atev1alpha1.WorkerPoolLabelValue{
+	wp := testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
+		Labels: map[string]atev1.WorkerPoolLabelValue{
 			"project":             "agent-substrate",
 			"team":                "compute",
 			"ate.dev/worker-pool": "incorrect",
@@ -226,7 +244,7 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 		},
 	})
 
-	got := buildDeploymentApplyConfig(wp, ateomOTelSettings{})
+	got := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
 	wantLabels := map[string]string{
 		"project":             "agent-substrate",
 		"team":                "compute",
@@ -250,25 +268,89 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 	}
 }
 
+// sandboxClassTolerationAC is the toleration applySandboxClassToleration adds
+// for class, in apply-configuration form for cmp against built pod specs.
+func sandboxClassTolerationAC(class atev1.SandboxClass) corev1ac.TolerationApplyConfiguration {
+	return *corev1ac.Toleration().
+		WithKey(sandboxClassTaintKey).
+		WithOperator(corev1.TolerationOpEqual).
+		WithValue(string(class)).
+		WithEffect(corev1.TaintEffectNoSchedule)
+}
+
+// TestSandboxClassToleration asserts every pool tolerates the
+// ate.dev/sandboxClass taint for its own class, exactly once, with an empty
+// class meaning the gvisor default, and that template tolerations survive
+// alongside it.
+func TestSandboxClassToleration(t *testing.T) {
+	tests := []struct {
+		name  string
+		class atev1.SandboxClass
+		want  string
+	}{
+		{"gvisor default", "", "gvisor"},
+		{"gvisor explicit", atev1.SandboxClassGvisor, "gvisor"},
+		{"microvm", atev1.SandboxClassMicroVM, "microvm"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wp := testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
+				Tolerations: []corev1.Toleration{{
+					Key:      "dedicated",
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoSchedule,
+				}},
+			})
+			wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
+			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
+
+			var classValues []string
+			hasTemplateToleration := false
+			for _, tol := range ps.Tolerations {
+				if tol.Key == nil {
+					continue
+				}
+				switch *tol.Key {
+				case sandboxClassTaintKey:
+					if tol.Operator == nil || *tol.Operator != corev1.TolerationOpEqual ||
+						tol.Effect == nil || *tol.Effect != corev1.TaintEffectNoSchedule || tol.Value == nil {
+						t.Errorf("sandbox class toleration = %+v, want Equal/NoSchedule with a value", tol)
+						continue
+					}
+					classValues = append(classValues, *tol.Value)
+				case "dedicated":
+					hasTemplateToleration = true
+				}
+			}
+			if len(classValues) != 1 || classValues[0] != tt.want {
+				t.Errorf("%s toleration values = %v, want exactly [%s]", sandboxClassTaintKey, classValues, tt.want)
+			}
+			if !hasTemplateToleration {
+				t.Errorf("template toleration was dropped; the class toleration must be additive")
+			}
+		})
+	}
+}
+
 // TestMicroVMPodShape asserts the micro-VM sandbox class requests the host
 // devices as extended resources (served by atelet's device plugin) and
-// tolerates the ate.dev/sandboxClass taint; other classes get none of it.
-// Placement comes from the device request, so no nodeSelector is added.
+// bind-mounts the tun device; other classes get none of it. Placement comes
+// from the device request, so no nodeSelector is added.
 func TestMicroVMPodShape(t *testing.T) {
 	tests := []struct {
 		name        string
-		class       atev1alpha1.SandboxClass
+		class       atev1.SandboxClass
 		wantMicroVM bool
 	}{
 		{"gvisor default", "", false},
-		{"gvisor explicit", atev1alpha1.SandboxClassGvisor, false},
-		{"microvm", atev1alpha1.SandboxClassMicroVM, true},
+		{"gvisor explicit", atev1.SandboxClassGvisor, false},
+		{"microvm", atev1.SandboxClassMicroVM, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
-			wp.Spec.SandboxClass = tt.class
-			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+			wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
+			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
 
 			// /dev/kvm must come from the device plugin, never a hostPath: a
 			// hostPath mount carries no cgroup device allow rule, and the
@@ -295,7 +377,7 @@ func TestMicroVMPodShape(t *testing.T) {
 				}
 			}
 			if hasTunMount && !containerMountsPath(ps.Containers[0], tunDevicePath) {
-				t.Errorf("%s is a pod volume but the ateom container does not mount it", tunDevicePath)
+				t.Errorf("%s is a pod volume but the worker container does not mount it", tunDevicePath)
 			}
 
 			hasDeviceRequest := true
@@ -313,18 +395,12 @@ func TestMicroVMPodShape(t *testing.T) {
 			// The device request handles placement, so the class must not also
 			// pin a nodeSelector (which would re-introduce the hand-applied
 			// label as a scheduling requirement).
-			if _, hasSelector := ps.NodeSelector["ate.dev/sandboxClass"]; hasSelector {
-				t.Errorf("nodeSelector on ate.dev/sandboxClass should be gone; placement comes from the device request")
+			if _, hasSelector := ps.NodeSelector[sandboxClassTaintKey]; hasSelector {
+				t.Errorf("nodeSelector on %s should be gone; placement comes from the device request", sandboxClassTaintKey)
 			}
-			hasTol := false
-			for _, tol := range ps.Tolerations {
-				if tol.Key != nil && *tol.Key == "ate.dev/sandboxClass" {
-					hasTol = true
-				}
-			}
-			if hasDeviceRequest != tt.wantMicroVM || hasTol != tt.wantMicroVM || hasTunMount != tt.wantMicroVM {
-				t.Errorf("microvm shape: deviceRequest=%v toleration=%v tunMount=%v, want all %v",
-					hasDeviceRequest, hasTol, hasTunMount, tt.wantMicroVM)
+			if hasDeviceRequest != tt.wantMicroVM || hasTunMount != tt.wantMicroVM {
+				t.Errorf("microvm shape: deviceRequest=%v tunMount=%v, want both %v",
+					hasDeviceRequest, hasTunMount, tt.wantMicroVM)
 			}
 		})
 	}
@@ -355,13 +431,13 @@ func deviceLimit(c corev1ac.ContainerApplyConfiguration, name string) (string, b
 // A pod template's own resource limits must survive the device requests being
 // merged in.
 func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
-	wp := testWorkerPoolApplyConfig(&atev1alpha1.WorkerPoolPodTemplate{
+	wp := testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 		Resources: &corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
 		},
 	})
-	wp.Spec.SandboxClass = atev1alpha1.SandboxClassMicroVM
-	c := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec.Containers[0]
+	wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: atev1.SandboxClassMicroVM}}
+	c := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec.Containers[0]
 
 	if got, ok := deviceLimit(c, string(corev1.ResourceMemory)); !ok || got != "2Gi" {
 		t.Errorf("memory limit = %q (present=%v), want 2Gi", got, ok)
@@ -371,26 +447,33 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 	}
 }
 
-// TestAteomSecurityContextByClass asserts no worker runs privileged: every class
-// drops ALL capabilities and adds back an explicit set. Only the micro-VM class
-// gives up the runtime's default seccomp profile, and only so virtiofsd can keep
-// its own sandbox. An empty class defaults to gVisor.
-func TestAteomSecurityContextByClass(t *testing.T) {
+// TestWorkerSecurityContextByClass asserts no worker runs privileged: every class
+// drops ALL capabilities and adds back its fixed runtime-specific set. An empty
+// class defaults to gVisor. The expected sets are independent of the production
+// lists so adding an unnecessary capability fails the test.
+func TestWorkerSecurityContextByClass(t *testing.T) {
 	tests := []struct {
 		name     string
-		class    atev1alpha1.SandboxClass
+		class    atev1.SandboxClass
 		wantCaps []corev1.Capability
 		// wantSeccompUnconfined holds for every class: both runsc's and
 		// virtiofsd's sandbox pivot_root(), which the default profile denies.
 		wantSeccompUnconfined bool
 	}{
-		{"gvisor default", "", ateomGvisorCapabilities, true},
-		{"gvisor explicit", atev1alpha1.SandboxClassGvisor, ateomGvisorCapabilities, true},
-		{"microvm", atev1alpha1.SandboxClassMicroVM, ateomMicroVMCapabilities, true},
+		{"gvisor default", "", []corev1.Capability{"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "CHOWN", "NET_RAW", "SETFCAP"}, true},
+		{"gvisor explicit", atev1.SandboxClassGvisor, []corev1.Capability{"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "CHOWN", "NET_RAW", "SETFCAP"}, true},
+		{"microvm", atev1.SandboxClassMicroVM, []corev1.Capability{"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "CHOWN", "MKNOD", "SETFCAP", "FSETID", "SETPCAP"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sc := ateomSecurityContext(tt.class)
+			wp := testWorkerPoolApplyConfig(nil)
+			if tt.class != "" {
+				wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
+			}
+			sc := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec.Containers[0].SecurityContext
+			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+				t.Errorf("AllowPrivilegeEscalation = %v, want false for every class", sc.AllowPrivilegeEscalation)
+			}
 			if sc.Privileged == nil || *sc.Privileged {
 				t.Errorf("Privileged = %v, want false for every class", sc.Privileged)
 			}
@@ -426,7 +509,7 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 // TestTerminationGracePeriodSeconds asserts the pod's grace period is hardcoded to 3600s.
 func TestTerminationGracePeriodSeconds(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+	ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
 	if ps.TerminationGracePeriodSeconds == nil {
 		t.Fatalf("TerminationGracePeriodSeconds not set")
 	}
@@ -435,40 +518,59 @@ func TestTerminationGracePeriodSeconds(t *testing.T) {
 	}
 }
 
-// TestBuildDeploymentApplyConfigOTelEndpoint asserts the OTLP endpoint and the
-// resource identity are set on the ateom container only when an endpoint is
-// configured, and that every ref the value substitutes is declared ahead of it.
+// TestRolloutStrategy pins the rollout settings a pool edit rolls workers
+// with: delete first, never surge, and a progress deadline that outlasts the
+// actors' drain window.
+func TestRolloutStrategy(t *testing.T) {
+	wp := testWorkerPoolApplyConfig(nil)
+	spec := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec
+	if spec.Strategy == nil || spec.Strategy.RollingUpdate == nil {
+		t.Fatalf("Strategy.RollingUpdate not set")
+	}
+	if got := *spec.Strategy.Type; got != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("Strategy.Type = %q, want RollingUpdate", got)
+	}
+	ru := spec.Strategy.RollingUpdate
+	if got := ru.MaxSurge.String(); got != "0" {
+		t.Errorf("MaxSurge = %q, want 0", got)
+	}
+	if got := ru.MaxUnavailable.String(); got != "10%" {
+		t.Errorf("MaxUnavailable = %q, want 10%%", got)
+	}
+	if spec.ProgressDeadlineSeconds == nil || *spec.ProgressDeadlineSeconds <= int32(workerTerminationGracePeriodSeconds) {
+		t.Errorf("ProgressDeadlineSeconds = %v, want above the %ds grace period", spec.ProgressDeadlineSeconds, workerTerminationGracePeriodSeconds)
+	}
+}
+
+// TestBuildDeploymentApplyConfigOTelEndpoint asserts the OTLP endpoint is set on
+// the worker container only when one is configured, the resource identity
+// always, since the worker also exports through atelet's relay, and that every
+// ref the identity substitutes is declared ahead of it.
 func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 	const endpoint = "http://collector.otel-system.svc:4317"
 	tests := []struct {
-		name          string
-		endpoint      string
-		wantTelemetry bool
+		name         string
+		endpoint     string
+		wantEndpoint bool
 	}{
 		{"endpoint empty", "", false},
 		{"endpoint set", endpoint, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{Endpoint: tt.endpoint}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 
-			if _, ok := env["POD_UID"]; !ok {
-				t.Error("POD_UID must always be set")
-			}
-
-			if !tt.wantTelemetry {
-				for _, k := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_RESOURCE_ATTRIBUTES", "OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT", "POD_NAME", "POD_NAMESPACE", "NODE_NAME"} {
-					if _, ok := env[k]; ok {
-						t.Errorf("%s must be absent without an OTLP endpoint", k)
-					}
+			for _, k := range []string{"POD_UID", "POD_NAMESPACE", "WORKER_POOL_NAME"} {
+				if _, ok := env[k]; !ok {
+					t.Errorf("%s must always be set", k)
 				}
-				return
 			}
 
-			if got := env["OTEL_EXPORTER_OTLP_ENDPOINT"].value; got != endpoint {
-				t.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT = %q, want %q", got, endpoint)
+			got, ok := env["OTEL_EXPORTER_OTLP_ENDPOINT"]
+			if ok != tt.wantEndpoint || got.value != tt.endpoint {
+				t.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT = %q (set %t), want %q", got.value, ok, tt.endpoint)
 			}
 			resourceAttrs := env["OTEL_RESOURCE_ATTRIBUTES"].value
 
@@ -496,47 +598,48 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 }
 
 // TestBuildDeploymentApplyConfigMetricExportTuning asserts the export interval and
-// per-export timeout reach the ateom container only when each is set alongside an
-// endpoint. ateom is invisible to the collector until its first successful export
-// tick, so the kind stack shortens the SDK's 60s interval to keep that gap inside
-// the e2e budget, and its 30s timeout so a failing tick cannot swallow three
+// per-export timeout reach the worker container only when each is set, with or
+// without an endpoint, since the worker also exports through atelet's relay. The
+// worker is invisible to the collector until its first successful export tick,
+// so the kind stack shortens the SDK's 60s interval to keep that gap inside the
+// e2e budget, and its 30s timeout so a failing tick cannot swallow three
 // shortened intervals.
 func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
 	const endpoint = "http://collector.otel-system.svc:4317"
 	tests := []struct {
 		name string
-		otel ateomOTelSettings
+		otel workerOTelSettings
 		want map[string]string // env name -> value; absent key means must not be set
 	}{
 		{
 			name: "unset keeps SDK defaults",
-			otel: ateomOTelSettings{Endpoint: endpoint},
+			otel: workerOTelSettings{Endpoint: endpoint},
 			want: nil,
 		},
 		{
 			name: "both set with endpoint",
-			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000", MetricExportTimeout: "10000"},
+			otel: workerOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000", MetricExportTimeout: "10000"},
 			want: map[string]string{"OTEL_METRIC_EXPORT_INTERVAL": "10000", "OTEL_METRIC_EXPORT_TIMEOUT": "10000"},
 		},
 		{
 			name: "interval alone",
-			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000"},
+			otel: workerOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000"},
 			want: map[string]string{"OTEL_METRIC_EXPORT_INTERVAL": "10000"},
 		},
 		{
 			name: "timeout alone",
-			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportTimeout: "10000"},
+			otel: workerOTelSettings{Endpoint: endpoint, MetricExportTimeout: "10000"},
 			want: map[string]string{"OTEL_METRIC_EXPORT_TIMEOUT": "10000"},
 		},
 		{
-			name: "ignored without endpoint",
-			otel: ateomOTelSettings{MetricExportInterval: "10000", MetricExportTimeout: "10000"},
-			want: nil,
+			name: "set without endpoint",
+			otel: workerOTelSettings{MetricExportInterval: "10000", MetricExportTimeout: "10000"},
+			want: map[string]string{"OTEL_METRIC_EXPORT_INTERVAL": "10000", "OTEL_METRIC_EXPORT_TIMEOUT": "10000"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
@@ -555,45 +658,45 @@ func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
 }
 
 // TestBuildDeploymentApplyConfigTracesSamplerPropagation asserts the sampler
-// env pair reaches the ateom container only alongside an endpoint, and the arg
+// env pair reaches the worker container with or without an endpoint, and the arg
 // only alongside a sampler: an arg without a sampler name is dead config the
 // SDK ignores.
 func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
 	const endpoint = "http://collector.otel-system.svc:4317"
 	tests := []struct {
 		name string
-		otel ateomOTelSettings
+		otel workerOTelSettings
 		want map[string]string // value by env name; absent key means must not be set
 	}{
 		{
 			name: "unset keeps binary default",
-			otel: ateomOTelSettings{Endpoint: endpoint},
+			otel: workerOTelSettings{Endpoint: endpoint},
 			want: nil,
 		},
 		{
 			name: "sampler and arg with endpoint",
-			otel: ateomOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
+			otel: workerOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
 			want: map[string]string{"OTEL_TRACES_SAMPLER": "parentbased_traceidratio", "OTEL_TRACES_SAMPLER_ARG": "0.25"},
 		},
 		{
 			name: "sampler alone",
-			otel: ateomOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_always_on"},
+			otel: workerOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_always_on"},
 			want: map[string]string{"OTEL_TRACES_SAMPLER": "parentbased_always_on"},
 		},
 		{
 			name: "arg alone stays unset",
-			otel: ateomOTelSettings{Endpoint: endpoint, TracesSamplerArg: "0.25"},
+			otel: workerOTelSettings{Endpoint: endpoint, TracesSamplerArg: "0.25"},
 			want: nil,
 		},
 		{
-			name: "ignored without endpoint",
-			otel: ateomOTelSettings{TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
-			want: nil,
+			name: "set without endpoint",
+			otel: workerOTelSettings{TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
+			want: map[string]string{"OTEL_TRACES_SAMPLER": "parentbased_traceidratio", "OTEL_TRACES_SAMPLER_ARG": "0.25"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"} {
@@ -606,6 +709,60 @@ func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
 				if ok && got.value != want {
 					t.Errorf("%s = %q, want %q", k, got.value, want)
 				}
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentApplyConfigTracesExporterPropagation asserts
+// OTEL_TRACES_EXPORTER reaches the worker container only when set, with or
+// without an endpoint.
+func TestBuildDeploymentApplyConfigTracesExporterPropagation(t *testing.T) {
+	const endpoint = "http://collector.otel-system.svc:4317"
+	tests := []struct {
+		name    string
+		otel    workerOTelSettings
+		want    string
+		wantSet bool
+	}{
+		{name: "unset keeps binary default", otel: workerOTelSettings{Endpoint: endpoint}},
+		{name: "none with endpoint", otel: workerOTelSettings{Endpoint: endpoint, TracesExporter: "none"}, want: "none", wantSet: true},
+		{name: "none without endpoint", otel: workerOTelSettings{TracesExporter: "none"}, want: "none", wantSet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+				Spec.Template.Spec.Containers[0]
+			got, ok := envByName(c.Env)["OTEL_TRACES_EXPORTER"]
+			if ok != tt.wantSet || got.value != tt.want {
+				t.Errorf("OTEL_TRACES_EXPORTER = %q (set %t), want %q (set %t)", got.value, ok, tt.want, tt.wantSet)
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentApplyConfigMetricsExporterPropagation asserts
+// OTEL_METRICS_EXPORTER reaches the worker container only when set, with or
+// without an endpoint.
+func TestBuildDeploymentApplyConfigMetricsExporterPropagation(t *testing.T) {
+	const endpoint = "http://collector.otel-system.svc:4317"
+	tests := []struct {
+		name    string
+		otel    workerOTelSettings
+		want    string
+		wantSet bool
+	}{
+		{name: "unset keeps binary default", otel: workerOTelSettings{Endpoint: endpoint}},
+		{name: "none with endpoint", otel: workerOTelSettings{Endpoint: endpoint, MetricsExporter: "none"}, want: "none", wantSet: true},
+		{name: "none without endpoint", otel: workerOTelSettings{MetricsExporter: "none"}, want: "none", wantSet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+				Spec.Template.Spec.Containers[0]
+			got, ok := envByName(c.Env)["OTEL_METRICS_EXPORTER"]
+			if ok != tt.wantSet || got.value != tt.want {
+				t.Errorf("OTEL_METRICS_EXPORTER = %q (set %t), want %q (set %t)", got.value, ok, tt.want, tt.wantSet)
 			}
 		})
 	}
@@ -658,12 +815,12 @@ func envByName(env []corev1ac.EnvVarApplyConfiguration) map[string]envInfo {
 	return m
 }
 
-func testWorkerPoolApplyConfig(tmpl *atev1alpha1.WorkerPoolPodTemplate) *atev1alpha1.WorkerPool {
-	return &atev1alpha1.WorkerPool{
+func testWorkerPoolApplyConfig(tmpl *atev1.WorkerPoolPodTemplate) *atev1.WorkerPool {
+	return &atev1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default", UID: "uid"},
-		Spec: atev1alpha1.WorkerPoolSpec{
+		Spec: atev1.WorkerPoolSpec{
 			Replicas:    2,
-			WorkerImage: "ateom:v1",
+			WorkerImage: "worker:v1",
 			Template:    tmpl,
 		},
 	}
@@ -678,16 +835,16 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 			WithRunAsGroup(0)).
 		WithVolumes(
 			corev1ac.Volume().
-				WithName(ateomCapacityVolume).
+				WithName(workerCapacityVolume).
 				WithDownwardAPI(corev1ac.DownwardAPIVolumeSource().
 					WithItems(
-						resourceFieldRefFile(ateomcapacity.CPULimitFile, "limits.cpu", milliCores),
-						resourceFieldRefFile(ateomcapacity.MemoryLimitFile, "limits.memory", wholeBytes),
+						resourceFieldRefFile(workercapacity.CPULimitFile, "limits.cpu", milliCores),
+						resourceFieldRefFile(workercapacity.MemoryLimitFile, "limits.memory", wholeBytes),
 					)),
 			corev1ac.Volume().
-				WithName("run-ateom").
+				WithName("ate-base").
 				WithHostPath(corev1ac.HostPathVolumeSource().
-					WithPath(ateompath.BasePath).
+					WithPath(nodepath.BasePath).
 					WithType(corev1.HostPathDirectoryOrCreate)),
 			corev1ac.Volume().
 				WithName(atunnelIdentityVolume).
@@ -720,16 +877,20 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				),
 		).
 		WithContainers(corev1ac.Container().
-			WithName("ateom").
+			WithName("worker").
 			WithImage(wp.Spec.WorkerImage).
 			WithArgs(
 				"--pod-uid=$(POD_UID)",
+				"--pod-ips=$(POD_IPS)",
 				"--atunnel-listen-address=:443",
 				"--atunnel-connect-listen-address=:8443",
 				"--atunnel-credential-bundle="+atunnelIdentityMountPath+"/credential-bundle.pem",
 				"--atunnel-trust-bundle="+atunnelIdentityMountPath+"/trust-bundle.pem",
+				"--atunnel-client-identity="+installdefaults.RouterSPIFFEID(installdefaults.SystemNamespace),
 				"--atunnel-egress-listen-address=0.0.0.0:15001",
 				"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
+				"--dns-egress-policy="+egresspolicy.DNSEgressPolicyEnforceInAtunnel,
+				"--preview=",
 			).
 			WithPorts(corev1ac.ContainerPort().
 				WithName("https").
@@ -751,9 +912,10 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithRunAsUser(0).
 				WithRunAsGroup(0).
 				WithPrivileged(false).
+				WithAllowPrivilegeEscalation(false).
 				WithCapabilities(corev1ac.Capabilities().
 					WithDrop("ALL").
-					WithAdd(ateomGvisorCapabilities...)).
+					WithAdd(workerGvisorCapabilities...)).
 				WithAppArmorProfile(corev1ac.AppArmorProfile().
 					WithType(corev1.AppArmorProfileTypeUnconfined)).
 				WithSeccompProfile(corev1ac.SeccompProfile().
@@ -764,15 +926,43 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 					WithValueFrom(corev1ac.EnvVarSource().
 						WithFieldRef(corev1ac.ObjectFieldSelector().
 							WithFieldPath("metadata.uid"))),
+				corev1ac.EnvVar().
+					WithName("POD_NAMESPACE").
+					WithValueFrom(corev1ac.EnvVarSource().
+						WithFieldRef(corev1ac.ObjectFieldSelector().
+							WithFieldPath("metadata.namespace"))),
+				corev1ac.EnvVar().
+					WithName("WORKER_POOL_NAME").
+					WithValueFrom(corev1ac.EnvVarSource().
+						WithFieldRef(corev1ac.ObjectFieldSelector().
+							WithFieldPath("metadata.labels['ate.dev/worker-pool']"))),
+				corev1ac.EnvVar().
+					WithName("POD_NAME").
+					WithValueFrom(corev1ac.EnvVarSource().
+						WithFieldRef(corev1ac.ObjectFieldSelector().
+							WithFieldPath("metadata.name"))),
+				corev1ac.EnvVar().
+					WithName("NODE_NAME").
+					WithValueFrom(corev1ac.EnvVarSource().
+						WithFieldRef(corev1ac.ObjectFieldSelector().
+							WithFieldPath("spec.nodeName"))),
+				corev1ac.EnvVar().
+					WithName("POD_IPS").
+					WithValueFrom(corev1ac.EnvVarSource().
+						WithFieldRef(corev1ac.ObjectFieldSelector().
+							WithFieldPath("status.podIPs"))),
+				corev1ac.EnvVar().
+					WithName("OTEL_RESOURCE_ATTRIBUTES").
+					WithValue(workerOTelResourceAttributes),
 			).
 			WithVolumeMounts(
 				corev1ac.VolumeMount().
-					WithName(ateomCapacityVolume).
-					WithMountPath(ateomcapacity.CapacityMountPath).
+					WithName(workerCapacityVolume).
+					WithMountPath(workercapacity.MountPath).
 					WithReadOnly(true),
 				corev1ac.VolumeMount().
-					WithName("run-ateom").
-					WithMountPath(ateompath.BasePath).
+					WithName("ate-base").
+					WithMountPath(nodepath.BasePath).
 					WithMountPropagation(corev1.MountPropagationHostToContainer),
 				corev1ac.VolumeMount().
 					WithName(atunnelIdentityVolume).
@@ -786,8 +976,11 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 			WithResources(corev1ac.ResourceRequirements()))
 
 	podSpecAC.NodeSelector = map[string]string{}
-	podSpecAC.Tolerations = []corev1ac.TolerationApplyConfiguration{}
+	podSpecAC.Tolerations = []corev1ac.TolerationApplyConfiguration{
+		sandboxClassTolerationAC(atev1.SandboxClassGvisor),
+	}
 	podSpecAC.WithPriorityClassName("")
+	podSpecAC.WithServiceAccountName("ateworker")
 	podSpecAC.WithAffinity(corev1ac.Affinity())
 	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 	if mutatePodSpec != nil {
@@ -797,7 +990,7 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 	return appsv1ac.Deployment(wp.Name, wp.Namespace).
 		WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 		WithOwnerReferences(metav1ac.OwnerReference().
-			WithAPIVersion(atev1alpha1.GroupVersion.String()).
+			WithAPIVersion(atev1.GroupVersion.String()).
 			WithKind("WorkerPool").
 			WithName(wp.Name).
 			WithUID(wp.UID).
@@ -805,9 +998,181 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 			WithBlockOwnerDeletion(true)).
 		WithSpec(appsv1ac.DeploymentSpec().
 			WithReplicas(wp.Spec.Replicas).
+			WithStrategy(appsv1ac.DeploymentStrategy().
+				WithType(appsv1.RollingUpdateDeploymentStrategyType).
+				WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+					WithMaxSurge(intstr.FromInt32(0)).
+					WithMaxUnavailable(intstr.FromString("10%")))).
+			WithProgressDeadlineSeconds(4800).
 			WithSelector(metav1ac.LabelSelector().
 				WithMatchLabels(map[string]string{"ate.dev/worker-pool": wp.Name})).
 			WithTemplate(corev1ac.PodTemplateSpec().
 				WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 				WithSpec(podSpecAC)))
+}
+
+// TestBuildDeploymentAtunnelIdentitiesRelocatedNamespace pins the SPIFFE
+// identities handed to worker to the controller's namespace. atunnel runs in
+// the actor's pod, so it cannot derive atelet's or the router's namespace
+// itself; if these carry the wrong one, the credential broker handshake and
+// actor ingress both fail closed. Every other case here passes the canonical
+// namespace and so would pass against a hardcoded value too.
+func TestBuildDeploymentAtunnelIdentitiesRelocatedNamespace(t *testing.T) {
+	const relocated = "substrate-test"
+
+	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, relocated, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+		Spec.Template.Spec.Containers[0]
+
+	want := map[string]string{
+		"--atunnel-client-identity=": "spiffe://cluster.local/ns/substrate-test/sa/atenet-router",
+		"--atunnel-broker-identity=": "spiffe://cluster.local/ns/substrate-test/sa/atelet",
+	}
+	for flag, wantVal := range want {
+		var got string
+		for _, arg := range c.Args {
+			if strings.HasPrefix(arg, flag) {
+				got = strings.TrimPrefix(arg, flag)
+			}
+		}
+		if got == "" {
+			t.Fatalf("no %s argument found in %v", flag, c.Args)
+		}
+		if got != wantVal {
+			t.Errorf("%s%s, want %s%s", flag, got, flag, wantVal)
+		}
+	}
+}
+
+// TestBuildDeploymentAtunnelIdentitiesPrefixedServiceAccounts covers a
+// deployment that renames the ServiceAccounts, which is what a packaging layer
+// does when it prefixes every resource name. The SPIFFE ID embeds the
+// ServiceAccount name, so identities built from the compiled-in defaults name
+// accounts that do not exist and atunnel rejects the peer.
+func TestBuildDeploymentAtunnelIdentitiesPrefixedServiceAccounts(t *testing.T) {
+	const (
+		namespace = "kagent-system"
+		atelet    = "kagent-atelet"
+		router    = "kagent-atenet-router"
+	)
+
+	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, namespace, atelet, router, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+		Spec.Template.Spec.Containers[0]
+
+	want := map[string]string{
+		"--atunnel-client-identity=": "spiffe://cluster.local/ns/kagent-system/sa/kagent-atenet-router",
+		"--atunnel-broker-identity=": "spiffe://cluster.local/ns/kagent-system/sa/kagent-atelet",
+	}
+	for flag, wantVal := range want {
+		var got string
+		for _, arg := range c.Args {
+			if strings.HasPrefix(arg, flag) {
+				got = strings.TrimPrefix(arg, flag)
+			}
+		}
+		if got != wantVal {
+			t.Errorf("%s%s, want %s%s", flag, got, flag, wantVal)
+		}
+	}
+}
+
+// TestBuildDeploymentOmitsBrokerIdentityForCanonicalInstall pins the flag's
+// absence. A WorkerPool may still pin a worker from before
+// --atunnel-broker-identity existed, which exits on the unrecognized flag, so
+// passing it would crashloop that pool's workers.
+func TestBuildDeploymentOmitsBrokerIdentityForCanonicalInstall(t *testing.T) {
+	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{},
+		installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+		Spec.Template.Spec.Containers[0]
+
+	for _, arg := range c.Args {
+		if strings.HasPrefix(arg, "--atunnel-broker-identity=") {
+			t.Fatalf("canonical install passed %q; a worker predating the flag exits on it", arg)
+		}
+	}
+
+	// The value it would have carried is the one such a worker already assumes,
+	// so omitting it changes nothing for either binary.
+	var clientIdentity string
+	for _, arg := range c.Args {
+		if strings.HasPrefix(arg, "--atunnel-client-identity=") {
+			clientIdentity = strings.TrimPrefix(arg, "--atunnel-client-identity=")
+		}
+	}
+	if want := installdefaults.RouterSPIFFEID(installdefaults.SystemNamespace); clientIdentity != want {
+		t.Errorf("--atunnel-client-identity=%s, want %s", clientIdentity, want)
+	}
+}
+
+// TestBuildDeploymentApplyConfigWorkerPoolEnv asserts the worker reads its
+// pool from the label the controller puts on the pod, so the usage records
+// name the pool the pod belongs to.
+func TestBuildDeploymentApplyConfigWorkerPoolEnv(t *testing.T) {
+	d := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
+	c := d.Spec.Template.Spec.Containers[0]
+	var path string
+	for _, e := range c.Env {
+		if e.Name != nil && *e.Name == "WORKER_POOL_NAME" {
+			path = *e.ValueFrom.FieldRef.FieldPath
+		}
+	}
+	if want := "metadata.labels['" + workerPoolLabel + "']"; path != want {
+		t.Errorf("WORKER_POOL_NAME field path = %q, want %q", path, want)
+	}
+	if _, ok := d.Spec.Template.Labels[workerPoolLabel]; !ok {
+		t.Errorf("pod template has no %s label for WORKER_POOL_NAME to read", workerPoolLabel)
+	}
+}
+
+// TestBuildDeploymentApplyConfigLogsExporter asserts OTEL_LOGS_EXPORTER
+// reaches the worker container whenever it is set, with or without an endpoint,
+// since the worker also exports through atelet's relay.
+func TestBuildDeploymentApplyConfigLogsExporter(t *testing.T) {
+	const endpoint = "http://collector.otel-system.svc:4317"
+	for _, tt := range []struct {
+		name string
+		otel workerOTelSettings
+		want string // "" means must not be set
+	}{
+		{"set with endpoint", workerOTelSettings{Endpoint: endpoint, LogsExporter: "otlp"}, "otlp"},
+		{"unset keeps binary default", workerOTelSettings{Endpoint: endpoint}, ""},
+		{"set without endpoint", workerOTelSettings{LogsExporter: "otlp"}, "otlp"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+				Spec.Template.Spec.Containers[0]
+			got, ok := envByName(c.Env)["OTEL_LOGS_EXPORTER"]
+			if ok != (tt.want != "") || (ok && got.value != tt.want) {
+				t.Errorf("OTEL_LOGS_EXPORTER = %q (present %v), want %q", got.value, ok, tt.want)
+			}
+		})
+	}
+}
+
+// worker gets preview features when the controller has them.
+func TestBuildDeploymentPreview(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		gates []string
+		want  []string
+	}{
+		{name: "disabled", want: []string{"--preview="}},
+		{name: "named", gates: []string{"Fake"}, want: []string{"--preview=Fake"}},
+		{name: "ALL", gates: []string{"ALL"}, want: []string{"--preview=Fake,Phony"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			preview.InitForTestFake(t, []preview.Gate{"Fake", "Phony"}, tc.gates...)
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{},
+				installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+				Spec.Template.Spec.Containers[0]
+			var got []string
+			for _, arg := range c.Args {
+				if strings.HasPrefix(arg, "--preview") {
+					got = append(got, arg)
+				}
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("--preview args mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

@@ -21,7 +21,7 @@ import (
 )
 
 // SandboxClassMicroVM is the kata + cloud-hypervisor runtime, spelled as the
-// WorkerPool/ActorTemplate spec.sandboxClass field spells it.
+// WorkerPool spec.sandboxClasses[].name spells it.
 const SandboxClassMicroVM = "microvm"
 
 // sandboxClassEnv selects which runtime's fixtures the suites build actors
@@ -38,13 +38,16 @@ func SandboxClass() string { return os.Getenv(sandboxClassEnv) }
 // Assertions that only hold for one runtime gate on this.
 func IsMicroVM() bool { return SandboxClass() == SandboxClassMicroVM }
 
+// IsAgentGateway reports whether the suites run against the agentgateway lane.
+func IsAgentGateway() bool { return os.Getenv(AtenetDataplaneEnv) == "agentgateway" }
+
 // Fixture identifies an installed WorkerPool + ActorTemplate pair (both carry
 // the same name) that suites either create Actors from directly or copy the
-// resolved runtime — sandbox class, ateom image, container images — out of.
+// resolved runtime — sandbox class, worker image, container images — out of.
 type Fixture struct {
 	Namespace string
 	Name      string
-	// DeployWith is the install flag or script that creates the fixture, so a
+	// DeployWith is the ate-setup command that creates the fixture, so a
 	// missing one reports how to fix it rather than just failing.
 	DeployWith string
 }
@@ -52,8 +55,8 @@ type Fixture struct {
 // SubstrateFixture identifies an installed substrate ActorTemplate (the proto
 // resource created through the ate API, not the CRD) plus the CRD WorkerPool
 // backing it. Suites copy the resolved runtime — container images, sandbox
-// config, sandbox size — out of the template, and the ateom image and sandbox
-// class out of the pool.
+// size — out of the template, and the worker image and sandbox class out of
+// the pool.
 type SubstrateFixture struct {
 	// Atespace and Name locate the ActorTemplate for GetActorTemplate.
 	Atespace string
@@ -61,7 +64,7 @@ type SubstrateFixture struct {
 	// PoolNamespace and PoolName locate the WorkerPool CRD.
 	PoolNamespace string
 	PoolName      string
-	// DeployWith is the install flag or script that creates the fixture, so a
+	// DeployWith is the ate-setup command that creates the fixture, so a
 	// missing one reports how to fix it rather than just failing.
 	DeployWith string
 }
@@ -77,7 +80,7 @@ func SubstrateCounterFixture() SubstrateFixture {
 		Name:          "counter",
 		PoolNamespace: "ate-demo-counter",
 		PoolName:      "counter",
-		DeployWith:    "hack/install-ate-kind.sh --deploy-demo-counter",
+		DeployWith:    "go run ./cmd/ate-setup --kind deploy demo counter",
 	}
 	if IsMicroVM() {
 		f = SubstrateFixture{
@@ -85,7 +88,7 @@ func SubstrateCounterFixture() SubstrateFixture {
 			Name:          "counter-microvm",
 			PoolNamespace: "ate-demo-counter-microvm",
 			PoolName:      "counter-microvm",
-			DeployWith:    "hack/install-ate-kind.sh --deploy-demo-counter-microvm",
+			DeployWith:    "go run ./cmd/ate-setup --kind deploy demo counter-microvm",
 		}
 	}
 	if v := os.Getenv("E2E_SUBSTRATE_TEMPLATE_ATESPACE"); v != "" {
@@ -103,19 +106,20 @@ func SubstrateCounterFixture() SubstrateFixture {
 	return f
 }
 
-// EgressFixture returns the egress demo for the sandbox class under test.
+// EgressFixture returns the egress demo for the sandbox class under test. Its
+// actors trust the CA the egress gateway mints its leaves from.
 func EgressFixture() Fixture {
 	if IsMicroVM() {
 		return Fixture{
 			Namespace:  "ate-demo-egress-microvm",
 			Name:       "egress-microvm",
-			DeployWith: "hack/install-ate-kind.sh --deploy-demo-egress-microvm",
+			DeployWith: "go run ./cmd/ate-setup --kind deploy demo egress-microvm",
 		}
 	}
 	return Fixture{
 		Namespace:  "ate-demo-egress",
 		Name:       "egress",
-		DeployWith: "hack/install-ate-kind.sh --deploy-demo-egress",
+		DeployWith: "go run ./cmd/ate-setup --kind deploy demo egress",
 	}
 }
 
@@ -165,27 +169,24 @@ func TemplateReadyTimeout(t *testing.T) time.Duration {
 // One template serves both sandbox classes so the two variants of a fixture
 // cannot drift apart. See renderManifest for the placeholder kinds a template
 // can carry.
-func RenderFixtureManifest(t *testing.T, relPath, bucket, name string) string {
+func RenderFixtureManifest(t *testing.T, relPath, name string) string {
 	t.Helper()
-	inline, blocks := fixtureSubstitutions(bucket, name)
+	inline, blocks := fixtureSubstitutions(name)
 	return renderManifest(t, relPath, inline, blocks)
 }
 
 // fixtureSubstitutions is the placeholder set the internal/e2e/fixtures
 // manifest templates carry, split into the inline and whole-line-block kinds
 // RenderFixtureManifest treats differently.
-func fixtureSubstitutions(bucket, name string) (inline, blocks map[string]string) {
+func fixtureSubstitutions(name string) (inline, blocks map[string]string) {
 	inline = map[string]string{
-		"${BUCKET_NAME}": bucket,
-		"${ATEOM_IMAGE}": "ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor",
+		"${WORKER_IMAGE}": "ko://go.ate.dev/substrate/cmd/ateworker-gvisor",
 		// The manifest-side half of FixtureName: it suffixes the fixture's
-		// namespace, and with it the snapshot prefix underneath.
+		// namespace.
 		"${FIXTURE_SUFFIX}": "-" + name,
 	}
 	blocks = map[string]string{
-		"${WORKERPOOL_RUNTIME}":     "",
-		"${TEMPLATE_SANDBOX_CLASS}": "",
-		"${TEMPLATE_RESOURCES}":     "",
+		"${WORKERPOOL_RUNTIME}": "  sandboxClasses:\n  - name: gvisor",
 		// Off unless the caller opts in; see WithTrustBundle.
 		"${TEMPLATE_TRUST_BUNDLE}": "",
 	}
@@ -193,19 +194,8 @@ func fixtureSubstitutions(bucket, name string) (inline, blocks map[string]string
 		return inline, blocks
 	}
 
-	inline["${ATEOM_IMAGE}"] = "ko://github.com/agent-substrate/substrate/cmd/ateom-microvm"
+	inline["${WORKER_IMAGE}"] = "ko://go.ate.dev/substrate/cmd/ateworker-microvm"
 	inline["${FIXTURE_SUFFIX}"] = "-" + SandboxClassMicroVM + "-" + name
-	// The micro-VM ActorTemplates name the cluster-wide SandboxConfig
-	// hack/install-microvm-deps.sh installs (configName: microvm), so a
-	// missing or stale one fails loudly. The pool only selects the class.
-	blocks["${WORKERPOOL_RUNTIME}"] = "  sandboxClass: microvm"
-	// Must match the WorkerPool's: a snapshot is not portable across sandbox
-	// classes, so only same-class pools are eligible to run these actors.
-	blocks["${TEMPLATE_SANDBOX_CLASS}"] = "  sandboxClass: microvm"
-	// Only for fixtures that declare no limits of their own. Without them the
-	// guest boots at the kata config's default (2GiB), and several of those do
-	// not fit beside the demo pools on CI's single kind node. These size the VM
-	// itself — see internal/sizing.
-	blocks["${TEMPLATE_RESOURCES}"] = "  resources:\n    limits:\n      cpu: \"1\"\n      memory: 512Mi"
+	blocks["${WORKERPOOL_RUNTIME}"] = "  sandboxClasses:\n  - name: microvm"
 	return inline, blocks
 }

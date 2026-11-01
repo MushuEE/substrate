@@ -25,8 +25,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
 )
 
 // installTrees are the directories the installer reads manifests from.
@@ -112,54 +112,33 @@ func TestComponentsCoverTheManifests(t *testing.T) {
 			" in images.Components: %v\n"+
 			"add the missing entries to images.Components, or remove the stale ones; "+
 			"an entry still carrying a ko:// prefix is a reference that does not name "+
-			"its package by the full import path %s/...",
+			"its package by the full import path %s/...\n"+
+			"a new control-plane component also needs its own `ate-setup deploy` "+
+			"subcommand and a place in the upgrade order in docs/upgrade.md",
 			strings.Join(installTrees, "/ and "), found, want, images.ModulePath)
 	}
 }
 
-func TestSourceValidate(t *testing.T) {
-	tests := []struct {
-		name  string
-		src   images.Source
-		error string
-	}{
-		{
-			name: "build from source",
-			src:  images.Source{},
-		},
-		{
-			name: "prebuilt",
-			src:  images.Source{Repo: "example.com/substrate", Tag: "v1"},
-		},
-		{
-			name:  "no tag",
-			src:   images.Source{Repo: "example.com/substrate"},
-			error: "--image-repo (or ATE_IMAGE_REPO) requires --image-tag",
-		},
-		{
-			// A tag with nowhere to pull from would otherwise be dropped, and
-			// the source build that followed would look like the release.
-			name:  "no repo",
-			src:   images.Source{Tag: "v1"},
-			error: "--image-tag (or ATE_IMAGE_TAG) requires --image-repo",
-		},
+// ImageName addresses a published image by the last element of its import
+// path, so two components sharing one would install each other's binary.
+// --base-import-paths makes that collision possible; ko's default md5 suffix
+// did not.
+func TestImageNamesAreUnique(t *testing.T) {
+	byName := make(map[string]string, len(images.Components))
+	for _, pkg := range images.Components {
+		name := images.ImageName(pkg)
+		if other, ok := byName[name]; ok {
+			t.Errorf("%s and %s both publish as %q; one of them needs a different package name", other, pkg, name)
+			continue
+		}
+		byName[name] = pkg
 	}
+}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := tc.src.Validate()
-			if tc.error == "" {
-				if err != nil {
-					t.Fatalf("Validate() = %v, want nil", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("Validate() = nil, want an error containing %q", tc.error)
-			}
-			if !strings.Contains(err.Error(), tc.error) {
-				t.Errorf("Validate() error = %v, want it to contain %q", err, tc.error)
-			}
-		})
+// A nested package publishes under its last path element, which is how a
+// build from source names it and how --image-repo has to find it.
+func TestImageNameOfANestedPackage(t *testing.T) {
+	if got := images.ImageName("demos/multi-template/fspersist"); got != "fspersist" {
+		t.Errorf("ImageName() = %q, want fspersist", got)
 	}
 }

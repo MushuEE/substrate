@@ -13,13 +13,11 @@
 // limitations under the License.
 
 // Command ate-setup installs and tears down Agent Substrate on a Kubernetes
-// cluster. It is a Go port of hack/install-ate.sh and the scripts it sources,
-// which remain in place and still work; see cmd/ate-setup/commands.md for the
-// flag-by-flag mapping between the two.
+// cluster. See cmd/ate-setup/commands.md for its commands.
 package main
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/cmd"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/cmd"
 )
 
 func main() {

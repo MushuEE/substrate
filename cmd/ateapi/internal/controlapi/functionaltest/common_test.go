@@ -22,18 +22,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
-	"github.com/agent-substrate/substrate/internal/ateinterceptors"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/internal/volume"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
-	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
-	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/controlapi"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
+	"go.ate.dev/substrate/internal/ateinterceptors"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/internal/objectstore/objectstoretest"
+	"go.ate.dev/substrate/internal/objectstoreplugin/objectstoreplugintest"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/volume"
+	"go.ate.dev/substrate/pkg/client/clientset/versioned"
+	"go.ate.dev/substrate/pkg/client/informers/externalversions"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -58,6 +62,10 @@ import (
 const (
 	testAtespace = "test-atespace"
 	testActorID  = "id1"
+	// testStorageLocation is the --snapshot-location the test server runs
+	// with. No object store is wired up behind it.
+	testStorageLocation = "gs://fake-fake-fake"
+	testActorJWTIssuer  = "https://idp.example.test"
 
 	// ateletNamespace and byNode mirror the unexported constants controlapi's
 	// atelet informer is built with.
@@ -66,45 +74,70 @@ const (
 )
 
 var (
-	ignoreUID        = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "uid")
-	ignoreVersion    = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "version")
-	ignoreTimestamps = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "create_time", "update_time")
+	ignoreUID        = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "uid")
+	ignoreVersion    = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "version")
+	ignoreTimestamps = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "create_time", "update_time", "delete_time")
 
 	// ignoreServerMetadata skips the ResourceMetadata fields the store assigns.
-	ignoreServerMetadata = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "uid", "create_time", "update_time")
+	ignoreServerMetadata = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "uid", "create_time", "update_time", "delete_time")
 )
 
 type testContext struct {
-	service             *controlapi.RPCService
-	client              ateapipb.ControlClient
-	k8sClient           kubernetes.Interface
-	substrateClient     versioned.Interface
-	persistence         store.Interface
-	workerCache         *workercache.Cache
-	fakeAtelet          *FakeAteletServer
-	cleanup             func()
-	workerPoolLister    listersv1alpha1.WorkerPoolLister
-	sandboxConfigLister listersv1alpha1.SandboxConfigLister
+	service         *controlapi.RPCService
+	client          ateapi.ControlClient
+	noOptInClient   ateapi.ControlClient // never sends preview.Header
+	k8sClient       kubernetes.Interface
+	substrateClient versioned.Interface
+	persistence     store.Interface
+	workerCache     *workercache.Cache
+	fakeAtelet      *FakeAteletServer
+	cleanup         func()
 	// ateletIndexer is the index DialForAteletOnNode looks up atelets in.
 	// setupAteletOnNode waits on it so a test never dials a node whose atelet the
 	// informer has not seen yet.
 	ateletIndexer cache.Indexer
 	// metricReader collects what the service's instruments recorded.
 	metricReader *sdkmetric.ManualReader
+	// objectStore holds the external snapshots the service wrote, so a test can
+	// see which ones a flow created and released.
+	objectStore *objectstoretest.Fake
 }
 
 // setupTest sets up a fully isolated test environment.
 func setupTest(t *testing.T, ns string) *testContext {
 	t.Helper()
-	return setupTestWithVolumePlugins(t, ns, nil)
+	return setupTestWithOptions(t, ns, testOptions{})
 }
 
-// setupTestWithVolumePlugins is setupTest with the default mock volume plugin
-// replaced by plugins, keyed by driver name. Tests that need a failure-injecting
-// plugin pass it here rather than swapping it into the running RPCService, so each
-// test owns its own plugin set.
+type testOptions struct {
+	allowPreview  bool // enable use of preview features over gRPC
+	volumePlugins map[string]volume.VolumePluginControlPlane
+}
+
+// setupPreviewTest is setupTest with a client that opts in to preview
+// features. It does not enable any gate; call preview.InitForTest for that.
+func setupPreviewTest(t *testing.T, ns string) *testContext {
+	t.Helper()
+	return setupTestWithOptions(t, ns, testOptions{allowPreview: true})
+}
+
+// setupTestWithVolumePlugins is setupPreviewTest with the default mock volume
+// plugin replaced by plugins, keyed by driver name. Tests that need a
+// failure-injecting plugin pass it here rather than swapping it into the
+// running RPCService, so each test owns its own plugin set.
 func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volume.VolumePluginControlPlane) *testContext {
 	t.Helper()
+	return setupTestWithOptions(t, ns, testOptions{volumePlugins: plugins, allowPreview: true})
+}
+
+func setupTestWithOptions(t *testing.T, ns string, options testOptions) *testContext {
+	t.Helper()
+
+	var dialOpts []grpc.DialOption
+	if options.allowPreview {
+		dialOpts = preview.DialOptionsWithOptIn()
+	}
+
 	// 1. Start an isolated PostgreSQL-backed store.
 	persistence, cleanupStore := storetest.SetupTestStore(t)
 
@@ -122,24 +155,19 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 	}
 
 	// 3. Initialize Informers
-	workerFactory, workerInformer := controlapi.WorkerPodInformer(k8sClient)
-	ateletFactory, ateletInformer := controlapi.AteletInformer(k8sClient)
+	ateletFactory, ateletInformer := controlapi.AteletInformer(k8sClient, installdefaults.SystemNamespace)
 	scFactory := informers.NewSharedInformerFactory(k8sClient, 0)
 	scLister := scFactory.Storage().V1().StorageClasses().Lister()
 
 	substrateInformerFactory := externalversions.NewSharedInformerFactory(substrateClient, 0)
-	workerPoolLister := substrateInformerFactory.Api().V1alpha1().WorkerPools().Lister()
-	sandboxConfigLister := substrateInformerFactory.Api().V1alpha1().SandboxConfigs().Lister()
-	csiDriverConfigLister := substrateInformerFactory.Api().V1alpha1().CSIDriverConfigs().Lister()
+	csiDriverConfigLister := substrateInformerFactory.Ate().V1().CSIDriverConfigs().Lister()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	workerFactory.Start(ctx.Done())
 	ateletFactory.Start(ctx.Done())
 	substrateInformerFactory.Start(ctx.Done())
 	scFactory.Start(ctx.Done())
 
-	workerFactory.WaitForCacheSync(ctx.Done())
 	ateletFactory.WaitForCacheSync(ctx.Done())
 	substrateInformerFactory.WaitForCacheSync(ctx.Done())
 	scFactory.WaitForCacheSync(ctx.Done())
@@ -153,8 +181,8 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 	}
 
 	// Dial the fake atelet over insecure transport instead of per-atelet mTLS,
-	// so DialForWorker's real lookup/dial/cache path is exercised under test.
-	dialer := controlapi.NewAteletDialer(workerInformer.GetIndexer(), ateletInformer.GetIndexer(), "", "",
+	// so DialForAteletOnNode's real lookup/dial/cache path is exercised under test.
+	dialer := controlapi.NewAteletDialer(ateletInformer.GetIndexer(), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
 		controlapi.WithDialCredentials(func(_ string) (credentials.TransportCredentials, error) {
 			return insecure.NewCredentials(), nil
 		}))
@@ -166,7 +194,7 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 		cleanupStore()
 		t.Fatalf("failed to create metric instruments: %v", err)
 	}
-	volPlugins := plugins
+	volPlugins := options.volumePlugins
 	if volPlugins == nil {
 		mockPlugin := volume.NewMockVolumePlugin()
 		mockDriverName, err := mockPlugin.DriverName(ctx)
@@ -177,14 +205,43 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 			mockDriverName: mockPlugin,
 		}
 	}
-	service := controlapi.NewRPCService(persistence, wc, sandboxConfigLister, csiDriverConfigLister, scLister, dialer, instruments, "", volPlugins)
+
+	actorJWTAuthority, err := localjwtauthority.GenerateAuthority("ES256", "1")
+	if err != nil {
+		t.Fatalf("Error generating actor JWT authority: %v", err)
+	}
+
+	actorJWTAuthorityPool := &localjwtauthority.ConcretePool{
+		Authorities: []*localjwtauthority.Authority{
+			actorJWTAuthority,
+		},
+		ActiveForSigning: "1",
+	}
+
+	objectStore := objectstoretest.New()
+
+	service := controlapi.NewRPCService(
+		persistence,
+		wc,
+		csiDriverConfigLister,
+		scLister,
+		dialer,
+		instruments,
+		"",
+		volPlugins,
+		objectstoreplugintest.ControlClient(objectStore),
+		testActorJWTIssuer,
+		actorJWTAuthorityPool,
+		testStorageLocation,
+	)
 
 	// 5. Start REAL gRPC Server for ATE API
 	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
 		ateinterceptors.ServerUnaryInterceptor,
 		ateinterceptors.RejectUnknownFieldsUnaryInterceptor,
+		preview.UnaryServerInterceptor,
 	))
-	ateapipb.RegisterControlServer(grpcServer, service)
+	ateapi.RegisterControlServer(grpcServer, service)
 
 	lis := bufconn.Listen(8192)
 
@@ -194,24 +251,36 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 		}
 	}()
 
-	conn, err := grpc.NewClient(
-		"passthrough://bufnet",
+	baseDialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
 			return lis.Dial()
 		}),
-	)
+	}
+	conn, err := grpc.NewClient("passthrough://bufnet", append(baseDialOpts, dialOpts...)...)
 	if err != nil {
 		grpcServer.Stop()
 		cancel()
 		cleanupStore()
 		t.Fatalf("failed to connect: %v", err)
 	}
+	noOptInConn, err := grpc.NewClient("passthrough://bufnet", baseDialOpts...)
+	if err != nil {
+		conn.Close()
+		grpcServer.Stop()
+		cancel()
+		cleanupStore()
+		t.Fatalf("failed to connect: %v", err)
+	}
+	t.Cleanup(func() { noOptInConn.Close() })
 
-	client := ateapipb.NewControlClient(conn)
+	client := ateapi.NewControlClient(conn)
 
 	// Call Reset on global mock
 	fakeAtelet.Reset()
+	// A checkpoint writes its external snapshot into this test's own store, so
+	// the copy and release steps have something to act on.
+	fakeAtelet.SetObjectStore(objectStore)
 
 	// Create namespace
 	_, err = k8sClient.CoreV1().Namespaces().Create(context.Background(), &corev1.Namespace{
@@ -226,7 +295,7 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 	}
 
 	// CreateActor now requires the atespace to exist first.
-	if _, err := client.CreateAtespace(context.Background(), &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: testAtespace}}}); err != nil {
+	if _, err := client.CreateAtespace(context.Background(), &ateapi.CreateAtespaceRequest{Atespace: &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: testAtespace}}}); err != nil {
 		conn.Close()
 		grpcServer.Stop()
 		cancel()
@@ -242,31 +311,106 @@ func setupTestWithVolumePlugins(t *testing.T, ns string, plugins map[string]volu
 	}
 
 	return &testContext{
-		service:             service,
-		client:              client,
-		k8sClient:           k8sClient,
-		substrateClient:     substrateClient,
-		persistence:         persistence,
-		workerCache:         wc,
-		fakeAtelet:          fakeAtelet,
-		cleanup:             cleanup,
-		workerPoolLister:    workerPoolLister,
-		sandboxConfigLister: sandboxConfigLister,
-		ateletIndexer:       ateletInformer.GetIndexer(),
-		metricReader:        metricReader,
+		service:         service,
+		client:          client,
+		noOptInClient:   ateapi.NewControlClient(noOptInConn),
+		k8sClient:       k8sClient,
+		substrateClient: substrateClient,
+		persistence:     persistence,
+		workerCache:     wc,
+		fakeAtelet:      fakeAtelet,
+		cleanup:         cleanup,
+		ateletIndexer:   ateletInformer.GetIndexer(),
+		metricReader:    metricReader,
+		objectStore:     objectStore,
 	}
+}
+
+// snapshotObjectNames returns the names, relative to snapshotURI, of the
+// objects the external snapshot there is made of. Empty means the snapshot is
+// not in object storage — either never written, or collected.
+func snapshotObjectNames(t *testing.T, tc *testContext, snapshotURI string) []string {
+	t.Helper()
+	uri, err := resources.ParseSnapshotURI(snapshotURI)
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI(%q) = %v", snapshotURI, err)
+	}
+	return tc.objectStore.Snapshot(t, uri)
+}
+
+// assertSnapshotPresent fails when the external snapshot at snapshotURI is not
+// in object storage.
+func assertSnapshotPresent(t *testing.T, tc *testContext, snapshotURI string) {
+	t.Helper()
+	if names := snapshotObjectNames(t, tc, snapshotURI); len(names) == 0 {
+		t.Errorf("external snapshot %s is not in object storage, want it present", snapshotURI)
+	}
+}
+
+// assertSnapshotCollected fails when anything is left of the external snapshot
+// at snapshotURI.
+func assertSnapshotCollected(t *testing.T, tc *testContext, snapshotURI string) {
+	t.Helper()
+	if names := snapshotObjectNames(t, tc, snapshotURI); len(names) != 0 {
+		t.Errorf("external snapshot %s still holds %v, want it collected", snapshotURI, names)
+	}
+}
+
+const goldenSnapshotName = "9c2f7b41-6d05-4e83-a1f7-3b8c0d5e2a94"
+
+// goldenSnapshotURI is the snapshot owned by the test template's golden tag.
+func goldenSnapshotURI(t *testing.T) string {
+	t.Helper()
+	uri, err := resources.NewTagSnapshotURI(testStorageLocation, testAtespace, goldenSnapshotName)
+	if err != nil {
+		t.Fatalf("NewTagSnapshotURI: %v", err)
+	}
+	return uri.String()
+}
+
+// snapshotOwnedByActor reports whether snapshotURI sits under the actor's own
+// prefix. That is what says the actor took the snapshot itself rather than
+// borrowing it from a tag, and so what decides whether its suspends and its
+// delete may collect it.
+func snapshotOwnedByActor(t *testing.T, actor *ateapi.Actor, snapshotURI string) bool {
+	t.Helper()
+	uri, err := resources.ParseSnapshotURI(snapshotURI)
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI(%q) = %v", snapshotURI, err)
+	}
+	return uri.OwnedBy(resources.ActorSnapshotOwner(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetUid()))
+}
+
+// assertSnapshotOwnedByActor fails when snapshotURI is not under the actor's
+// own prefix.
+func assertSnapshotOwnedByActor(t *testing.T, actor *ateapi.Actor, snapshotURI string) {
+	t.Helper()
+	if !snapshotOwnedByActor(t, actor, snapshotURI) {
+		t.Errorf("external snapshot %s is not under actor %s's own prefix, want it owned by the actor", snapshotURI, resources.ActorRefFromActor(actor))
+	}
+}
+
+// snapshotName returns the name snapshotURI gives its snapshot in object
+// storage, which the Snapshot's uuid must match.
+func snapshotName(t *testing.T, snapshotURI string) string {
+	t.Helper()
+	uri, err := resources.ParseSnapshotURI(snapshotURI)
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI(%q) = %v", snapshotURI, err)
+	}
+	return uri.Name()
 }
 
 func namespaceForTest(baseName string) string {
 	return fmt.Sprintf("%s-%d", baseName, time.Now().UnixNano())
 }
 
-func createTemplate(t *testing.T, tc *testContext, ns string) *ateapipb.ActorTemplate {
+func createTemplate(t *testing.T, tc *testContext, ns string) *ateapi.ActorTemplate {
 	t.Helper()
-	return createTemplateWithContainers(t, tc, ns, []*ateapipb.Container{
+	return createTemplateWithContainers(t, tc, ns, []*ateapi.Container{
 		{
 			Name:    "main",
-			Image:   "main@sha256:abc",
+			Image:   "main@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 			Command: []string{"/main"},
 		},
 	})
@@ -275,24 +419,24 @@ func createTemplate(t *testing.T, tc *testContext, ns string) *ateapipb.ActorTem
 // createAtespace creates an atespace via the API.
 func createAtespace(t *testing.T, tc *testContext, name string) {
 	t.Helper()
-	if _, err := tc.client.CreateAtespace(context.Background(), &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}}); err != nil {
+	if _, err := tc.client.CreateAtespace(context.Background(), &ateapi.CreateAtespaceRequest{Atespace: &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: name}}}); err != nil {
 		t.Fatalf("CreateAtespace(%s) failed: %v", name, err)
 	}
 }
 
 const poolLabelKey = "pool"
 
-func createTemplateWithContainers(t *testing.T, tc *testContext, ns string, containers []*ateapipb.Container) *ateapipb.ActorTemplate {
+func createTemplateWithContainers(t *testing.T, tc *testContext, ns string, containers []*ateapi.Container) *ateapi.ActorTemplate {
 	t.Helper()
 	return createTemplateWithContainersAndVolumes(t, tc, ns, containers, nil)
 }
 
-func createTemplateWithVolumes(t *testing.T, tc *testContext, ns string, volumes []*ateapipb.Volume, mounts []*ateapipb.VolumeMount) *ateapipb.ActorTemplate {
+func createTemplateWithVolumes(t *testing.T, tc *testContext, ns string, volumes []*ateapi.Volume, mounts []*ateapi.VolumeMount) *ateapi.ActorTemplate {
 	t.Helper()
-	return createTemplateWithContainersAndVolumes(t, tc, ns, []*ateapipb.Container{
+	return createTemplateWithContainersAndVolumes(t, tc, ns, []*ateapi.Container{
 		{
 			Name:         "main",
-			Image:        "main@sha256:abc",
+			Image:        "main@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 			Command:      []string{"/main"},
 			VolumeMounts: mounts,
 		},
@@ -303,58 +447,51 @@ func createTemplateWithVolumes(t *testing.T, tc *testContext, ns string, volumes
 // "tmpl1" in testAtespace, backed by a WorkerPool in ns whose labels match the
 // template's worker selector, and seeds its golden snapshot. ns keys the pool
 // labels, so each test's template still selects only its own pool.
-func createTemplateWithContainersAndVolumes(t *testing.T, tc *testContext, ns string, containers []*ateapipb.Container, volumes []*ateapipb.Volume) *ateapipb.ActorTemplate {
+func createTemplateWithContainersAndVolumes(t *testing.T, tc *testContext, ns string, containers []*ateapi.Container, volumes []*ateapi.Volume) *ateapi.ActorTemplate {
 	t.Helper()
 
-	// Sandbox binaries live on a (cluster-scoped) SandboxConfig the template
-	// names. Create the gvisor-default SandboxConfig so a boot-from-spec Run
-	// can resolve its assets.
-	ensureDefaultGvisorSandboxConfig(t, tc)
 	createWorkerPool(t, tc, ns, "pool1", map[string]string{poolLabelKey: ns})
 
-	created, err := tc.client.CreateActorTemplate(context.Background(), &ateapipb.CreateActorTemplateRequest{
-		ActorTemplate: &ateapipb.ActorTemplate{
-			Metadata: &ateapipb.ResourceMetadata{
+	created, err := tc.client.CreateActorTemplate(context.Background(), &ateapi.CreateActorTemplateRequest{
+		ActorTemplate: &ateapi.ActorTemplate{
+			Metadata: &ateapi.ResourceMetadata{
 				Atespace: testAtespace,
 				Name:     "tmpl1",
 			},
-			SnapshotsConfig: &ateapipb.SnapshotsConfig{
-				StorageLocation: "gs://fake-fake-fake",
-			},
-			SandboxConfig: &ateapipb.SandboxConfig{
-				SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
-				ConfigName:   "gvisor-default",
-			},
 			Containers: containers,
 			Volumes:    volumes,
-			WorkerSelector: &ateapipb.Selector{
+			WorkerSelector: &ateapi.Selector{
 				MatchLabels: map[string]string{poolLabelKey: ns},
 			},
+			Resources: &ateapi.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		},
 	})
 	if err != nil {
 		t.Fatalf("failed to create actor template: %v", err)
 	}
 
-	const goldenSnapshot = "golden"
-	storetest.MustCreateActorSnapshot(t, context.Background(), tc.persistence, &ateapipb.ActorSnapshot{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: goldenSnapshot},
-		Status: &ateapipb.ActorSnapshotStatus{
+	tag, err := tc.persistence.CreateTag(context.Background(), &ateapi.Tag{
+		Metadata:    &ateapi.ResourceMetadata{Atespace: testAtespace, Name: created.GetMetadata().GetUid()},
+		SourceActor: &ateapi.ObjectRef{Atespace: testAtespace, Name: created.GetMetadata().GetUid()},
+		Scope:       ateapi.TagScope_TAG_SCOPE_PUBLISHED,
+		Status: &ateapi.TagStatus{
+			Snapshot:         newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, created.GetMetadata().GetUid(), goldenSnapshotName, goldenSnapshotURI(t)),
 			ActorTemplateUid: created.GetMetadata().GetUid(),
-			ContentScope:     ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-			SnapshotUri:      "gs://fake-fake-fake/snapshots/" + resources.GoldenActorAtespace + "/" + goldenSnapshot,
 		},
 	})
+	if err != nil {
+		t.Fatalf("create golden tag: %v", err)
+	}
 
 	// Record the golden snapshot on the template's status directly in the
 	// store, as the ActorTemplateReconciler's checkpoint would: there is no
 	// status RPC, and the reconciler does not run in this test environment.
 	updated, err := tc.persistence.UpdateActorTemplate(context.Background(),
 		resources.ActorTemplateRefFromActorTemplate(created), store.PreconditionFrom(created),
-		func(dbTemplate *ateapipb.ActorTemplate) error {
-			dbTemplate.Status = &ateapipb.ActorTemplateStatus{
-				GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{
-					GoldenSnapshot: &ateapipb.ObjectRef{Atespace: resources.GoldenActorAtespace, Name: goldenSnapshot},
+		func(dbTemplate *ateapi.ActorTemplate) error {
+			dbTemplate.Status = &ateapi.ActorTemplateStatus{
+				GoldenSnapshotStatus: &ateapi.GoldenSnapshotStatus{
+					GoldenTag: resources.TagRefFromTag(tag).ToObjectRef(),
 				},
 			}
 			return nil
@@ -365,106 +502,115 @@ func createTemplateWithContainersAndVolumes(t *testing.T, tc *testContext, ns st
 	return updated
 }
 
-// testPauseImage is the pause image the default test SandboxConfig carries;
-// it is what a resolved WorkloadSpec's sandbox assets should name.
-const testPauseImage = "pause@sha256:abc"
-
-// ensureDefaultGvisorSandboxConfig creates the cluster-scoped "gvisor-default"
-// SandboxConfig (idempotently) and waits for it to appear in the lister.
-func ensureDefaultGvisorSandboxConfig(t *testing.T, tc *testContext) {
-	t.Helper()
-	ensureGvisorSandboxConfig(t, tc, "gvisor-default")
-}
-
-// ensureGvisorSandboxConfig creates a cluster-scoped gvisor SandboxConfig
-// (idempotently) and waits for it to appear in the lister.
-func ensureGvisorSandboxConfig(t *testing.T, tc *testContext, name string) {
-	t.Helper()
-	sc := &atev1alpha1.SandboxConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: atev1alpha1.SandboxConfigSpec{
-			SandboxClass: atev1alpha1.SandboxClassGvisor,
-			PauseImage:   testPauseImage,
-			Assets: map[string]map[string]atev1alpha1.AssetFile{
-				"amd64": {"runsc": {
-					URL:    "gs://gvisor/releases/nightly/2026-05-19/x86_64/runsc",
-					SHA256: "a397be1abc2420d26bce6c70e6e2ff96c73aaaab929756c56f5e2089ea842b63",
-				}},
-				"arm64": {"runsc": {
-					URL:    "gs://gvisor/releases/nightly/2026-05-19/aarch64/runsc",
-					SHA256: "1ba2366ae2efceba166046f51a4104f9261c9cb72c6db8f5b3fe2dc57dea86b9",
-				}},
-			},
+func newDurableSnapshot(gen int32, owner ateapi.SnapshotOwner, fidelity ateapi.SnapshotFidelity, templateUID, uuid, uri string) *ateapi.Snapshot {
+	return &ateapi.Snapshot{
+		Uuid:             uuid,
+		Generation:       gen,
+		Owner:            owner,
+		Fidelity:         fidelity,
+		ActorTemplateUid: templateUID,
+		DurableSnapshot: &ateapi.SnapshotStorage{
+			State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+			Object: &ateapi.ObjectSnapshot{SnapshotUri: uri},
 		},
 	}
-	if _, err := tc.substrateClient.ApiV1alpha1().SandboxConfigs().Create(context.Background(), sc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		t.Fatalf("failed to create SandboxConfig %s: %v", name, err)
+}
+
+// newPausedSnapshot is the snapshot an asynchronous suspend leaves on node
+// locality: its durable copy, under the actor's own prefix, is PENDING until
+// atelet uploads it.
+func newPausedSnapshot(t *testing.T, gen int32, fidelity ateapi.SnapshotFidelity, templateUID, actorUID, uuid, locality string) *ateapi.Snapshot {
+	t.Helper()
+	uri, err := resources.NewActorSnapshotURI(testStorageLocation, testAtespace, actorUID, uuid)
+	if err != nil {
+		t.Fatalf("NewActorSnapshotURI: %v", err)
 	}
-	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, err := tc.sandboxConfigLister.Get(name)
-		return err == nil, nil
-	}); err != nil {
-		t.Fatalf("SandboxConfig %s not synced into lister: %v", name, err)
+	return &ateapi.Snapshot{
+		Uuid:             uuid,
+		Generation:       gen,
+		Owner:            ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+		Fidelity:         fidelity,
+		ActorTemplateUid: templateUID,
+		Locality:         locality,
+		DurableSnapshot: &ateapi.SnapshotStorage{
+			State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING,
+			Object: &ateapi.ObjectSnapshot{SnapshotUri: uri.String()},
+		},
 	}
+}
+
+func durableSnapshot(status *ateapi.ActorStatus) *ateapi.Snapshot {
+	var best *ateapi.Snapshot
+	for _, snap := range status.GetSnapshots() {
+		st := snap.GetDurableSnapshot()
+		if st.GetState() == ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED &&
+			st.GetObject().GetSnapshotUri() != "" {
+			if best == nil || snap.GetGeneration() > best.GetGeneration() {
+				best = snap
+			}
+		}
+	}
+	return best
+}
+
+func durableSnapshotStorage(status *ateapi.ActorStatus) *ateapi.SnapshotStorage {
+	return durableSnapshot(status).GetDurableSnapshot()
+}
+
+func durableSnapshotURI(status *ateapi.ActorStatus) string {
+	return durableSnapshotStorage(status).GetObject().GetSnapshotUri()
+}
+
+func localSnapshot(status *ateapi.ActorStatus) *ateapi.Snapshot {
+	var best *ateapi.Snapshot
+	for _, snap := range status.GetSnapshots() {
+		if snap.GetLocality() != "" && snap.GetUuid() != "" {
+			if best == nil || snap.GetGeneration() > best.GetGeneration() {
+				best = snap
+			}
+		}
+	}
+	return best
+}
+
+func tagSnapshotURI(tag *ateapi.Tag) string {
+	return tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri()
 }
 
 func createWorkerPool(t *testing.T, tc *testContext, ns string, name string, labels map[string]string) {
 	t.Helper()
-	wp := &atev1alpha1.WorkerPool{
+	wp := &atev1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
 			Labels:    labels,
 		},
-		Spec: atev1alpha1.WorkerPoolSpec{
-			Replicas:    1,
-			WorkerImage: "ateom@sha256:abc",
+		Spec: atev1.WorkerPoolSpec{
+			Replicas:       1,
+			WorkerImage:    "worker@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			SandboxClasses: []atev1.WorkerPoolSandboxClass{{Name: atev1.SandboxClassGvisor}},
 		},
 	}
-	_, err := tc.substrateClient.ApiV1alpha1().WorkerPools(ns).Create(context.Background(), wp, metav1.CreateOptions{})
-	if err != nil {
+	if _, err := tc.substrateClient.AteV1().WorkerPools(ns).Create(context.Background(), wp, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create WorkerPool: %v", err)
-	}
-
-	waitForWorkerPoolInInformer(t, tc, ns, name)
-}
-
-// waitForWorkerPoolInInformer blocks until the pool the test just created is
-// visible to the scheduler, which reads it through an informer rather than the
-// API.
-func waitForWorkerPoolInInformer(t *testing.T, tc *testContext, ns, name string) {
-	t.Helper()
-	err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, err := tc.workerPoolLister.WorkerPools(ns).Get(name)
-		return err == nil, nil
-	})
-	if err != nil {
-		t.Fatalf("failed to wait for WorkerPool %s/%s in informer: %v", ns, name, err)
 	}
 }
 
 // createTemplateWithSelector creates a substrate ActorTemplate in
 // testAtespace with the given worker selector and no golden snapshot.
-func createTemplateWithSelector(t *testing.T, tc *testContext, name string, selector *ateapipb.Selector) *ateapipb.ActorTemplate {
+func createTemplateWithSelector(t *testing.T, tc *testContext, name string, selector *ateapi.Selector) *ateapi.ActorTemplate {
 	t.Helper()
-	ensureDefaultGvisorSandboxConfig(t, tc)
-	created, err := tc.client.CreateActorTemplate(context.Background(), &ateapipb.CreateActorTemplateRequest{
-		ActorTemplate: &ateapipb.ActorTemplate{
-			Metadata: &ateapipb.ResourceMetadata{
+	created, err := tc.client.CreateActorTemplate(context.Background(), &ateapi.CreateActorTemplateRequest{
+		ActorTemplate: &ateapi.ActorTemplate{
+			Metadata: &ateapi.ResourceMetadata{
 				Atespace: testAtespace,
 				Name:     name,
 			},
-			SnapshotsConfig: &ateapipb.SnapshotsConfig{
-				StorageLocation: "gs://fake-fake-fake",
-			},
-			SandboxConfig: &ateapipb.SandboxConfig{
-				SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
-				ConfigName:   "gvisor-default",
-			},
-			Containers: []*ateapipb.Container{
-				{Name: "main", Image: "main@sha256:abc", Command: []string{"/main"}},
+			Containers: []*ateapi.Container{
+				{Name: "main", Image: "main@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Command: []string{"/main"}},
 			},
 			WorkerSelector: selector,
+			Resources:      &ateapi.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		},
 	})
 	if err != nil {
@@ -513,33 +659,34 @@ func createWorkerPod(t *testing.T, tc *testContext, ns string, name string, node
 		t.Fatalf("failed to update worker pod status: %v", err)
 	}
 
-	// The WorkerPool supplies the fields the syncer copies off it. Read it from
-	// the lister the service itself uses, so a pool the informer has not caught
-	// up on fails here rather than producing a Worker the scheduler will not
-	// match.
-	pool, err := tc.workerPoolLister.WorkerPools(ns).Get(poolName)
+	// The WorkerPool supplies the fields the syncer copies off it.
+	pool, err := tc.substrateClient.AteV1().WorkerPools(ns).Get(context.Background(), poolName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get WorkerPool %s/%s: %v", ns, poolName, err)
 	}
-	if _, err := tc.client.CreateWorker(context.Background(), &ateapipb.CreateWorkerRequest{
-		Worker: &ateapipb.Worker{
+	if _, err := tc.client.CreateWorker(context.Background(), &ateapi.CreateWorkerRequest{
+		Worker: &ateapi.Worker{
 			// Workers are global-scoped and named after the pod UID.
-			Metadata:        &ateapipb.ResourceMetadata{Name: string(createdPod.UID)},
+			Metadata:        &ateapi.ResourceMetadata{Name: string(createdPod.UID)},
 			WorkerNamespace: ns,
 			WorkerPool:      poolName,
 			WorkerPod:       name,
 			WorkerPodUid:    string(createdPod.UID),
-			Ip:              "127.0.0.1",
 			NodeName:        nodeName,
-			SandboxClass:    string(pool.Spec.SandboxClass),
 			Labels:          pool.GetLabels(),
 			// Capacity is not settable here: a Worker gets it from its own
-			// ateom's report, which the reportWorkerCapacity below stands in
+			// worker's report, which the reportWorkerCapacity below stands in
 			// for. These pods declare no limits, so only the actor ceiling is
 			// reported; see setWorkerActorCapacity for tests needing more.
 		},
 	}); err != nil {
 		t.Fatalf("failed to register worker: %v", err)
+	}
+	// As the syncer does once the pod is Ready.
+	if _, err := tc.client.MarkWorkerAvailable(context.Background(), &ateapi.MarkWorkerAvailableRequest{
+		Worker: &ateapi.ObjectRef{Name: string(createdPod.UID)},
+	}); err != nil {
+		t.Fatalf("failed to mark worker available: %v", err)
 	}
 	reportWorkerCapacity(t, tc, string(createdPod.UID), 1)
 
@@ -574,7 +721,7 @@ func waitForWorkerAvailable(t *testing.T, tc *testContext, workerName string) {
 		}
 		// Hosting nothing is what "available" means, and the allocation total
 		// is how a cached Worker reports it: it does not carry the records.
-		return worker.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_ACTIVE &&
+		return worker.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_ACTIVE &&
 			worker.GetStatus().GetAllocated().GetActors() == 0, nil
 	})
 	if err != nil {
@@ -659,7 +806,7 @@ func deleteWorkerPod(t *testing.T, tc *testContext, ns string, name string) {
 	// Deregister the Worker, as the syncer would once it saw the pod go. The
 	// Worker is named after the pod UID, but the caller only has the pod name,
 	// so it is found by the pod fields it carries.
-	resp, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{})
+	resp, err := tc.client.ListWorkers(context.Background(), &ateapi.ListWorkersRequest{})
 	if err != nil {
 		t.Fatalf("failed to list workers: %v", err)
 	}
@@ -667,8 +814,8 @@ func deleteWorkerPod(t *testing.T, tc *testContext, ns string, name string) {
 		if w.GetWorkerNamespace() != ns || w.GetWorkerPod() != name {
 			continue
 		}
-		if _, err := tc.client.DeleteWorker(context.Background(), &ateapipb.DeleteWorkerRequest{
-			Worker: &ateapipb.ObjectRef{Name: w.GetMetadata().GetName()},
+		if _, err := tc.client.DeleteWorker(context.Background(), &ateapi.DeleteWorkerRequest{
+			Worker: &ateapi.ObjectRef{Name: w.GetMetadata().GetName()},
 		}); err != nil {
 			t.Fatalf("failed to deregister worker %s: %v", w.GetMetadata().GetName(), err)
 		}
@@ -764,3 +911,6 @@ func assertSpanStr(t *testing.T, attrs map[attribute.Key]attribute.Value, key at
 		t.Errorf("%s = %q, want %q", key, v.AsString(), want)
 	}
 }
+
+// foreignUID matches no stored object, for guards that must miss.
+const foreignUID = "0f0e0d0c-0b0a-4908-8706-050403020100"

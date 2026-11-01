@@ -21,11 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
 	"google.golang.org/protobuf/testing/protocmp"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -56,7 +56,7 @@ func TestCache_SyncsOnStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Workers: %v", err)
 	}
-	if diff := cmp.Diff([]*ateapipb.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
 }
@@ -97,7 +97,7 @@ func TestCache_CreatedEvent(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{w}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
 }
@@ -113,7 +113,7 @@ func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 	}
 
 	updated := makeWorker("ns", "pod1", 2)
-	updated.Status.Allocated = &ateapipb.WorkerResources{Actors: 1}
+	updated.Status.Allocated = &ateapi.WorkerResources{Actors: 1}
 	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: updated})
 
 	eventually(t, func() bool {
@@ -125,7 +125,7 @@ func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{updated}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{updated}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
 }
@@ -142,7 +142,7 @@ func TestCache_UpdatedEvent_OlderVersionIgnored(t *testing.T) {
 
 	// Send a stale update followed by a sentinel we can detect.
 	stale := makeWorker("ns", "pod1", 3)
-	stale.Status.Allocated = &ateapipb.WorkerResources{Actors: 7}
+	stale.Status.Allocated = &ateapi.WorkerResources{Actors: 7}
 	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: stale})
 
 	sentinel := makeWorker("ns", "pod2", 1)
@@ -155,7 +155,7 @@ func TestCache_UpdatedEvent_OlderVersionIgnored(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{w, sentinel}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w, sentinel}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
 }
@@ -173,7 +173,7 @@ func TestCache_DeletedEvent(t *testing.T) {
 	// Delete events carry only the name.
 	fs.send(store.WorkerEvent{
 		Type:   store.WorkerEventDeleted,
-		Worker: &ateapipb.Worker{Metadata: &ateapipb.ResourceMetadata{Name: workerName("ns", "pod1")}},
+		Worker: &ateapi.Worker{Metadata: &ateapi.ResourceMetadata{Name: workerName("ns", "pod1")}},
 	})
 
 	eventually(t, func() bool {
@@ -204,7 +204,7 @@ func TestCache_Disconnect_ResyncsWithFreshSnapshot(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers after resync (-want +got):\n%s", diff)
 	}
 }
@@ -313,7 +313,7 @@ func TestCache_Relist_RecoversFromMissedCreate(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers after relist (-want +got):\n%s", diff)
 	}
 }
@@ -338,7 +338,7 @@ func TestCache_Relist_RecoversFromMissedDelete(t *testing.T) {
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
-	if diff := cmp.Diff([]*ateapipb.Worker{w1}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w1}, got, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers after relist (-want +got):\n%s", diff)
 	}
 }
@@ -369,7 +369,7 @@ func TestCache_Relist_FailureIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Workers: %v", err)
 	}
-	if diff := cmp.Diff([]*ateapipb.Worker{w1}, workers, protocmp.Transform(), workerSortOpt); diff != "" {
+	if diff := cmp.Diff([]*ateapi.Worker{w1}, workers, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
 }
@@ -378,13 +378,13 @@ type fakeStore struct {
 	store.Interface
 
 	mu      sync.Mutex
-	workers []*ateapipb.Worker
+	workers []*ateapi.Worker
 	watchCh chan store.WorkerEvent
 	listErr error // if set, ListWorkers returns it
 	closes  int   // number of times a returned watch was Closed
 }
 
-func newFakeStore(workers ...*ateapipb.Worker) *fakeStore {
+func newFakeStore(workers ...*ateapi.Worker) *fakeStore {
 	return &fakeStore{
 		workers: workers,
 		watchCh: make(chan store.WorkerEvent, 16),
@@ -401,15 +401,15 @@ func (f *fakeStore) WatchWorkers(_ context.Context) (*store.WorkerWatch, error) 
 	}), nil
 }
 
-func (f *fakeStore) ListWorkers(_ context.Context, _ store.ListOptions) (store.ListResponse[*ateapipb.Worker], error) {
+func (f *fakeStore) ListWorkers(_ context.Context, _ store.ListOptions) (store.ListResponse[*ateapi.Worker], error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
-		return store.ListResponse[*ateapipb.Worker]{}, f.listErr
+		return store.ListResponse[*ateapi.Worker]{}, f.listErr
 	}
-	out := make([]*ateapipb.Worker, len(f.workers))
+	out := make([]*ateapi.Worker, len(f.workers))
 	copy(out, f.workers)
-	return store.ListResponse[*ateapipb.Worker]{Items: out}, nil
+	return store.ListResponse[*ateapi.Worker]{Items: out}, nil
 }
 
 func (f *fakeStore) send(event store.WorkerEvent) {
@@ -419,7 +419,7 @@ func (f *fakeStore) send(event store.WorkerEvent) {
 	ch <- event
 }
 
-func (f *fakeStore) setWorkers(workers ...*ateapipb.Worker) {
+func (f *fakeStore) setWorkers(workers ...*ateapi.Worker) {
 	f.mu.Lock()
 	f.workers = workers
 	f.mu.Unlock()
@@ -439,21 +439,21 @@ func workerName(namespace, pod string) string {
 	return "uid-" + namespace + "-" + pod
 }
 
-func makeWorker(namespace, pod string, version int64) *ateapipb.Worker {
-	return &ateapipb.Worker{
-		Metadata: &ateapipb.ResourceMetadata{
+func makeWorker(namespace, pod string, version int64) *ateapi.Worker {
+	return &ateapi.Worker{
+		Metadata: &ateapi.ResourceMetadata{
 			Name:    workerName(namespace, pod),
 			Version: version,
 		},
 		WorkerNamespace: namespace,
 		WorkerPod:       pod,
 		WorkerPodUid:    workerName(namespace, pod),
-		Status:          &ateapipb.WorkerStatus{},
+		Status:          &ateapi.WorkerStatus{},
 	}
 }
 
 // workerSortOpt compares workers ignoring ordering.
-var workerSortOpt = cmpopts.SortSlices(func(a, b *ateapipb.Worker) bool {
+var workerSortOpt = cmpopts.SortSlices(func(a, b *ateapi.Worker) bool {
 	if a.GetWorkerNamespace() != b.GetWorkerNamespace() {
 		return a.GetWorkerNamespace() < b.GetWorkerNamespace()
 	}
@@ -468,5 +468,143 @@ func eventually(t *testing.T, condition func() bool, timeout time.Duration) {
 	})
 	if err != nil {
 		t.Fatal("condition not met within timeout")
+	}
+}
+
+// The watch may replay an event or deliver one out of order, so an event
+// older than what the cache already holds must not regress it.
+func TestCache_WatchEventsAreFenced(t *testing.T) {
+	w := makeWorker("ns", "pod1", 1)
+	fs := newFakeStore(w)
+	c := workercache.New(fs, time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	updated := makeWorker("ns", "pod1", 2)
+	updated.Status.Allocated = &ateapi.WorkerResources{Actors: 1}
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: updated})
+	eventually(t, func() bool {
+		w, err := c.Worker(workerName("ns", "pod1"))
+		return err == nil && w.GetMetadata().GetVersion() == 2 && w.GetStatus().GetAllocated().GetActors() == 1
+	}, 2*time.Second)
+
+	// A replayed and an older event must both be no-ops.
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: updated})
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: makeWorker("ns", "pod1", 1)})
+	// Ordering on the channel means observing a later event proves the two
+	// above were already applied.
+	fs.send(store.WorkerEvent{Type: store.WorkerEventCreated, Worker: makeWorker("ns", "pod2", 1)})
+	eventually(t, func() bool {
+		_, err := c.Worker(workerName("ns", "pod2"))
+		return err == nil
+	}, 2*time.Second)
+
+	got, err := c.Worker(workerName("ns", "pod1"))
+	if err != nil {
+		t.Fatalf("Worker: %v", err)
+	}
+	if got.GetMetadata().GetVersion() != 2 || got.GetStatus().GetAllocated().GetActors() != 1 {
+		t.Fatalf("stale event regressed the cache to version %d", got.GetMetadata().GetVersion())
+	}
+}
+
+// handlerRecorder records the Workers a Cache handler is called with.
+type handlerRecorder struct {
+	mu   sync.Mutex
+	seen []*ateapi.Worker
+}
+
+func (h *handlerRecorder) handle(w *ateapi.Worker) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = append(h.seen, w)
+}
+
+// versions returns the versions the handler saw for the named Worker, in order.
+func (h *handlerRecorder) versions(name string) []int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []int64
+	for _, w := range h.seen {
+		if w.GetMetadata().GetName() == name {
+			out = append(out, w.GetMetadata().GetVersion())
+		}
+	}
+	return out
+}
+
+// A handler added after Start is first called with what the cache holds.
+func TestCache_AddHandler_ReplaysCurrentWorkers(t *testing.T) {
+	c := workercache.New(newFakeStore(makeWorker("ns", "pod1", 1), makeWorker("ns", "pod2", 3)), time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var h handlerRecorder
+	c.AddHandler(h.handle)
+
+	if diff := cmp.Diff([]int64{1}, h.versions(workerName("ns", "pod1"))); diff != "" {
+		t.Errorf("pod1 versions (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]int64{3}, h.versions(workerName("ns", "pod2"))); diff != "" {
+		t.Errorf("pod2 versions (-want +got):\n%s", diff)
+	}
+}
+
+// A handler sees each change the cache applies, and not an event it fences
+// off as stale or a delete.
+func TestCache_AddHandler_SeesAppliedEvents(t *testing.T) {
+	fs := newFakeStore(makeWorker("ns", "pod1", 2))
+	c := workercache.New(fs, time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var h handlerRecorder
+	c.AddHandler(h.handle)
+
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: makeWorker("ns", "pod1", 1)})
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: makeWorker("ns", "pod1", 3)})
+	fs.send(store.WorkerEvent{Type: store.WorkerEventCreated, Worker: makeWorker("ns", "pod2", 1)})
+	fs.send(store.WorkerEvent{Type: store.WorkerEventDeleted, Worker: makeWorker("ns", "pod2", 1)})
+	eventually(t, func() bool {
+		_, err := c.Worker(workerName("ns", "pod2"))
+		return errors.Is(err, store.ErrNotFound) && len(h.versions(workerName("ns", "pod2"))) == 1
+	}, 2*time.Second)
+
+	if diff := cmp.Diff([]int64{2, 3}, h.versions(workerName("ns", "pod1"))); diff != "" {
+		t.Errorf("pod1 versions (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]int64{1}, h.versions(workerName("ns", "pod2"))); diff != "" {
+		t.Errorf("pod2 versions (-want +got):\n%s", diff)
+	}
+}
+
+// A relist hands the handler each Worker it finds new or changed, so a change
+// whose event was missed still reaches it, and leaves the rest alone.
+func TestCache_AddHandler_SeesRelistChanges(t *testing.T) {
+	unchanged := makeWorker("ns", "pod2", 1)
+	fs := newFakeStore(makeWorker("ns", "pod1", 1), unchanged)
+	c := workercache.New(fs, 20*time.Millisecond)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var h handlerRecorder
+	c.AddHandler(h.handle)
+
+	fs.setWorkers(makeWorker("ns", "pod1", 5), unchanged, makeWorker("ns", "pod3", 1))
+	eventually(t, func() bool {
+		return len(h.versions(workerName("ns", "pod1"))) == 2 && len(h.versions(workerName("ns", "pod3"))) == 1
+	}, 2*time.Second)
+	// Let a few more relists run over the now-unchanged store.
+	time.Sleep(100 * time.Millisecond)
+
+	if diff := cmp.Diff([]int64{1, 5}, h.versions(workerName("ns", "pod1"))); diff != "" {
+		t.Errorf("pod1 versions (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]int64{1}, h.versions(workerName("ns", "pod2"))); diff != "" {
+		t.Errorf("pod2 versions (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]int64{1}, h.versions(workerName("ns", "pod3"))); diff != "" {
+		t.Errorf("pod3 versions (-want +got):\n%s", diff)
 	}
 }

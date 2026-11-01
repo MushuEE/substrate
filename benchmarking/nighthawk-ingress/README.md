@@ -30,19 +30,19 @@ just don't steer the search.*
 ## What it measures
 
 Every request exercises the **full production routing path** — created and
-warmed sandboxed actors, Host-header routing, the ext_proc routing
+warmed sandboxed actors, actor-reference header routing, the ext_proc routing
 decision, and the mTLS hop to the worker:
 
 ```mermaid
 flowchart LR
     subgraph job["nighthawk runner Job"]
         alc["nighthawk_adaptive_load_client<br/>exponential ramp + binary search"]
-        svc["nighthawk_service<br/>16 event loops, Host header<br/>rotated across all actors"]
+        svc["nighthawk_service<br/>16 event loops, actor headers<br/>rotated across all actors"]
         alc -->|gRPC| svc
     end
 
     subgraph pod["atenet-router pod — pinned to envoyCpu CPUs"]
-        envoy["envoy :8080<br/>--concurrency envoyCpu"]
+        envoy["envoy :8443<br/>--concurrency envoyCpu"]
         extproc["atenet-router sidecar<br/>ext_proc routing decision"]
         envoy -->|request headers| extproc
         extproc -->|x-ate-original-dst| envoy
@@ -54,7 +54,7 @@ flowchart LR
         atunnel["atunnel :443"] --> glutton["glutton actor<br/>POST /ping :80"]
     end
 
-    svc -->|"HTTP :80, Host:<br/>actor-N.benchmark.actors..."| envoy
+    svc -->|"mTLS :443<br/>ate-target-actor"| envoy
     extproc -->|ResumeActor| ateapi
     envoy -->|"mTLS :443"| atunnel
 ```
@@ -84,9 +84,9 @@ One Kubernetes Job per `type: nighthawk-ingress` tests.yaml entry, driven by
    down afterwards, so nothing leaks.
 2. **Create + warm actors.** The runner creates one glutton actor per
    WorkerPool worker (the entry's `workerCount`) via ateapi and POSTs
-   `/ping` through the router with each actor's Host header until it
+   `/ping` through the router with each actor's routing header until it
    answers 200.
-3. **Adaptive search.** Open-loop traffic with the Host header rotated
+3. **Adaptive search.** Open-loop traffic with the actor routing header rotated
    across all actors; `clientConcurrency` event loops (default 16,
    decoupled from `envoyCpu`) and large per-loop pools so the harness is
    never the bottleneck. Exponential ramp → binary search → a 60s
@@ -120,7 +120,9 @@ requests 2×`envoyCpu` CPUs; the runner requests `clientConcurrency`+1).
 
 ```bash
 # .ate-dev-env.sh at the repo root, then:
-hack/install-ate.sh --deploy-ate-system
+go run ./cmd/ate-setup deploy ate-system \
+  --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner
 benchmarking/workloads/deploy.sh --deploy --worker-count 50 --sandbox-class gvisor
 ```
 
@@ -147,7 +149,7 @@ Flags: `--envoy-cpu`, `--actors`, `--tail-latency-slo-ms`, `--atespace`,
 Notes:
 
 - The script does not redeploy substrate — if substrate code changed,
-  rerun `hack/install-ate.sh --deploy-ate-system` first.
+  rerun `go run ./cmd/ate-setup deploy ate-system` first.
 - `--atespace` isolates actor *fleets* between experiments sharing a
   cluster; capacity runs themselves still need the router exclusively
   (the cpu pin is global and the run saturates it).
@@ -174,7 +176,7 @@ Start with `capacity.json`, drill into `stats.jsonl`:
 
 The fleet size is the entry's top-level `workerCount` (required): the
 benchmark warms one actor per worker, so it is also the number of glutton
-actors receiving rotated-Host traffic. Everything else lives in the
+actors receiving rotated actor-reference header traffic. Everything else lives in the
 `nighthawk-ingress:` block:
 
 | Knob | Default | Meaning |

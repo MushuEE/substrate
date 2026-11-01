@@ -18,7 +18,11 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,31 +33,67 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
 )
 
 const (
-	listenAddress   = ":80"
-	maxRequestBody  = 64 << 10
-	maxResponseBody = 1 << 20
-	requestTimeout  = 15 * time.Second
+	listenAddress             = ":80"
+	maxRequestBody            = 64 << 10
+	maxResponseBody           = 1 << 20
+	requestTimeout            = 15 * time.Second
+	maxWebSocketMessages      = 16
+	maxWebSocketMessageSize   = 64 << 10
+	maxWebSocketHandshakeBody = 4 << 10
+	maxConnectAnswerBody      = 4 << 10
+	muxRequestCount           = 10
+	muxBodySize               = 64
+	// Keep connection around longer than ext_proc cache freshness (10s)
+	postBodyDelay   = 15 * time.Second
+	slowHeaderDelay = 5 * time.Second
 )
 
 type fetchRequest struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	RootCA string `json:"rootCA,omitempty"`
+	HTTP1  bool   `json:"http1,omitempty"`
 }
 
 type fetchResponse struct {
 	StatusCode int    `json:"statusCode,omitempty"`
 	Body       string `json:"body,omitempty"`
+	ServerCert string `json:"serverCert,omitempty"`
+	Protocol   string `json:"protocol,omitempty"`
+	TLS        bool   `json:"tls"`
 	Error      string `json:"error,omitempty"`
+}
+
+type websocketRequest struct {
+	URL      string   `json:"url"`
+	RootCA   string   `json:"rootCA,omitempty"`
+	Messages []string `json:"messages"`
+}
+
+type websocketMessage struct {
+	Type    int    `json:"type"`
+	Message string `json:"message"`
+}
+
+type websocketResponse struct {
+	StatusCode    int                `json:"statusCode,omitempty"`
+	Protocol      string             `json:"protocol,omitempty"`
+	HandshakeBody string             `json:"handshakeBody,omitempty"`
+	TLS           bool               `json:"tls"`
+	Messages      []websocketMessage `json:"messages"`
+	Error         string             `json:"error,omitempty"`
 }
 
 // grpcRequest asks for one unary Echo against target, and additionally for a
@@ -90,6 +130,29 @@ type grpcResponse struct {
 type streamedMessage struct {
 	Message string `json:"message"`
 	Index   int32  `json:"index"`
+}
+
+// connectRequest parameters for an HTTP CONNECT.
+type connectRequest struct {
+	// Proxy is the host:port the actor dials and sends the CONNECT to.
+	Proxy string `json:"proxy"`
+	// Target is the host:port named in the CONNECT request line.
+	Target string `json:"target"`
+	// TLS wraps the connection to Proxy in TLS before the CONNECT goes out,
+	// which is how a client talks to an HTTPS proxy. The proxy's certificate
+	// is verified against RootCA when set, else the actor's roots.
+	TLS    bool   `json:"tls,omitempty"`
+	RootCA string `json:"rootCA,omitempty"`
+}
+
+// connectResponse is the proxy's answer to the CONNECT.
+type connectResponse struct {
+	StatusCode int    `json:"statusCode,omitempty"`
+	Protocol   string `json:"protocol,omitempty"`
+	Body       string `json:"body,omitempty"`
+	// TLS is true if the CONNECT was sent over TLS.
+	TLS   bool   `json:"tls"`
+	Error string `json:"error,omitempty"`
 }
 
 func main() {
@@ -135,7 +198,13 @@ func newHandler(client *http.Client) http.Handler {
 		if traceparent := r.Header.Get("traceparent"); traceparent != "" {
 			outbound.Header.Set("traceparent", traceparent)
 		}
-		response, err := client.Do(outbound)
+		requestClient, cleanup, err := fetchClient(client, input)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("configuring request: %v", err)})
+			return
+		}
+		defer cleanup()
+		response, err := requestClient.Do(outbound)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
 			return
@@ -147,10 +216,538 @@ func newHandler(client *http.Client) http.Handler {
 			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("reading response: %v", err)})
 			return
 		}
-		writeJSON(w, response.StatusCode, fetchResponse{StatusCode: response.StatusCode, Body: string(body)})
+		var serverCert string
+		verifiedTLS := response.TLS != nil && len(response.TLS.VerifiedChains) > 0
+		if response.TLS != nil && len(response.TLS.PeerCertificates) > 0 {
+			serverCert = response.TLS.PeerCertificates[0].Issuer.String()
+		}
+		writeJSON(w, response.StatusCode, fetchResponse{
+			StatusCode: response.StatusCode,
+			Body:       string(body),
+			ServerCert: serverCert,
+			Protocol:   response.Proto,
+			TLS:        verifiedTLS,
+		})
 	})
+	mux.HandleFunc("/post", handlePost(postBodyDelay))
+	mux.HandleFunc("/slow-headers", handleSlowHeaders(slowHeaderDelay))
+	mux.HandleFunc("/mux", handleMux)
+	mux.HandleFunc("/websocket", handleWebSocket)
 	mux.HandleFunc("/grpc", handleGRPC)
+	mux.HandleFunc("/connect", handleConnect)
 	return mux
+}
+
+func handleSlowHeaders(headerDelay time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSON(w, http.StatusMethodNotAllowed, fetchResponse{Error: "method must be POST"})
+			return
+		}
+
+		var input fetchRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+		if err := decoder.Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid JSON payload: %v", err)})
+			return
+		}
+		if err := validateURL(input.URL); err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: err.Error()})
+			return
+		}
+		parsed, err := url.Parse(input.URL)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid URL: %v", err)})
+			return
+		}
+		if parsed.Scheme != "http" {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: "URL scheme must be http"})
+			return
+		}
+
+		targetAddr := parsed.Host
+		if parsed.Port() == "" {
+			targetAddr = net.JoinHostPort(parsed.Hostname(), "80")
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout+headerDelay)
+		defer cancel()
+
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+		defer conn.Close()
+
+		if deadline, ok := ctx.Deadline(); ok {
+			if err := conn.SetDeadline(deadline); err != nil {
+				writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+				return
+			}
+		}
+
+		// Send request line and headers without the final "\r\n" that terminates the header block.
+		reqHeader := fmt.Sprintf(
+			"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n",
+			parsed.RequestURI(), parsed.Host,
+		)
+		if _, err := io.WriteString(conn, reqHeader); err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+
+		select {
+		case <-time.After(headerDelay):
+		case <-ctx.Done():
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", ctx.Err())})
+			return
+		}
+
+		if _, err := io.WriteString(conn, "\r\n"); err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("reading response: %v", err)})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("reading response: %v", err)})
+			return
+		}
+		writeJSON(w, resp.StatusCode, fetchResponse{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			Protocol:   resp.Proto,
+			TLS:        false,
+		})
+	}
+}
+
+func handlePost(bodyDelay time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSON(w, http.StatusMethodNotAllowed, fetchResponse{Error: "method must be POST"})
+			return
+		}
+
+		var input fetchRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+		if err := decoder.Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid JSON payload: %v", err)})
+			return
+		}
+		if err := validateURL(input.URL); err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: err.Error()})
+			return
+		}
+		parsed, err := url.Parse(input.URL)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid URL: %v", err)})
+			return
+		}
+
+		var tlsCfg *tls.Config
+		if parsed.Scheme == "https" {
+			tlsCfg = &tls.Config{
+				ServerName: parsed.Hostname(),
+				MinVersion: tls.VersionTLS12,
+			}
+			if input.RootCA != "" {
+				roots := x509.NewCertPool()
+				if !roots.AppendCertsFromPEM([]byte(input.RootCA)) {
+					writeJSON(w, http.StatusBadRequest, fetchResponse{Error: "rootCA does not contain a valid certificate"})
+					return
+				}
+				tlsCfg.RootCAs = roots
+			}
+		}
+
+		targetAddr := parsed.Host
+		if parsed.Port() == "" {
+			defaultPort := "80"
+			if parsed.Scheme == "https" {
+				defaultPort = "443"
+			}
+			targetAddr = net.JoinHostPort(parsed.Hostname(), defaultPort)
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout+bodyDelay)
+		defer cancel()
+
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+		defer conn.Close()
+
+		if deadline, ok := ctx.Deadline(); ok {
+			if err := conn.SetDeadline(deadline); err != nil {
+				writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+				return
+			}
+		}
+
+		if tlsCfg != nil {
+			tlsConn := tls.Client(conn, tlsCfg)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+				return
+			}
+			conn = tlsConn
+		}
+
+		reqHeader := fmt.Sprintf(
+			"POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+			parsed.RequestURI(), parsed.Host, muxBodySize,
+		)
+		if _, err := io.WriteString(conn, reqHeader); err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+
+		select {
+		case <-time.After(bodyDelay):
+		case <-ctx.Done():
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", ctx.Err())})
+			return
+		}
+
+		body := bytes.Repeat([]byte("a"), muxBodySize)
+		if _, err := conn.Write(body); err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
+			return
+		}
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("reading response: %v", err)})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("reading response: %v", err)})
+			return
+		}
+		writeJSON(w, resp.StatusCode, fetchResponse{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			Protocol:   resp.Proto,
+			TLS:        tlsCfg != nil,
+		})
+	}
+}
+
+// This handler is for testing mutiplexing of actor `muxRequestCount` connections over H/2
+// CONNECT tunnels between an atunnel and egress gateway. This handler:
+// 1. opens `muxRequestCount` connections to the origin
+// 2. sends POST request with headers, but not bodies on all of them.
+// 3. once headers were sent, it sends bodies
+// 4. waits for all 200 responses.
+// Tests can then validate the expected number of H/2 connections on egress gateways.
+func handleMux(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, fetchResponse{Error: "method must be POST"})
+		return
+	}
+
+	var input fetchRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid JSON payload: %v", err)})
+		return
+	}
+	if err := validateURL(input.URL); err != nil {
+		writeJSON(w, http.StatusBadRequest, fetchResponse{Error: err.Error()})
+		return
+	}
+	parsed, err := url.Parse(input.URL)
+	if err != nil || parsed.Scheme != "http" {
+		writeJSON(w, http.StatusBadRequest, fetchResponse{Error: "URL scheme must be http"})
+		return
+	}
+
+	targetAddr := parsed.Host
+	if parsed.Port() == "" {
+		targetAddr = net.JoinHostPort(parsed.Hostname(), "80")
+	}
+	requestURI := parsed.RequestURI()
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	var headersWg sync.WaitGroup
+	headersWg.Add(muxRequestCount)
+	allHeadersSent := make(chan struct{})
+	go func() {
+		headersWg.Wait()
+		close(allHeadersSent)
+	}()
+
+	type muxOutcome struct {
+		status int
+		body   string
+		err    error
+	}
+	outcomes := make([]muxOutcome, muxRequestCount)
+
+	var doneWg sync.WaitGroup
+	doneWg.Add(muxRequestCount)
+	for i := range muxRequestCount {
+		go func(idx int) {
+			defer doneWg.Done()
+			status, body, reqErr := sendMuxRequest(ctx, cancel, targetAddr, parsed.Host, requestURI, &headersWg, allHeadersSent)
+			outcomes[idx] = muxOutcome{status: status, body: body, err: reqErr}
+		}(i)
+	}
+	doneWg.Wait()
+
+	for i, out := range outcomes {
+		if out.err != nil && !errors.Is(out.err, context.Canceled) {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request %d failed: %v", i, out.err)})
+			return
+		}
+		if out.err == nil && out.status != http.StatusOK {
+			writeJSON(w, out.status, fetchResponse{
+				StatusCode: out.status,
+				Body:       out.body,
+				Error:      fmt.Sprintf("request %d returned status %d, want 200", i, out.status),
+			})
+			return
+		}
+	}
+	for i, out := range outcomes {
+		if out.err != nil {
+			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request %d failed: %v", i, out.err)})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, fetchResponse{StatusCode: http.StatusOK})
+}
+
+func sendMuxRequest(ctx context.Context, cancel context.CancelFunc, targetAddr, host, requestURI string, headersWg *sync.WaitGroup, allHeadersSent <-chan struct{}) (int, string, error) {
+	headerDone := false
+	defer func() {
+		if !headerDone {
+			cancel()
+			headersWg.Done()
+		}
+	}()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		return 0, "", fmt.Errorf("dialing %s: %w", targetAddr, err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return 0, "", fmt.Errorf("setting deadline: %w", err)
+		}
+	}
+
+	reqHeader := fmt.Sprintf(
+		"POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+		requestURI, host, muxBodySize,
+	)
+	if _, err := io.WriteString(conn, reqHeader); err != nil {
+		return 0, "", fmt.Errorf("writing request headers: %w", err)
+	}
+
+	headerDone = true
+	headersWg.Done()
+
+	select {
+	case <-allHeadersSent:
+	case <-ctx.Done():
+		return 0, "", ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
+	}
+
+	body := bytes.Repeat([]byte("a"), muxBodySize)
+	if _, err := conn.Write(body); err != nil {
+		return 0, "", fmt.Errorf("writing request body: %w", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+	if err != nil {
+		return 0, "", fmt.Errorf("reading response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		return 0, "", fmt.Errorf("reading response body: %w", err)
+	}
+	return resp.StatusCode, string(respBody), nil
+}
+
+// fetchClient constructs a per-request client only when the request asks for
+// request-scoped TLS or protocol behavior. The default path retains the
+// caller's client, including its transport and redirect policy.
+func fetchClient(base *http.Client, input fetchRequest) (*http.Client, func(), error) {
+	if input.RootCA == "" && !input.HTTP1 {
+		return base, func() {}, nil
+	}
+	if base == nil {
+		base = http.DefaultClient
+	}
+	// Start from the standard transport so request-scoped trust cannot inherit
+	// an insecure TLS callback or proxy from an injected/base client.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	if input.RootCA != "" {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM([]byte(input.RootCA)) {
+			return nil, nil, errors.New("rootCA does not contain a valid certificate")
+		}
+		transport.TLSClientConfig.RootCAs = roots
+	}
+	if input.HTTP1 {
+		protocols := new(http.Protocols)
+		protocols.SetHTTP1(true)
+		transport.Protocols = protocols
+		transport.ForceAttemptHTTP2 = false
+		transport.TLSNextProto = nil
+	}
+	requestClient := *base
+	requestClient.Transport = transport
+	requestClient.Timeout = requestTimeout
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &requestClient, transport.CloseIdleConnections, nil
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, websocketResponse{Messages: []websocketMessage{}, Error: "method must be POST"})
+		return
+	}
+
+	var input websocketRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, websocketResponse{Messages: []websocketMessage{}, Error: fmt.Sprintf("invalid JSON payload: %v", err)})
+		return
+	}
+	if err := validateWebSocketRequest(input); err != nil {
+		writeJSON(w, http.StatusBadRequest, websocketResponse{Messages: []websocketMessage{}, Error: err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	response, err := performWebSocket(ctx, input)
+	if err != nil {
+		response.Error = err.Error()
+		writeJSON(w, http.StatusBadGateway, response)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func validateWebSocketRequest(input websocketRequest) error {
+	parsed, err := url.Parse(input.URL)
+	if err != nil {
+		return fmt.Errorf("invalid WebSocket URL: %w", err)
+	}
+	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
+		return errors.New("WebSocket URL scheme must be ws or wss")
+	}
+	if parsed.Hostname() == "" {
+		return errors.New("WebSocket URL must include a hostname")
+	}
+	if len(input.Messages) == 0 {
+		return errors.New("messages must contain at least one message")
+	}
+	if len(input.Messages) > maxWebSocketMessages {
+		return fmt.Errorf("messages contains %d items, maximum is %d", len(input.Messages), maxWebSocketMessages)
+	}
+	for index, message := range input.Messages {
+		if len(message) > maxWebSocketMessageSize {
+			return fmt.Errorf("message %d is %d bytes, maximum is %d", index, len(message), maxWebSocketMessageSize)
+		}
+	}
+	return nil
+}
+
+func performWebSocket(ctx context.Context, input websocketRequest) (websocketResponse, error) {
+	dialer := websocket.Dialer{HandshakeTimeout: requestTimeout, Proxy: nil}
+	if input.RootCA != "" {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM([]byte(input.RootCA)) {
+			return websocketResponse{Messages: []websocketMessage{}}, errors.New("configuring TLS: rootCA does not contain a valid certificate")
+		}
+		dialer.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	}
+	response := websocketResponse{Messages: []websocketMessage{}}
+	conn, handshakeResponse, err := dialer.DialContext(ctx, input.URL, nil)
+	if handshakeResponse != nil {
+		response.StatusCode = handshakeResponse.StatusCode
+		response.Protocol = handshakeResponse.Proto
+		if handshakeResponse.Body != nil {
+			body, _ := io.ReadAll(io.LimitReader(handshakeResponse.Body, maxWebSocketHandshakeBody))
+			_ = handshakeResponse.Body.Close()
+			response.HandshakeBody = string(body)
+		}
+	}
+	if err != nil {
+		return response, fmt.Errorf("WebSocket handshake failed: %w", err)
+	}
+	if tlsConn, ok := conn.UnderlyingConn().(*tls.Conn); ok {
+		response.TLS = tlsConn.ConnectionState().VerifiedChains != nil
+	}
+	defer conn.Close()
+	conn.SetReadLimit(maxWebSocketMessageSize)
+
+	stopCancellation := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopCancellation:
+		}
+	}()
+	defer close(stopCancellation)
+
+	for index, message := range input.Messages {
+		if err := conn.SetWriteDeadline(time.Now().Add(requestTimeout)); err != nil {
+			return response, fmt.Errorf("setting write deadline for message %d: %w", index, err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+			return response, fmt.Errorf("writing message %d: %w", index, err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(requestTimeout)); err != nil {
+			return response, fmt.Errorf("setting read deadline for message %d: %w", index, err)
+		}
+		messageType, received, err := conn.ReadMessage()
+		if err != nil {
+			return response, fmt.Errorf("reading response to message %d: %w", index, err)
+		}
+		response.Messages = append(response.Messages, websocketMessage{Type: messageType, Message: string(received)})
+	}
+	return response, nil
 }
 
 // handleGRPC dials the requested target and echoes back what the RPCs returned.
@@ -169,7 +766,7 @@ func handleGRPC(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, grpcResponse{Error: fmt.Sprintf("invalid JSON payload: %v", err)})
 		return
 	}
-	if err := validateTarget(input.Target); err != nil {
+	if err := validateTarget(input.Target, "target"); err != nil {
 		writeJSON(w, http.StatusBadRequest, grpcResponse{Error: err.Error()})
 		return
 	}
@@ -290,6 +887,107 @@ func writeGRPCFailure(w http.ResponseWriter, rpc string, err error) {
 	})
 }
 
+// handleConnect sends one HTTP CONNECT, the request a client makes of a
+// forward proxy, and reports the answer.
+func handleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, connectResponse{Error: "method must be POST"})
+		return
+	}
+
+	var input connectRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, connectResponse{Error: fmt.Sprintf("invalid JSON payload: %v", err)})
+		return
+	}
+	if err := validateTarget(input.Proxy, "proxy"); err != nil {
+		writeJSON(w, http.StatusBadRequest, connectResponse{Error: err.Error()})
+		return
+	}
+	if err := validateTarget(input.Target, "target"); err != nil {
+		writeJSON(w, http.StatusBadRequest, connectResponse{Error: err.Error()})
+		return
+	}
+	// Built before anything is dialed, so a bad rootCA is the caller's
+	// mistake and no connection is opened for it.
+	var tlsCfg *tls.Config
+	if input.TLS {
+		host, _, _ := net.SplitHostPort(input.Proxy)
+		tlsCfg = &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+		if input.RootCA != "" {
+			roots := x509.NewCertPool()
+			if !roots.AppendCertsFromPEM([]byte(input.RootCA)) {
+				writeJSON(w, http.StatusBadRequest, connectResponse{Error: "rootCA does not contain a valid certificate"})
+				return
+			}
+			tlsCfg.RootCAs = roots
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	response, err := performConnect(ctx, input, tlsCfg)
+	if err != nil {
+		response.Error = err.Error()
+		writeJSON(w, http.StatusBadGateway, response)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// performConnect dials the proxy, completes a TLS handshake with it when
+// tlsCfg is set, sends the CONNECT and reads its answer.
+func performConnect(ctx context.Context, input connectRequest, tlsCfg *tls.Config) (connectResponse, error) {
+	var response connectResponse
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", input.Proxy)
+	if err != nil {
+		return response, fmt.Errorf("dialing proxy %s: %w", input.Proxy, err)
+	}
+	// Through the variable, so the TLS connection that may replace it below
+	// is the one closed and gets to send its close_notify.
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return response, fmt.Errorf("setting deadline: %w", err)
+		}
+	}
+
+	if tlsCfg != nil {
+		tlsConn := tls.Client(conn, tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return response, fmt.Errorf("TLS handshake with proxy %s: %w", input.Proxy, err)
+		}
+		response.TLS = tlsConn.ConnectionState().VerifiedChains != nil
+		conn = tlsConn
+	}
+
+	request := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", input.Target, input.Target)
+	if _, err := io.WriteString(conn, request); err != nil {
+		return response, fmt.Errorf("sending CONNECT %s: %w", input.Target, err)
+	}
+	answer, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return response, fmt.Errorf("reading the answer to CONNECT %s: %w", input.Target, err)
+	}
+	defer answer.Body.Close()
+	response.StatusCode = answer.StatusCode
+	response.Protocol = answer.Proto
+	// A 2xx turns the connection into the tunnel, so there is no body to
+	// read, and reading one would wait on bytes the proxy will never send.
+	if answer.StatusCode/100 == 2 {
+		return response, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(answer.Body, maxConnectAnswerBody))
+	if err != nil {
+		return response, fmt.Errorf("reading the body of the answer to CONNECT %s: %w", input.Target, err)
+	}
+	response.Body = string(body)
+	return response, nil
+}
+
 func validateURL(raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -304,21 +1002,23 @@ func validateURL(raw string) error {
 	return nil
 }
 
-// validateTarget checks that raw is the host:port a gRPC dial needs. Unlike a
-// URL there is no scheme to reject, so a caller that passes one -- or passes a
-// bare hostname and lets the dial default the port -- finds out here rather
-// than in a connection error from somewhere along the egress path.
-func validateTarget(raw string) error {
+// validateTarget checks that raw is a host:port, which is what a gRPC dial, a
+// forward proxy, and a CONNECT's authority all take. Unlike a URL there is no
+// scheme to reject, so a caller that passes one -- or passes a bare hostname
+// and lets the dial default the port -- finds out here rather than in a
+// connection error from somewhere along the egress path. what names the
+// field in the error.
+func validateTarget(raw, what string) error {
 	host, port, err := net.SplitHostPort(raw)
 	if err != nil {
-		return fmt.Errorf("target must be host:port: %w", err)
+		return fmt.Errorf("%s must be host:port: %w", what, err)
 	}
 	if host == "" {
-		return fmt.Errorf("target must include a host")
+		return fmt.Errorf("%s must include a host", what)
 	}
 	number, err := strconv.Atoi(port)
 	if err != nil || number < 1 || number > 65535 {
-		return fmt.Errorf("target port must be a number between 1 and 65535, got %q", port)
+		return fmt.Errorf("%s port must be a number between 1 and 65535, got %q", what, port)
 	}
 	return nil
 }

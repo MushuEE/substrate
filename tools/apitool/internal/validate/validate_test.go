@@ -17,8 +17,8 @@ package validate_test
 import (
 	"testing"
 
-	"github.com/agent-substrate/substrate/tools/apitool/internal/exemption"
-	"github.com/agent-substrate/substrate/tools/apitool/internal/validate"
+	"go.ate.dev/substrate/tools/apitool/internal/exemption"
+	"go.ate.dev/substrate/tools/apitool/internal/validate"
 )
 
 func TestExemptions(t *testing.T) {
@@ -40,6 +40,9 @@ func TestExemptions(t *testing.T) {
 	want, err := exemption.Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	if err := exemption.CheckSorted(want); err != nil {
+		t.Fatalf("%s: %v; run `apitool validate --update` (from tools/apitool) to restore canonical order", path, err)
 	}
 
 	missing, stale := exemption.Diff(current, want)

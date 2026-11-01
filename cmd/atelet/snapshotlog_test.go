@@ -18,14 +18,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/ateerrors"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -104,7 +106,7 @@ func TestSnapshotLogAttrsSeconds(t *testing.T) {
 		templateNamespace: testTemplateNamespace,
 		templateName:      testTemplateName,
 		kind:              ateattr.SnapshotKindLatest,
-		scope:             ateattr.SnapshotScopeFull,
+		fidelity:          ateattr.SnapshotFidelityMemory,
 		sandboxClass:      "gvisor",
 	}
 	attrs := snapshotLogAttrs(testAttribution(), op, restoreDurationMetric, nil,
@@ -123,7 +125,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 		templateNamespace: testTemplateNamespace,
 		templateName:      testTemplateName,
 		kind:              ateattr.SnapshotKindLatest,
-		scope:             ateattr.SnapshotScopeFull,
+		fidelity:          ateattr.SnapshotFidelityMemory,
 		sandboxClass:      "gvisor",
 	}
 
@@ -145,7 +147,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 				{ateattr.SnapshotPhaseSandboxAssets, 10 * time.Millisecond},
 				{ateattr.SnapshotPhaseDownload, 310 * time.Millisecond},
 				{ateattr.SnapshotPhaseOCIUnpack, 50 * time.Millisecond},
-				{ateattr.SnapshotPhaseAteomRestore, 60 * time.Millisecond},
+				{ateattr.SnapshotPhaseWorkerRestore, 60 * time.Millisecond},
 				{ateattr.SnapshotPhaseTotal, 420 * time.Millisecond},
 			},
 			wantStrings: map[string]string{
@@ -155,7 +157,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 				"ate.template.atespace": testTemplateNamespace,
 				"ate.template.name":     testTemplateName,
 				"ate.snapshot.kind":     ateattr.SnapshotKindLatest,
-				"ate.snapshot.scope":    ateattr.SnapshotScopeFull,
+				"ate.snapshot.fidelity": ateattr.SnapshotFidelityMemory,
 				"ate.sandbox.class":     "gvisor",
 			},
 			wantNumbers: map[string]float64{
@@ -166,7 +168,52 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			},
 			// The phase key names the one step a datapoint timed; this record has
 			// them all, so borrowing it here would give one key two meanings.
-			wantAbsent: []string{"ate.failure.reason", "ate.snapshot.phase", "actor", "total", "download"},
+			// Absent error.type is success, as on the instruments.
+			wantAbsent: []string{"ate.snapshot.phase", "actor", "total", "download", "error.type"},
+		},
+		{
+			name: "a failed restore keeps the phases it completed and is marked with the gRPC code",
+			op:   fullOp,
+			err:  status.Error(codes.DeadlineExceeded, "download timed out"),
+			phases: []phase{
+				{ateattr.SnapshotPhaseDownload, 30 * time.Second},
+				{ateattr.SnapshotPhaseTotal, 30 * time.Second},
+			},
+			wantStrings: map[string]string{
+				"error.type": "DeadlineExceeded",
+			},
+			wantNumbers: map[string]float64{
+				"ate.actor.restore.duration.download": 30,
+			},
+		},
+		{
+			name:   "a plain error is a bounded Unknown, not its message",
+			op:     fullOp,
+			err:    errors.New("disk on fire at /var/lib/ate"),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "Unknown",
+			},
+		},
+		{
+			// atelet's own downloads and uploads fail with wrapped context
+			// errors, not status errors; a timeout must not read as Unknown.
+			name:   "a wrapped context deadline reports DeadlineExceeded",
+			op:     fullOp,
+			err:    fmt.Errorf("while downloading memory-ranges: %w", context.DeadlineExceeded),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, 30 * time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "DeadlineExceeded",
+			},
+		},
+		{
+			name:   "a wrapped context cancellation reports Canceled",
+			op:     fullOp,
+			err:    fmt.Errorf("while restoring: %w", context.Canceled),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "Canceled",
+			},
 		},
 		{
 			name:   "a phase that never ran is absent, not zero",
@@ -182,13 +229,11 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			op: snapshotOp{
 				templateNamespace: testTemplateNamespace,
 				templateName:      testTemplateName,
-				scope:             ateattr.SnapshotScopeFull,
+				fidelity:          ateattr.SnapshotFidelityMemory,
 			},
-			err:    fmt.Errorf("%w: while fetching snapshot manifest", ateerrors.ReasonFailedGetExternalObject),
 			phases: []phase{{ateattr.SnapshotPhaseTotal, 700 * time.Millisecond}},
 			wantStrings: map[string]string{
-				"ate.actor.uid":      testActorUID,
-				"ate.failure.reason": string(ateerrors.ReasonFailedGetExternalObject),
+				"ate.actor.uid": testActorUID,
 			},
 			wantNumbers: map[string]float64{
 				"ate.actor.restore.duration.total": 0.7,
@@ -196,35 +241,11 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			wantAbsent: []string{"ate.snapshot.kind", "ate.sandbox.class"},
 		},
 		{
-			name:   "an unclassified failure collapses onto UNKNOWN rather than leaking the message",
-			op:     fullOp,
-			err:    fmt.Errorf("dial tcp 10.96.192.187:9000: connect: connection refused"),
-			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
-			wantStrings: map[string]string{
-				"ate.failure.reason": ateattr.ReasonUnknown,
-			},
-		},
-		{
-			// A restore that panicked leaves the named err nil, so the defer
-			// substitutes this. Without a reason on the record it would read as a
-			// fast success right before atelet dies.
-			name:   "a restore that unwound reports as a failure, not a fast success",
-			op:     fullOp,
-			err:    errRestoreUnwound,
-			phases: []phase{{ateattr.SnapshotPhaseVolumeMount, 4 * time.Millisecond}, {ateattr.SnapshotPhaseTotal, 9 * time.Millisecond}},
-			wantStrings: map[string]string{
-				"ate.failure.reason": ateattr.ReasonUnknown,
-			},
-			wantNumbers: map[string]float64{
-				"ate.actor.restore.duration.total": 0.009,
-			},
-		},
-		{
 			name: "a sandbox class the manifest invented is bounded, not passed through",
 			op: snapshotOp{
 				templateNamespace: testTemplateNamespace,
 				templateName:      testTemplateName,
-				scope:             ateattr.SnapshotScopeFull,
+				fidelity:          ateattr.SnapshotFidelityMemory,
 				sandboxClass:      "../../etc/passwd",
 			},
 			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},

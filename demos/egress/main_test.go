@@ -15,7 +15,10 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,13 +26,19 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/testcert"
 )
 
 func TestFetch(t *testing.T) {
@@ -66,6 +75,54 @@ func TestFetch(t *testing.T) {
 	}
 	if got.StatusCode != http.StatusTeapot || got.Body != "hello from upstream" {
 		t.Errorf("response = %+v", got)
+	}
+}
+
+func TestFetchHTTPAndHTTPS(t *testing.T) {
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "from http")
+	}))
+	defer httpSrv.Close()
+
+	httpsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "from https")
+	}))
+	defer httpsSrv.Close()
+
+	// The demo verifies origins with the roots its client is given: in the
+	// cluster the projected trust bundle, here the test server's own.
+	httpsClient := httpsSrv.Client()
+	httpsClient.Timeout = requestTimeout
+	handler := newHandler(httpsClient)
+	for _, tc := range []struct {
+		name     string
+		url      string
+		want     string
+		wantCert string
+	}{
+		{name: "http", url: httpSrv.URL, want: "from http"},
+		{name: "https", url: httpsSrv.URL, want: "from https", wantCert: httpsSrv.Certificate().Issuer.String()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(fetchRequest{URL: tc.url})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(payload)))
+			handler.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var got fetchResponse
+			if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil {
+				t.Fatalf("decoding response: %v", err)
+			}
+			if got.StatusCode != http.StatusOK || got.Body != tc.want || got.ServerCert != tc.wantCert {
+				t.Errorf("response = %+v, want status 200, body %q, serverCert %q", got, tc.want, tc.wantCert)
+			}
+		})
 	}
 }
 
@@ -108,6 +165,271 @@ func TestOutboundFailure(t *testing.T) {
 	if recorder.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
 	}
+}
+
+func TestFetchWithRequestScopedTLSAndHTTP1(t *testing.T) {
+	server, rootCA := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Proto != "HTTP/1.1" {
+			t.Errorf("request protocol = %s, want HTTP/1.1", r.Proto)
+		}
+		_, _ = io.WriteString(w, "trusted")
+	}))
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/", fetchRequest{
+		URL:    server.URL,
+		RootCA: rootCA,
+		HTTP1:  true,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got fetchResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusOK || got.Body != "trusted" || got.Protocol != "HTTP/1.1" || !got.TLS {
+		t.Errorf("response = %+v, want successful verified HTTP/1.1 TLS response", got)
+	}
+}
+
+func TestFetchTLSVerificationFailure(t *testing.T) {
+	server, _ := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "should not arrive")
+	}))
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/", fetchRequest{URL: server.URL})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var got fetchResponse
+	decodeRecorder(t, recorder, &got)
+	if got.Error == "" || got.Body != "" || got.StatusCode != 0 {
+		t.Errorf("response = %+v, want TLS failure without upstream response", got)
+	}
+}
+
+func TestFetchTLSWrongRootFails(t *testing.T) {
+	server, _ := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "should not arrive")
+	}))
+	_, wrongRoot := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "other server")
+	}))
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/", fetchRequest{URL: server.URL, RootCA: wrongRoot})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+}
+
+func TestFetchDoesNotFollowRedirects(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected = true
+		_, _ = io.WriteString(w, "redirected")
+	}))
+	t.Cleanup(target.Close)
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(source.Close)
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/", fetchRequest{URL: source.URL, HTTP1: true})
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusFound, recorder.Body.String())
+	}
+	if redirected {
+		t.Fatal("redirect target received a request")
+	}
+	var got fetchResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusFound || got.Protocol == "" {
+		t.Errorf("response = %+v, want observed redirect response", got)
+	}
+}
+
+func TestWebSocket(t *testing.T) {
+	server := startWebSocketServer(t, false)
+	messages := []string{"one", "two", "three"}
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server), Messages: messages})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got websocketResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusSwitchingProtocols || got.Protocol != "HTTP/1.1" || got.TLS || got.Error != "" {
+		t.Errorf("response = %+v, want successful plaintext handshake", got)
+	}
+	if len(got.Messages) != len(messages) {
+		t.Fatalf("messages = %+v, want %d observations", got.Messages, len(messages))
+	}
+	for i, message := range got.Messages {
+		if message.Type != websocket.TextMessage || message.Message != messages[i] {
+			t.Errorf("messages[%d] = %+v, want text %q", i, message, messages[i])
+		}
+	}
+}
+
+func TestWebSocketTLSAndVerificationFailure(t *testing.T) {
+	server, rootCA := startIPTLSServer(t, webSocketEchoHandler(false))
+	messages := []string{"tls-one", "tls-two", "tls-three"}
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server.URL), RootCA: rootCA, Messages: messages})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got websocketResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusSwitchingProtocols || got.Protocol != "HTTP/1.1" || !got.TLS || len(got.Messages) != len(messages) {
+		t.Errorf("response = %+v, want verified TLS observations", got)
+	}
+
+	recorder = postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server.URL), Messages: messages})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("untrusted status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+}
+
+func TestWebSocketRejectsNonUpgrade(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not websocket")
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server.URL), Messages: []string{"one", "two", "three"}})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var got websocketResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusOK || got.Protocol != "HTTP/1.1" || got.TLS || got.Error == "" {
+		t.Errorf("response = %+v, want preserved non-upgrade response and stage error", got)
+	}
+}
+
+func TestWebSocketPreservesBoundedHandshakeBody(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		want       string
+		wantPrefix bool
+	}{
+		{name: "exact denial body", body: "WebSocket egress is not supported", want: "WebSocket egress is not supported"},
+		{name: "oversized body", body: strings.Repeat("x", maxWebSocketHandshakeBody+1), wantPrefix: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+
+			recorder := postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server.URL), Messages: []string{"probe"}})
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+			}
+			var got websocketResponse
+			decodeRecorder(t, recorder, &got)
+			if got.StatusCode != http.StatusForbidden {
+				t.Errorf("handshake status = %d, want %d", got.StatusCode, http.StatusForbidden)
+			}
+			if tc.wantPrefix {
+				if len(got.HandshakeBody) == 0 || len(got.HandshakeBody) > maxWebSocketHandshakeBody || !strings.HasPrefix(tc.body, got.HandshakeBody) {
+					t.Errorf("handshake body length = %d, want a prefix no longer than %d bytes", len(got.HandshakeBody), maxWebSocketHandshakeBody)
+				}
+			} else if got.HandshakeBody != tc.want {
+				t.Errorf("handshake body = %q, want %q", got.HandshakeBody, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebSocketPreservesPartialObservationsOnBadResponse(t *testing.T) {
+	server := startWebSocketServer(t, true)
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/websocket", websocketRequest{URL: toWebSocketURL(server), Messages: []string{"one", "two", "three"}})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var got websocketResponse
+	decodeRecorder(t, recorder, &got)
+	if len(got.Messages) != 1 || got.Messages[0].Message != "one" || got.Messages[0].Type != websocket.TextMessage || got.Error == "" {
+		t.Errorf("response = %+v, want first observation and read failure", got)
+	}
+}
+
+func postHandler(t *testing.T, handler http.Handler, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func decodeRecorder(t *testing.T, recorder *httptest.ResponseRecorder, dst any) {
+	t.Helper()
+	if err := json.NewDecoder(recorder.Body).Decode(dst); err != nil {
+		t.Fatalf("decoding response (HTTP %d): %v", recorder.Code, err)
+	}
+}
+
+func startWebSocketServer(t *testing.T, badSecondResponse bool) string {
+	t.Helper()
+	server := httptest.NewServer(webSocketEchoHandler(badSecondResponse))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func webSocketEchoHandler(badSecondResponse bool) http.Handler {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for index := 0; ; index++ {
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if badSecondResponse && index == 1 {
+				_ = conn.Close()
+				return
+			}
+			if err := conn.WriteMessage(messageType, message); err != nil {
+				return
+			}
+		}
+	})
+}
+
+func startIPTLSServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	material := testcert.NewServerTLS(t, net.ParseIP("127.0.0.1"))
+	cert, err := tls.X509KeyPair(material.Certificate, material.PrivateKey)
+	if err != nil {
+		t.Fatalf("loading server certificate: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server, string(material.RootCA)
+}
+
+func toWebSocketURL(raw string) string {
+	if strings.HasPrefix(raw, "https://") {
+		return strings.Replace(raw, "https://", "wss://", 1)
+	}
+	return strings.Replace(raw, "http://", "ws://", 1)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -315,6 +637,393 @@ func TestGRPCInvalidRequests(t *testing.T) {
 			handler.ServeHTTP(recorder, request)
 			if recorder.Code != test.status {
 				t.Errorf("status = %d, want %d; body = %s", recorder.Code, test.status, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestMux(t *testing.T) {
+	var completed atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/fetch" {
+			t.Errorf("path = %s, want /fetch", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(body) != muxBodySize {
+			t.Errorf("len(body) = %d, want %d", len(body), muxBodySize)
+		}
+		completed.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	payload, err := json.Marshal(fetchRequest{URL: srv.URL + "/fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/mux", strings.NewReader(string(payload)))
+	newHandler(http.DefaultClient).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := int(completed.Load()); got != muxRequestCount {
+		t.Errorf("completed = %d, want %d", got, muxRequestCount)
+	}
+}
+
+func TestMuxNon200Fails(t *testing.T) {
+	var seen atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if int(seen.Add(1)) == muxRequestCount {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	payload, err := json.Marshal(fetchRequest{URL: srv.URL + "/fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/mux", strings.NewReader(string(payload)))
+	newHandler(http.DefaultClient).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+}
+
+func TestMuxInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		body   string
+		status int
+	}{
+		{name: "method", method: http.MethodGet, body: `{}`, status: http.StatusMethodNotAllowed},
+		{name: "malformed JSON", method: http.MethodPost, body: `{`, status: http.StatusBadRequest},
+		{name: "missing hostname", method: http.MethodPost, body: `{"url":"http:///path"}`, status: http.StatusBadRequest},
+		{name: "https scheme", method: http.MethodPost, body: `{"url":"https://example.com/fetch"}`, status: http.StatusBadRequest},
+	}
+
+	handler := newHandler(http.DefaultClient)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(test.method, "/mux", strings.NewReader(test.body))
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != test.status {
+				t.Errorf("status = %d, want %d; body = %s", recorder.Code, test.status, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestPost(t *testing.T) {
+	headersReceived := make(chan struct{})
+	var bodyBytes atomic.Int32
+	srv, rootCA := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/fetch" {
+			t.Errorf("path = %s, want /fetch", r.URL.Path)
+		}
+		close(headersReceived)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bodyBytes.Store(int32(len(body)))
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/post", handlePost(50*time.Millisecond))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postHandler(t, mux, "/post", fetchRequest{
+			URL:    srv.URL + "/fetch",
+			RootCA: rootCA,
+		})
+	}()
+
+	<-headersReceived
+	if got := bodyBytes.Load(); got != 0 {
+		t.Fatalf("body bytes immediately after headers = %d, want 0", got)
+	}
+
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/post status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := int(bodyBytes.Load()); got != muxBodySize {
+		t.Errorf("body bytes after /post completed = %d, want %d", got, muxBodySize)
+	}
+}
+
+func TestPostInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/post", nil)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+		}
+	})
+	t.Run("invalid rootCA", func(t *testing.T) {
+		recorder := postHandler(t, handler, "/post", fetchRequest{
+			URL:    "https://example.com/fetch",
+			RootCA: "not-a-cert",
+		})
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	})
+}
+
+func TestSlowHeaders(t *testing.T) {
+	headersCompleted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		close(headersCompleted)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow-headers", handleSlowHeaders(80*time.Millisecond))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postHandler(t, mux, "/slow-headers", fetchRequest{
+			URL: srv.URL + "/",
+		})
+	}()
+
+	select {
+	case <-headersCompleted:
+		t.Fatal("headers completed before headerDelay elapsed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	<-headersCompleted
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/slow-headers status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestSlowHeadersInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/slow-headers", nil)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+		}
+	})
+	t.Run("https rejected", func(t *testing.T) {
+		recorder := postHandler(t, handler, "/slow-headers", fetchRequest{
+			URL: "https://example.net/",
+		})
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	})
+}
+
+// startProxyStub listens on loopback and answers the first CONNECT on each
+// connection with answer, verbatim, then holds the connection open until the
+// test ends -- as a proxy that opened the tunnel would. It returns its
+// host:port and a function listing the request lines it received so far.
+func startProxyStub(t *testing.T, answer string) (string, func() []string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	var mu sync.Mutex
+	var received []string
+	done := make(chan struct{})
+	t.Cleanup(func() { listener.Close(); close(done) })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				request, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				received = append(received, request.Method+" "+request.Host)
+				mu.Unlock()
+				_, _ = io.WriteString(conn, answer)
+				<-done
+			}()
+		}
+	}()
+	return listener.Addr().String(), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(received)
+	}
+}
+
+func TestConnectReportsRefusal(t *testing.T) {
+	proxy, received := startProxyStub(t, "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\ndenied")
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusForbidden || got.Body != "denied" || got.Protocol != "HTTP/1.1" || got.TLS || got.Error != "" {
+		t.Errorf("response = %+v, want the proxy's 403 and body in the clear", got)
+	}
+	if got, want := received(), []string{"CONNECT example.com:443"}; !slices.Equal(got, want) {
+		t.Errorf("proxy received %q, want %q", got, want)
+	}
+}
+
+// A 2xx has no body: the connection is the tunnel now, and the proxy stub
+// sends nothing further, so a handler that tried to read one would hang.
+func TestConnectReportsOpenedTunnelWithoutWaitingForBody(t *testing.T) {
+	proxy, _ := startProxyStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
+	start := time.Now()
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if elapsed := time.Since(start); elapsed > requestTimeout/2 {
+		t.Errorf("answering a 200 took %v; the handler waited on a body the tunnel never sends", elapsed)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusOK || got.Body != "" || got.Error != "" {
+		t.Errorf("response = %+v, want an opened tunnel with no body", got)
+	}
+}
+
+func TestConnectOverTLS(t *testing.T) {
+	server, rootCA := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "not a CONNECT", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "no tunnels here", http.StatusForbidden)
+	}))
+	proxy := strings.TrimPrefix(server.URL, "https://")
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true, RootCA: rootCA})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusForbidden || !got.TLS || strings.TrimSpace(got.Body) != "no tunnels here" || got.Error != "" {
+		t.Errorf("response = %+v, want the proxy's 403 over verified TLS", got)
+	}
+
+	// Without the root the handshake fails, and that is a failure to get an
+	// answer, not an answer.
+	recorder = postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status without a root = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var unverified connectResponse
+	decodeRecorder(t, recorder, &unverified)
+	if unverified.StatusCode != 0 || !strings.Contains(unverified.Error, "TLS handshake") {
+		t.Errorf("response without a root = %+v, want a TLS handshake error and no status", unverified)
+	}
+}
+
+// A rootCA that is not a certificate is refused before anything is dialed:
+// the proxy here refuses connections, so a handler that dialed first would
+// report that instead.
+func TestConnectRejectsBadRootCABeforeDialing(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	proxy := closed.Addr().String()
+	closed.Close()
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true, RootCA: "not-a-pem"})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if !strings.Contains(got.Error, "rootCA") || strings.Contains(got.Error, "dialing") {
+		t.Errorf("error = %q, want the rootCA rejection and no dial", got.Error)
+	}
+}
+
+func TestConnectReportsUnreachableProxy(t *testing.T) {
+	// A port that was just listening and is now closed refuses the connection.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	proxy := closed.Addr().String()
+	closed.Close()
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if !strings.Contains(got.Error, "dialing proxy "+proxy) {
+		t.Errorf("error = %q, want the dial failure", got.Error)
+	}
+}
+
+func TestConnectRejectsInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+	for name, tc := range map[string]struct {
+		method string
+		body   string
+		want   int
+	}{
+		"GET":                {http.MethodGet, `{"proxy":"127.0.0.1:3128","target":"example.com:443"}`, http.StatusMethodNotAllowed},
+		"not JSON":           {http.MethodPost, `proxy`, http.StatusBadRequest},
+		"no proxy":           {http.MethodPost, `{"target":"example.com:443"}`, http.StatusBadRequest},
+		"proxy without port": {http.MethodPost, `{"proxy":"127.0.0.1","target":"example.com:443"}`, http.StatusBadRequest},
+		"no target":          {http.MethodPost, `{"proxy":"127.0.0.1:3128"}`, http.StatusBadRequest},
+		"target with scheme": {http.MethodPost, `{"proxy":"127.0.0.1:3128","target":"https://example.com:443"}`, http.StatusBadRequest},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(tc.method, "/connect", strings.NewReader(tc.body)))
+			if recorder.Code != tc.want {
+				t.Errorf("status = %d, want %d; body = %s", recorder.Code, tc.want, recorder.Body.String())
 			}
 		})
 	}

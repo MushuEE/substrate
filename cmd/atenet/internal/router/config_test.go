@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"github.com/spf13/pflag"
+
+	"go.ate.dev/substrate/cmd/atenet/internal/router/ingress"
 )
 
 func TestRouterConfigValidate(t *testing.T) {
@@ -30,38 +32,75 @@ func TestRouterConfigValidate(t *testing.T) {
 	}{
 		{
 			name: "defaults are valid (auto breaker, atenet-router defaults to envoy)",
-			cfg:  routerConfig{ExtProcMaxRequests: 0, ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
+			cfg:  routerConfig{Mode: ModeIngress, ExtProcMaxRequests: 0, ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
 		},
 		{
 			name: "atenet-router set to envoy is valid",
-			cfg:  routerConfig{AtenetRouter: string(atenetRouterEnvoy), ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
+			cfg:  routerConfig{Mode: ModeIngress, AtenetRouter: string(atenetRouterEnvoy), ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
 		},
 		{
 			name: "atenet-router set to agentgateway is valid",
-			cfg:  routerConfig{AtenetRouter: string(atenetRouterAgentgateway), ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
+			cfg:  routerConfig{Mode: ModeIngress, AtenetRouter: string(atenetRouterAgentgateway), ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}},
 		},
 		{
 			name:    "unknown router rejected",
-			cfg:     routerConfig{AtenetRouter: "blah"},
-			wantErr: "--atenet-router must be",
+			cfg:     routerConfig{Mode: ModeIngress, AtenetRouter: "blah"},
+			wantErr: "--atenet-dataplane must be",
+		},
+		{
+			name: "credential providers paired by position are valid",
+			cfg: routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{
+				Names: []string{"k8s.io", "sts.example.com"}, Addresses: []string{"a:1", "b:1"}, ServerNames: []string{"a", "b"},
+			}},
+		},
+		{
+			name:    "empty credential provider address rejected",
+			cfg:     routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{Names: []string{"k8s.io"}, Addresses: []string{""}}},
+			wantErr: "--credential-provider-address must not be empty",
+		},
+		{
+			name:    "credential provider name without an address rejected",
+			cfg:     routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{Names: []string{"k8s.io"}}},
+			wantErr: "want one per address",
+		},
+		{
+			name: "credential provider server names not paired rejected",
+			cfg: routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{
+				Names: []string{"k8s.io", "sts.example.com"}, Addresses: []string{"a:1", "b:1"}, ServerNames: []string{"a"},
+			}},
+			wantErr: "want one per address or none",
+		},
+		{
+			name: "repeated credential provider name rejected",
+			cfg: routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{
+				Names: []string{"k8s.io", "k8s.io"}, Addresses: []string{"a:1", "b:1"},
+			}},
+			wantErr: `"k8s.io" repeats`,
+		},
+		{
+			name: "empty credential provider name next to another rejected",
+			cfg: routerConfig{Mode: ModeEgress, CredentialProvider: credentialProviderConfig{
+				Names: []string{"", "k8s.io"}, Addresses: []string{"a:1", "b:1"},
+			}},
+			wantErr: "must be the only provider",
 		},
 		{
 			name:    "negative extproc-max-requests rejected",
-			cfg:     routerConfig{ExtProcMaxRequests: -1, ParkedRequest: ingress.ParkedRequestConfig{Max: 0}},
+			cfg:     routerConfig{Mode: ModeIngress, ExtProcMaxRequests: -1, ParkedRequest: ingress.ParkedRequestConfig{Max: 0}},
 			wantErr: "must not be negative",
 		},
 		{
 			name:    "explicit breaker below the lot rejected",
-			cfg:     routerConfig{ExtProcMaxRequests: 512, ParkedRequest: ingress.ParkedRequestConfig{Max: 1024}},
+			cfg:     routerConfig{Mode: ModeIngress, ExtProcMaxRequests: 512, ParkedRequest: ingress.ParkedRequestConfig{Max: 1024}},
 			wantErr: "must be >= --parked-request-max",
 		},
 		{
 			name: "explicit breaker equal to the lot accepted",
-			cfg:  routerConfig{ExtProcMaxRequests: 1024, ParkedRequest: ingress.ParkedRequestConfig{Max: 1024}},
+			cfg:  routerConfig{Mode: ModeIngress, ExtProcMaxRequests: 1024, ParkedRequest: ingress.ParkedRequestConfig{Max: 1024}},
 		},
 		{
 			name: "parking disabled ignores the relation",
-			cfg:  routerConfig{ExtProcMaxRequests: 8, ParkedRequest: ingress.ParkedRequestConfig{Max: 0}},
+			cfg:  routerConfig{Mode: ModeIngress, ExtProcMaxRequests: 8, ParkedRequest: ingress.ParkedRequestConfig{Max: 0}},
 		},
 		{
 			name: "explicit ingress mode accepted",
@@ -72,45 +111,174 @@ func TestRouterConfigValidate(t *testing.T) {
 			cfg:  routerConfig{Mode: ModeEgress},
 		},
 		{
-			name: "explicit all mode accepted",
-			cfg:  routerConfig{Mode: ModeAll},
+			name:    "missing mode rejected",
+			cfg:     routerConfig{},
+			wantErr: `--mode must be "ingress" or "egress"`,
 		},
 		{
-			name:    "unknown mode rejected",
-			cfg:     routerConfig{Mode: "both"},
-			wantErr: `--mode must be one of`,
+			name:    "all mode rejected",
+			cfg:     routerConfig{Mode: "all"},
+			wantErr: `--mode must be "ingress" or "egress"`,
 		},
 		{
 			name:    "drain-timeout below the parking budget rejected",
-			cfg:     routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 2 * time.Second},
+			cfg:     routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 2 * time.Second},
 			wantErr: "must be >= --parked-request-budget",
 		},
 		{
 			name: "drain-timeout equal to the parking budget accepted",
-			cfg:  routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 5 * time.Second},
+			cfg:  routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 5 * time.Second},
 		},
 		{
 			name: "drain-timeout above the parking budget accepted",
-			cfg:  routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 30 * time.Second},
+			cfg:  routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}, DrainTimeout: 30 * time.Second},
 		},
 		{
 			name: "short drain-timeout with parking disabled accepted",
-			cfg:  routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Max: 0}, DrainTimeout: time.Second},
+			cfg:  routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Max: 0}, DrainTimeout: time.Second},
 		},
 		{
 			name:    "negative drain-timeout rejected",
-			cfg:     routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}, DrainTimeout: -time.Second},
+			cfg:     routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}, DrainTimeout: -time.Second},
 			wantErr: "--drain-timeout must not be negative",
 		},
 		{
+			name: "upstream-connect with the upstream credential bundle accepted",
+			cfg:  routerConfig{Mode: ModeIngress, UpstreamConnect: true, UpstreamCredentialBundlePath: "/run/bundle.pem"},
+		},
+		{
+			name:    "upstream-connect without the upstream credential bundle rejected",
+			cfg:     routerConfig{Mode: ModeIngress, UpstreamConnect: true},
+			wantErr: "requires --upstream-credential-bundle",
+		},
+		{
+			name: "egress mode ignores upstream-connect",
+			cfg:  routerConfig{Mode: ModeEgress, UpstreamConnect: true},
+		},
+		{
 			name:    "negative drain-delay rejected",
-			cfg:     routerConfig{ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}, DrainDelay: -time.Second},
+			cfg:     routerConfig{Mode: ModeIngress, ParkedRequest: ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax}, DrainDelay: -time.Second},
 			wantErr: "--drain-delay must not be negative",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.validate()
+			// TestRouterConfigValidateIngressAuth covers the ingress
+			// listener settings, so every row here gets valid ones.
+			cfg := tc.cfg
+			cfg.HttpsPort = 8443
+			cfg.EnvoyCertPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+			cfg.IngressAuth = validIngressAuthConfig()
+			err := cfg.validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func validIngressAuthConfig() ingressAuthConfig {
+	return ingressAuthConfig{
+		ClientCAFile:     "/run/podidentity.podcert.ate.dev/trust-bundle.pem",
+		AllowedSPIFFEIDs: []string{"spiffe://cluster.local/ns/demo/sa/client"},
+	}
+}
+
+// validIngressConfig returns a valid ingress configuration for
+// TestRouterConfigValidateIngressAuth to break one field at a time.
+func validIngressConfig() routerConfig {
+	return routerConfig{
+		Mode:           ModeIngress,
+		ParkedRequest:  ingress.ParkedRequestConfig{Max: ingress.DefaultParkedRequestMax},
+		HttpsPort:      8443,
+		ConnectTLSPort: 8444,
+		EnvoyCertPath:  "/run/servicedns.podcert.ate.dev/credential-bundle.pem",
+		IngressAuth:    validIngressAuthConfig(),
+	}
+}
+
+func TestRouterConfigValidateIngressAuth(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*routerConfig)
+		wantErr string // substring; empty means valid
+	}{
+		{
+			name:   "both TLS listeners accepted",
+			mutate: func(*routerConfig) {},
+		},
+		{
+			name:   "only the HTTPS listener accepted",
+			mutate: func(c *routerConfig) { c.ConnectTLSPort = 0 },
+		},
+		{
+			name:   "only the CONNECT-TLS listener accepted",
+			mutate: func(c *routerConfig) { c.HttpsPort = 0 },
+		},
+		{
+			name: "egress-only instance ignores the ingress settings",
+			mutate: func(c *routerConfig) {
+				c.Mode = ModeEgress
+				c.EnvoyCertPath = ""
+				c.IngressAuth = ingressAuthConfig{}
+			},
+		},
+		{
+			name: "agentgateway ignores the ingress settings",
+			mutate: func(c *routerConfig) {
+				c.AtenetRouter = string(atenetRouterAgentgateway)
+				c.EnvoyCertPath = ""
+				c.IngressAuth = ingressAuthConfig{}
+			},
+		},
+		{
+			name:    "missing serving cert rejected",
+			mutate:  func(c *routerConfig) { c.EnvoyCertPath = "" },
+			wantErr: "--envoy-cert-path is required",
+		},
+		{
+			name: "no TLS listener rejected",
+			mutate: func(c *routerConfig) {
+				c.HttpsPort = 0
+				c.ConnectTLSPort = 0
+			},
+			wantErr: "--port-https or --port-connect-tls is required",
+		},
+		{
+			name:    "missing client CA rejected",
+			mutate:  func(c *routerConfig) { c.IngressAuth.ClientCAFile = "" },
+			wantErr: "--ingress-client-ca-file is required",
+		},
+		{
+			name:   "empty allowlist accepted",
+			mutate: func(c *routerConfig) { c.IngressAuth.AllowedSPIFFEIDs = nil },
+		},
+		{
+			name: "non-SPIFFE ID rejected",
+			mutate: func(c *routerConfig) {
+				c.IngressAuth.AllowedSPIFFEIDs = append(c.IngressAuth.AllowedSPIFFEIDs, "https://cluster.local/ns/demo/sa/client")
+			},
+			wantErr: "is not a valid SPIFFE ID",
+		},
+		{
+			name: "trailing slash rejected",
+			mutate: func(c *routerConfig) {
+				c.IngressAuth.AllowedSPIFFEIDs = []string{"spiffe://cluster.local/ns/demo/sa/client/"}
+			},
+			wantErr: "is not a valid SPIFFE ID",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validIngressConfig()
+			tc.mutate(&cfg)
+			err := cfg.validate()
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected valid, got %v", err)
@@ -143,16 +311,14 @@ func TestRouterConfigAtenetRouter(t *testing.T) {
 	}
 }
 
-// The empty mode is what a routerConfig built in code (rather than from flags)
-// carries, and it must behave as ModeAll so nothing silently stops serving.
+// Each mode serves exactly one direction, and an unset mode serves neither.
 func TestModeServes(t *testing.T) {
 	tests := []struct {
 		mode        Mode
 		wantIngress bool
 		wantEgress  bool
 	}{
-		{mode: "", wantIngress: true, wantEgress: true},
-		{mode: ModeAll, wantIngress: true, wantEgress: true},
+		{mode: "", wantIngress: false, wantEgress: false},
 		{mode: ModeIngress, wantIngress: true, wantEgress: false},
 		{mode: ModeEgress, wantIngress: false, wantEgress: true},
 	}
@@ -189,6 +355,78 @@ func TestRouterConfigExtProcMaxRequests(t *testing.T) {
 	}
 }
 
+// The whole shutdown sequence has to fit inside the router pod's
+// terminationGracePeriodSeconds or the kubelet SIGKILLs mid-drain. That is why
+// the derivation uses drainRouteBudget and not the route timeout: with a route
+// ceiling sized for a full model generation, deriving from it would put the
+// drain alone past five minutes. This pins the independence, which the
+// arithmetic cases below do not.
+//
+// The two numbers it checks against are read out of the installed manifest
+// rather than copied here, so retuning either one is caught instead of drifting
+// away from the Go side in silence.
+func TestRouterConfigDrainTimeoutIndependentOfRouteTimeout(t *testing.T) {
+	drainDelay, graceBudget := routerShutdownBudget(t)
+
+	cfg := routerConfig{DrainTimeout: 0, RouteTimeout: defaultRouteTimeout}
+	parkCfg := ingress.ParkedRequestConfig{Budget: ingress.DefaultParkedRequestBudget, Max: 1024}.Normalized()
+
+	got := cfg.drainTimeout(parkCfg)
+	if got >= defaultRouteTimeout {
+		t.Errorf("derived drain timeout %v tracks the route timeout %v; it must derive from drainRouteBudget", got, defaultRouteTimeout)
+	}
+
+	// drain delay, then the Envoy drain window (see router.go), then the
+	// ext_proc drain.
+	sequence := drainDelay + (drainRouteBudget + drainTimeoutMargin) + got
+	if sequence > graceBudget {
+		t.Errorf("shutdown sequence sums to %v, past terminationGracePeriodSeconds %v in %s", sequence, graceBudget, routerManifestPath)
+	}
+}
+
+// routerManifestPath is the atenet-router Deployment ate-setup installs.
+const routerManifestPath = "../../../../manifests/ate-install/atenet-router.yaml"
+
+// routerShutdownBudget returns the two shutdown numbers that live in the
+// manifest rather than in Go: --drain-delay on the router container, which is
+// how long it keeps serving after SIGTERM, and the pod's
+// terminationGracePeriodSeconds, which is the whole budget.
+func routerShutdownBudget(t *testing.T) (drainDelay, grace time.Duration) {
+	t.Helper()
+	pod := findDeployment(t, routerManifestPath, "atenet-router").Spec.Template.Spec
+	if pod.TerminationGracePeriodSeconds == nil {
+		t.Fatalf("%s sets no terminationGracePeriodSeconds on the atenet-router pod", routerManifestPath)
+	}
+	d, err := routerManifestFlags(t).GetDuration("drain-delay")
+	if err != nil {
+		t.Fatalf("reading --drain-delay from the manifest args: %v", err)
+	}
+	return d, time.Duration(*pod.TerminationGracePeriodSeconds) * time.Second
+}
+
+// routerManifestFlags returns the router command's flags parsed from the
+// atenet-router container's args in the manifest. Reading them back through
+// the command's own flag set means a renamed or retyped flag fails here rather
+// than being parsed by a private copy of the syntax.
+func routerManifestFlags(t *testing.T) *pflag.FlagSet {
+	t.Helper()
+	for _, c := range findDeployment(t, routerManifestPath, "atenet-router").Spec.Template.Spec.Containers {
+		if c.Name != "atenet-router" {
+			continue
+		}
+		cmd := NewRouterCmd()
+		if len(c.Args) == 0 || c.Args[0] != cmd.Name() {
+			t.Fatalf("the atenet-router container's args are %v; they should invoke the %q subcommand", c.Args, cmd.Name())
+		}
+		if err := cmd.ParseFlags(c.Args[1:]); err != nil {
+			t.Fatalf("the atenet-router container's flags are not ones the binary accepts: %v", err)
+		}
+		return cmd.Flags()
+	}
+	t.Fatalf("the atenet-router Deployment in %s has no container named atenet-router", routerManifestPath)
+	return nil
+}
+
 func TestRouterConfigDrainTimeout(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -197,16 +435,16 @@ func TestRouterConfigDrainTimeout(t *testing.T) {
 		want    time.Duration
 	}{
 		{
-			name:    "auto derives budget + route timeout + margin",
+			name:    "auto derives budget + drain route budget + margin",
 			cfg:     routerConfig{DrainTimeout: 0},
 			parkCfg: ingress.ParkedRequestConfig{Budget: 5 * time.Second, Max: 1024}.Normalized(),
-			want:    5*time.Second + defaultRouteTimeout + drainTimeoutMargin,
+			want:    5*time.Second + drainRouteBudget + drainTimeoutMargin,
 		},
 		{
 			name:    "auto scales with a larger budget",
 			cfg:     routerConfig{DrainTimeout: 0},
 			parkCfg: ingress.ParkedRequestConfig{Budget: 30 * time.Second, Max: 1024}.Normalized(),
-			want:    30*time.Second + defaultRouteTimeout + drainTimeoutMargin,
+			want:    30*time.Second + drainRouteBudget + drainTimeoutMargin,
 		},
 		{
 			name: "parking disabled still derives from the normalized default budget",
@@ -215,7 +453,7 @@ func TestRouterConfigDrainTimeout(t *testing.T) {
 			// derived drain still covers a later re-enable without a restart
 			// surprise.
 			parkCfg: ingress.ParkedRequestConfig{Max: 0}.Normalized(),
-			want:    ingress.DefaultParkedRequestBudget + defaultRouteTimeout + drainTimeoutMargin,
+			want:    ingress.DefaultParkedRequestBudget + drainRouteBudget + drainTimeoutMargin,
 		},
 		{
 			name:    "explicit value wins over derivation",

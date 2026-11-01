@@ -19,9 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -36,46 +38,47 @@ import (
 // (CRASHED). We assert the control-plane state
 // machine rather than any in-actor state saving, which is the application's responsibility.
 func TestGracefulWorkerTermination(t *testing.T) {
+	t.Parallel()
 	nsObj := e2e.CreateNamespace(t)
 
 	ctx := context.Background()
 	clients := e2e.GetClients()
 
-	at, err := createActorTemplate(ctx, t, clients, nsObj, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.ResumeSource_RESUME_SOURCE_COLD_BOOT)
+	at, err := createActorTemplate(ctx, t, clients, nsObj, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY)
 	if err != nil {
 		t.Fatalf("failed to initialize ActorTemplate: %v", err)
 	}
 
 	actorID := "graceful-term-" + nsObj.Name
-	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		Actor: &ateapipb.Actor{
-			Metadata:      &ateapipb.ResourceMetadata{Atespace: demoAtespace, Name: actorID},
+	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapi.CreateActorRequest{
+		Actor: &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Atespace: demoAtespace, Name: actorID},
 			ActorTemplate: e2e.TemplateRef(at),
 		},
 	}); err != nil {
 		t.Fatalf("failed to create Actor: %v", err)
 	}
 	defer func() {
-		_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-			Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+		_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+			Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 		})
 	}()
 
 	// Bring the actor up on a worker so it is bound to a pod.
-	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapi.ResumeActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	}); err != nil {
 		t.Fatalf("failed to resume Actor: %v", err)
 	}
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	waitForActorState(ctx, t, clients, actorID, ateapi.ActorState_ACTOR_STATE_RUNNING)
 
 	// Set the sigterm sleep interval to 15 seconds.
 	if _, err := callActorPath(t, resources.ActorRef{Atespace: demoAtespace, Name: actorID}, "GET", "/set-sigterm-sleep?duration=15"); err != nil {
 		t.Fatalf("failed to set sigterm sleep: %v", err)
 	}
 
-	running, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	running, err := clients.SubstrateAPI.GetActor(ctx, &ateapi.GetActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	})
 	if err != nil {
 		t.Fatalf("failed to get running Actor: %v", err)
@@ -87,7 +90,7 @@ func TestGracefulWorkerTermination(t *testing.T) {
 	}
 	t.Logf("Actor %q bound to worker pod %s/%s", actorID, podNS, podName)
 
-	// Evict the worker pod. The kubelet sends SIGTERM to ateom, which propagates
+	// Evict the worker pod. The kubelet sends SIGTERM to worker, which propagates
 	// it into the sandbox; the control plane marks the worker DRAINING on the
 	// DeletionTimestamp watch event and cleans up when the pod is finally gone.
 	if err := clients.K8s.CoreV1().Pods(podNS).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
@@ -100,11 +103,11 @@ func TestGracefulWorkerTermination(t *testing.T) {
 	}
 
 	// Verify the actor lands in ACTOR_STATE_CRASHED.
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_CRASHED)
+	waitForActorState(ctx, t, clients, actorID, ateapi.ActorState_ACTOR_STATE_CRASHED)
 
 	// Verify the pod assignment was cleared.
-	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapi.GetActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	})
 	if err != nil {
 		t.Fatalf("failed to get actor: %v", err)
@@ -119,7 +122,7 @@ func waitForWorkerRemoved(ctx context.Context, t *testing.T, clients *e2e.Client
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		resp, err := clients.SubstrateAPI.ListWorkers(ctx, &ateapipb.ListWorkersRequest{})
+		resp, err := clients.SubstrateAPI.ListWorkers(ctx, &ateapi.ListWorkersRequest{})
 		if err == nil {
 			found := false
 			for _, w := range resp.GetWorkers() {
@@ -139,135 +142,52 @@ func waitForWorkerRemoved(ctx context.Context, t *testing.T, clients *e2e.Client
 	}
 }
 
-// TestGracefulWorkerTerminationTimeout exercises the case where the workload
-// container hangs (exceeds the 1-minute workloadGracePeriod) during SIGTERM.
-// The ateom is expected to SIGKILL the container, letting the control plane
-// mark the worker removed and the actor CRASHED. Runs against both runtimes.
-func TestGracefulWorkerTerminationTimeout(t *testing.T) {
-	nsObj := e2e.CreateNamespace(t)
-
-	ctx := context.Background()
-	clients := e2e.GetClients()
-
-	at, err := createActorTemplate(ctx, t, clients, nsObj, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.ResumeSource_RESUME_SOURCE_COLD_BOOT)
-	if err != nil {
-		t.Fatalf("failed to initialize ActorTemplate: %v", err)
-	}
-
-	actorID := "graceful-term-timeout-" + nsObj.Name
-	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		Actor: &ateapipb.Actor{
-			Metadata:      &ateapipb.ResourceMetadata{Atespace: demoAtespace, Name: actorID},
-			ActorTemplate: e2e.TemplateRef(at),
-		},
-	}); err != nil {
-		t.Fatalf("failed to create Actor: %v", err)
-	}
-	defer func() {
-		_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-			Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
-		})
-	}()
-
-	// Bring the actor up on a worker so it is bound to a pod.
-	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
-	}); err != nil {
-		t.Fatalf("failed to resume Actor: %v", err)
-	}
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_RUNNING)
-
-	// Set the sigterm sleep interval to 90 seconds (longer than the 1-minute grace period).
-	if _, err := callActorPath(t, resources.ActorRef{Atespace: demoAtespace, Name: actorID}, "GET", "/set-sigterm-sleep?duration=90"); err != nil {
-		t.Fatalf("failed to set sigterm sleep: %v", err)
-	}
-
-	running, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
-	})
-	if err != nil {
-		t.Fatalf("failed to get running Actor: %v", err)
-	}
-	podNS := running.GetStatus().GetWorkerAssignment().GetWorkerNamespace()
-	podName := running.GetStatus().GetWorkerAssignment().GetWorkerPod()
-	if podNS == "" || podName == "" {
-		t.Fatalf("running actor has no bound worker pod: ns=%q name=%q", podNS, podName)
-	}
-	t.Logf("Actor %q bound to worker pod %s/%s", actorID, podNS, podName)
-
-	// Evict the worker pod. The kubelet sends SIGTERM to ateom, which propagates
-	// it into the sandbox; the container hangs, triggering the 1-minute timeout,
-	// followed by SIGKILL by ateom.
-	if err := clients.K8s.CoreV1().Pods(podNS).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
-		t.Fatalf("failed to delete worker pod %s/%s: %v", podNS, podName, err)
-	}
-
-	// The worker record must eventually be removed once the pod is gone.
-	// Since there is a 1-minute timeout + up to 5s SIGKILL wait, we need a
-	// larger timeout (e.g. 120 seconds).
-	if err := waitForWorkerRemoved(ctx, t, clients, podName, 120*time.Second); err != nil {
-		t.Fatalf("worker %s not removed after pod deletion: %v", podName, err)
-	}
-
-	// Verify the actor lands in ACTOR_STATE_CRASHED.
-	waitForActorStateWithTimeout(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_CRASHED, 120*time.Second)
-
-	// Verify the pod assignment was cleared.
-	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
-	})
-	if err != nil {
-		t.Fatalf("failed to get actor: %v", err)
-	}
-	if pod := actor.GetStatus().GetWorkerAssignment().GetWorkerPod(); pod != "" {
-		t.Errorf("actor still bound to worker pod %q, expected empty", pod)
-	}
-}
-
 // TestGracefulWorkerTerminationSuspend exercises the case where a worker pod is
 // deleted (evicted), and while the container is in its SIGTERM shutdown phase,
-// we initiate a suspend. Suspend should succeed.
+// we initiate a suspend. Suspend either completes before worker deletion crashes
+// the actor, or reports that concurrent crash without overwriting it.
 func TestGracefulWorkerTerminationSuspend(t *testing.T) {
+	t.Parallel()
 	nsObj := e2e.CreateNamespace(t)
 
 	ctx := context.Background()
 	clients := e2e.GetClients()
 
-	at, err := createActorTemplate(ctx, t, clients, nsObj, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.ResumeSource_RESUME_SOURCE_COLD_BOOT)
+	at, err := createActorTemplate(ctx, t, clients, nsObj, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY)
 	if err != nil {
 		t.Fatalf("failed to initialize ActorTemplate: %v", err)
 	}
 
 	actorID := "graceful-term-suspend-" + nsObj.Name
-	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		Actor: &ateapipb.Actor{
-			Metadata:      &ateapipb.ResourceMetadata{Atespace: demoAtespace, Name: actorID},
+	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapi.CreateActorRequest{
+		Actor: &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Atespace: demoAtespace, Name: actorID},
 			ActorTemplate: e2e.TemplateRef(at),
 		},
 	}); err != nil {
 		t.Fatalf("failed to create Actor: %v", err)
 	}
 	defer func() {
-		_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-			Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+		_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+			Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 		})
 	}()
 
 	// Bring the actor up on a worker so it is bound to a pod.
-	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapi.ResumeActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	}); err != nil {
 		t.Fatalf("failed to resume Actor: %v", err)
 	}
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	waitForActorState(ctx, t, clients, actorID, ateapi.ActorState_ACTOR_STATE_RUNNING)
 
 	// Set the sigterm sleep interval to 30 seconds.
 	if _, err := callActorPath(t, resources.ActorRef{Atespace: demoAtespace, Name: actorID}, "GET", "/set-sigterm-sleep?duration=30"); err != nil {
 		t.Fatalf("failed to set sigterm sleep: %v", err)
 	}
 
-	running, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	running, err := clients.SubstrateAPI.GetActor(ctx, &ateapi.GetActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	})
 	if err != nil {
 		t.Fatalf("failed to get running Actor: %v", err)
@@ -278,8 +198,12 @@ func TestGracefulWorkerTerminationSuspend(t *testing.T) {
 		t.Fatalf("running actor has no bound worker pod: ns=%q name=%q", podNS, podName)
 	}
 	t.Logf("Actor %q bound to worker pod %s/%s", actorID, podNS, podName)
+	previousSnapshotURI := durableSnapshotURI(running.GetStatus())
+	if previousSnapshotURI == "" {
+		t.Fatal("running actor has no completed durable snapshot")
+	}
 
-	// Evict the worker pod. The kubelet sends SIGTERM to ateom, which propagates
+	// Evict the worker pod. The kubelet sends SIGTERM to worker, which propagates
 	// it into the sandbox; the container hangs for 30s.
 	if err := clients.K8s.CoreV1().Pods(podNS).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed to delete worker pod %s/%s: %v", podNS, podName, err)
@@ -290,10 +214,21 @@ func TestGracefulWorkerTerminationSuspend(t *testing.T) {
 
 	// Suspend the actor.
 	t.Logf("Suspending actor %q during termination", actorID)
-	if _, err := clients.SubstrateAPI.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
-	}); err != nil {
-		t.Fatalf("failed to suspend Actor: %v", err)
+	_, suspendErr := clients.SubstrateAPI.SuspendActor(ctx, &ateapi.SuspendActorRequest{
+		Actor:   &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
+		Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+	})
+	wantState := ateapi.ActorState_ACTOR_STATE_SUSPENDED
+	switch status.Code(suspendErr) {
+	case codes.OK:
+	case codes.FailedPrecondition, codes.Aborted:
+		// Worker deletion can crash the actor before finalize reads it, or
+		// after that read but before its version-guarded update. Both must
+		// preserve the crash and report failure instead of returning success.
+		wantState = ateapi.ActorState_ACTOR_STATE_CRASHED
+		t.Logf("Suspend reported concurrent worker deletion: %v", suspendErr)
+	default:
+		t.Fatalf("failed to suspend Actor: %v", suspendErr)
 	}
 
 	// The worker record must eventually be removed once the pod is gone.
@@ -301,17 +236,28 @@ func TestGracefulWorkerTerminationSuspend(t *testing.T) {
 		t.Fatalf("worker %s not removed after pod deletion: %v", podName, err)
 	}
 
-	// Verify the actor lands in ACTOR_STATE_SUSPENDED
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	// The RPC result and persisted state must agree after the worker is gone.
+	waitForActorState(ctx, t, clients, actorID, wantState)
 
 	// Verify the pod assignment was cleared.
-	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapi.GetActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	})
 	if err != nil {
 		t.Fatalf("failed to get actor: %v", err)
 	}
 	if pod := actor.GetStatus().GetWorkerAssignment().GetWorkerPod(); pod != "" {
 		t.Errorf("actor still bound to worker pod %q, expected empty", pod)
+	}
+	if got := durableSnapshotURI(actor.GetStatus()); got == "" {
+		t.Error("actor lost its completed durable snapshot")
+	} else if wantState == ateapi.ActorState_ACTOR_STATE_CRASHED && got != previousSnapshotURI {
+		t.Errorf("crashed actor snapshot URI = %q, want previous snapshot %q", got, previousSnapshotURI)
+	}
+	if wantState == ateapi.ActorState_ACTOR_STATE_CRASHED && actor.GetStatus().GetCrash().GetMessage() == "" {
+		t.Error("crashed actor lost its crash reason")
+	}
+	if wantState == ateapi.ActorState_ACTOR_STATE_SUSPENDED && actor.GetStatus().GetCrash() != nil {
+		t.Errorf("successful suspend retained a crash record: %v", actor.GetStatus().GetCrash())
 	}
 }

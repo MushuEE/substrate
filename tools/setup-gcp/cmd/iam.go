@@ -69,10 +69,9 @@ func grantGkeNodePermissions(ctx context.Context, cfg *Config) error {
 	member := fmt.Sprintf("serviceAccount:%s-compute@developer.gserviceaccount.com", cfg.ProjectNumber)
 
 	// TODO: Don't grant these permissions at project level.
-	changed1 := addProjectIamBinding(policy, "roles/storage.objectViewer", member)
-	changed2 := addProjectIamBinding(policy, "roles/artifactregistry.reader", member)
+	changed := addProjectIamBinding(policy, "roles/artifactregistry.reader", member)
 
-	if !changed1 && !changed2 {
+	if !changed {
 		slog.Info("IAM policy already has required GKE node permissions. Skipping update.", slog.String("project", cfg.ProjectID))
 		return nil
 	}
@@ -108,13 +107,11 @@ func grantAteletPermissions(ctx context.Context, cfg *Config) error {
 
 	member := fmt.Sprintf("principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/ate-system/sa/atelet", cfg.ProjectNumber, cfg.ProjectID)
 
-	// TODO: This shouldn't be a project-level binding.  We should grant atelet
-	// access only to the specific bucket and artifact registry repository in
-	// use.
-	changed1 := addProjectIamBinding(policy, "roles/storage.objectAdmin", member)
-	changed2 := addProjectIamBinding(policy, "roles/artifactregistry.reader", member)
+	// atelet gets no storage role here, see bucketGrants.
+	// TODO: grant artifactregistry.reader on the repository in use only.
+	changed := addProjectIamBinding(policy, "roles/artifactregistry.reader", member)
 
-	if !changed1 && !changed2 {
+	if !changed {
 		slog.Info("IAM policy already has required GKE node permissions. Skipping update.", slog.String("project", cfg.ProjectID))
 		return nil
 	}
@@ -136,15 +133,15 @@ func grantAteletPermissions(ctx context.Context, cfg *Config) error {
 // grants run. Each grant is a separate SetIamPolicy call, so a flag validated
 // partway through the sequence reports a usage error only after the earlier
 // grants have already been written to the project.
-func validateIamFlags(cfg *Config, bucketBindings bool) error {
-	if cfg.ProjectID == "" {
-		return errors.New("--project-id is required")
-	}
-	if cfg.ProjectNumber == "" {
-		return errors.New("--project-number is required")
+func validateIamFlags(ctx context.Context, cfg *Config, bucketBindings bool) error {
+	if err := resolveProject(ctx, cfg); err != nil {
+		return err
 	}
 	if bucketBindings && cfg.BucketName == "" {
 		return errors.New("--bucket is required for bucket bindings")
+	}
+	if bucketBindings {
+		return checkAssetBucketName(cfg)
 	}
 	return nil
 }
@@ -155,9 +152,10 @@ var iamCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		gkeNodes, _ := cmd.Flags().GetBool("gke-nodes")
 		atelet, _ := cmd.Flags().GetBool("atelet")
+		transferAccount, _ := cmd.Flags().GetBool("transfer-service-account")
 		bucketBindings, _ := cmd.Flags().GetBool("bucket-bindings")
 
-		if err := validateIamFlags(&cfg, bucketBindings); err != nil {
+		if err := validateIamFlags(cmd.Context(), &cfg, bucketBindings); err != nil {
 			return err
 		}
 
@@ -168,6 +166,13 @@ var iamCmd = &cobra.Command{
 		}
 		if atelet {
 			if err := grantAteletPermissions(cmd.Context(), &cfg); err != nil {
+				return err
+			}
+		}
+		// Before the bucket bindings, which grant the account: IAM refuses a
+		// binding for an account that does not exist.
+		if transferAccount {
+			if err := setupTransferServiceAccount(cmd.Context(), &cfg, workloadIdentityPrincipal(&cfg, "ate-api-server")); err != nil {
 				return err
 			}
 		}
@@ -185,5 +190,7 @@ func init() {
 	iamCmd.Flags().StringVar(&cfg.BucketName, "bucket", getEnv("BUCKET_NAME", ""), "GCS bucket name (required for bucket bindings) [env: BUCKET_NAME]")
 	iamCmd.Flags().Bool("gke-nodes", true, "Grant GKE nodes permission to pull images")
 	iamCmd.Flags().Bool("atelet", true, "Grant atelet project-level permissions")
-	iamCmd.Flags().Bool("bucket-bindings", true, "Grant atelet access to the snapshot bucket")
+	addTransferGSANameFlag(iamCmd)
+	iamCmd.Flags().Bool("transfer-service-account", true, "Create the snapshot transfer service account and let ate-api-server create tokens for it")
+	iamCmd.Flags().Bool("bucket-bindings", true, "Grant ate-api-server and the snapshot transfer service account access to the snapshot bucket, and atelet read access to the asset bucket")
 }

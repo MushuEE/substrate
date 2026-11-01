@@ -16,7 +16,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v4.25.3
-// source: atelet.proto
+// source: internal/proto/ateletpb/atelet.proto
 
 package ateletpb
 
@@ -33,497 +33,795 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	CredentialBroker_MintActorCertificate_FullMethodName = "/atelet.CredentialBroker/MintActorCertificate"
+	WorkerSupport_MintActorCertificate_FullMethodName     = "/atelet.WorkerSupport/MintActorCertificate"
+	WorkerSupport_AcquireWorkerEpoch_FullMethodName       = "/atelet.WorkerSupport/AcquireWorkerEpoch"
+	WorkerSupport_RegisterWorker_FullMethodName           = "/atelet.WorkerSupport/RegisterWorker"
+	WorkerSupport_SetWorkerSandboxRuntimes_FullMethodName = "/atelet.WorkerSupport/SetWorkerSandboxRuntimes"
+	WorkerSupport_RequestActorSuspend_FullMethodName      = "/atelet.WorkerSupport/RequestActorSuspend"
+	WorkerSupport_GetActorEgressPolicy_FullMethodName     = "/atelet.WorkerSupport/GetActorEgressPolicy"
+	WorkerSupport_ReportActorCrashed_FullMethodName       = "/atelet.WorkerSupport/ReportActorCrashed"
 )
 
-// CredentialBrokerClient is the client API for CredentialBroker service.
+// WorkerSupportClient is the client API for WorkerSupport service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// CredentialBroker gives an authenticated worker its current actor credential.
-type CredentialBrokerClient interface {
+// WorkerSupport provides callouts for worker implementations.
+//
+// Called by individual worker pods over a local connection, authenticated with
+// the worker's k8s pod identity mTLS certificate.
+type WorkerSupportClient interface {
+	// Request an atunnel certificate for the given actor.
+	//
+	// TODO(identity): Rename to MintAtunnelCertificate, as distinct from
+	// MintActorCertificate (which would be used for certificates projected into
+	// the actor filesystem, when/if we support those).
 	MintActorCertificate(ctx context.Context, in *MintActorCertificateRequest, opts ...grpc.CallOption) (*MintActorCertificateResponse, error)
+	// AcquireWorkerEpoch hands out a new epoch for this worker process, for
+	// atelet to forward to the control plane's WorkerService, which this
+	// mirrors. A worker process calls it once at startup, before RegisterWorker.
+	AcquireWorkerEpoch(ctx context.Context, in *AcquireWorkerEpochRequest, opts ...grpc.CallOption) (*AcquireWorkerEpochResponse, error)
+	// RegisterWorker activates the epoch this worker process acquired and
+	// records its pod IPs and capacity. A worker process registers once, and
+	// takes no workloads until it has. FAILED_PRECONDITION means another worker
+	// process has registered since; this one must not serve.
+	RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterWorkerResponse, error)
+	// SetWorkerSandboxRuntimes records the sandbox runtimes this worker process
+	// can run. Called after RegisterWorker, and again whenever they change.
+	SetWorkerSandboxRuntimes(ctx context.Context, in *SetWorkerSandboxRuntimesRequest, opts ...grpc.CallOption) (*SetWorkerSandboxRuntimesResponse, error)
+	// RequestActorSuspend asks that the actor this worker hosts be suspended,
+	// for atelet to forward to the control plane's WorkerService, which this
+	// mirrors.
+	//
+	// Success means the control plane ran the suspend; an error is its refusal,
+	// passed through as it was given, so a worker can tell a decision from a
+	// failure to ask. Callers must not hold a lock the resulting Checkpoint
+	// would need: the control plane answers this by driving a suspend back
+	// through atelet into the calling worker.
+	RequestActorSuspend(ctx context.Context, in *RequestActorSuspendRequest, opts ...grpc.CallOption) (*RequestActorSuspendResponse, error)
+	// GetActorEgressPolicy returns the egress policy of the actor this
+	// worker hosts, which atelet reads from the control plane's
+	// Control.GetActorEgressPolicy. An error is the control plane's, passed
+	// through as it was given.
+	GetActorEgressPolicy(ctx context.Context, in *GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*GetActorEgressPolicyResponse, error)
+	// ReportActorCrashed reports that the sandbox of the actor this worker
+	// hosts died on its own, for atelet to forward to the control plane's
+	// WorkerService, which this mirrors.
+	ReportActorCrashed(ctx context.Context, in *ReportActorCrashedRequest, opts ...grpc.CallOption) (*ReportActorCrashedResponse, error)
 }
 
-type credentialBrokerClient struct {
+type workerSupportClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewCredentialBrokerClient(cc grpc.ClientConnInterface) CredentialBrokerClient {
-	return &credentialBrokerClient{cc}
+func NewWorkerSupportClient(cc grpc.ClientConnInterface) WorkerSupportClient {
+	return &workerSupportClient{cc}
 }
 
-func (c *credentialBrokerClient) MintActorCertificate(ctx context.Context, in *MintActorCertificateRequest, opts ...grpc.CallOption) (*MintActorCertificateResponse, error) {
+func (c *workerSupportClient) MintActorCertificate(ctx context.Context, in *MintActorCertificateRequest, opts ...grpc.CallOption) (*MintActorCertificateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MintActorCertificateResponse)
-	err := c.cc.Invoke(ctx, CredentialBroker_MintActorCertificate_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, WorkerSupport_MintActorCertificate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// CredentialBrokerServer is the server API for CredentialBroker service.
-// All implementations must embed UnimplementedCredentialBrokerServer
-// for forward compatibility.
-//
-// CredentialBroker gives an authenticated worker its current actor credential.
-type CredentialBrokerServer interface {
-	MintActorCertificate(context.Context, *MintActorCertificateRequest) (*MintActorCertificateResponse, error)
-	mustEmbedUnimplementedCredentialBrokerServer()
+func (c *workerSupportClient) AcquireWorkerEpoch(ctx context.Context, in *AcquireWorkerEpochRequest, opts ...grpc.CallOption) (*AcquireWorkerEpochResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcquireWorkerEpochResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_AcquireWorkerEpoch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// UnimplementedCredentialBrokerServer must be embedded to have
+func (c *workerSupportClient) RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterWorkerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterWorkerResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_RegisterWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerSupportClient) SetWorkerSandboxRuntimes(ctx context.Context, in *SetWorkerSandboxRuntimesRequest, opts ...grpc.CallOption) (*SetWorkerSandboxRuntimesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetWorkerSandboxRuntimesResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_SetWorkerSandboxRuntimes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerSupportClient) RequestActorSuspend(ctx context.Context, in *RequestActorSuspendRequest, opts ...grpc.CallOption) (*RequestActorSuspendResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RequestActorSuspendResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_RequestActorSuspend_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerSupportClient) GetActorEgressPolicy(ctx context.Context, in *GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*GetActorEgressPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetActorEgressPolicyResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_GetActorEgressPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerSupportClient) ReportActorCrashed(ctx context.Context, in *ReportActorCrashedRequest, opts ...grpc.CallOption) (*ReportActorCrashedResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportActorCrashedResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_ReportActorCrashed_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WorkerSupportServer is the server API for WorkerSupport service.
+// All implementations must embed UnimplementedWorkerSupportServer
+// for forward compatibility.
+//
+// WorkerSupport provides callouts for worker implementations.
+//
+// Called by individual worker pods over a local connection, authenticated with
+// the worker's k8s pod identity mTLS certificate.
+type WorkerSupportServer interface {
+	// Request an atunnel certificate for the given actor.
+	//
+	// TODO(identity): Rename to MintAtunnelCertificate, as distinct from
+	// MintActorCertificate (which would be used for certificates projected into
+	// the actor filesystem, when/if we support those).
+	MintActorCertificate(context.Context, *MintActorCertificateRequest) (*MintActorCertificateResponse, error)
+	// AcquireWorkerEpoch hands out a new epoch for this worker process, for
+	// atelet to forward to the control plane's WorkerService, which this
+	// mirrors. A worker process calls it once at startup, before RegisterWorker.
+	AcquireWorkerEpoch(context.Context, *AcquireWorkerEpochRequest) (*AcquireWorkerEpochResponse, error)
+	// RegisterWorker activates the epoch this worker process acquired and
+	// records its pod IPs and capacity. A worker process registers once, and
+	// takes no workloads until it has. FAILED_PRECONDITION means another worker
+	// process has registered since; this one must not serve.
+	RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterWorkerResponse, error)
+	// SetWorkerSandboxRuntimes records the sandbox runtimes this worker process
+	// can run. Called after RegisterWorker, and again whenever they change.
+	SetWorkerSandboxRuntimes(context.Context, *SetWorkerSandboxRuntimesRequest) (*SetWorkerSandboxRuntimesResponse, error)
+	// RequestActorSuspend asks that the actor this worker hosts be suspended,
+	// for atelet to forward to the control plane's WorkerService, which this
+	// mirrors.
+	//
+	// Success means the control plane ran the suspend; an error is its refusal,
+	// passed through as it was given, so a worker can tell a decision from a
+	// failure to ask. Callers must not hold a lock the resulting Checkpoint
+	// would need: the control plane answers this by driving a suspend back
+	// through atelet into the calling worker.
+	RequestActorSuspend(context.Context, *RequestActorSuspendRequest) (*RequestActorSuspendResponse, error)
+	// GetActorEgressPolicy returns the egress policy of the actor this
+	// worker hosts, which atelet reads from the control plane's
+	// Control.GetActorEgressPolicy. An error is the control plane's, passed
+	// through as it was given.
+	GetActorEgressPolicy(context.Context, *GetActorEgressPolicyRequest) (*GetActorEgressPolicyResponse, error)
+	// ReportActorCrashed reports that the sandbox of the actor this worker
+	// hosts died on its own, for atelet to forward to the control plane's
+	// WorkerService, which this mirrors.
+	ReportActorCrashed(context.Context, *ReportActorCrashedRequest) (*ReportActorCrashedResponse, error)
+	mustEmbedUnimplementedWorkerSupportServer()
+}
+
+// UnimplementedWorkerSupportServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedCredentialBrokerServer struct{}
+type UnimplementedWorkerSupportServer struct{}
 
-func (UnimplementedCredentialBrokerServer) MintActorCertificate(context.Context, *MintActorCertificateRequest) (*MintActorCertificateResponse, error) {
+func (UnimplementedWorkerSupportServer) MintActorCertificate(context.Context, *MintActorCertificateRequest) (*MintActorCertificateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MintActorCertificate not implemented")
 }
-func (UnimplementedCredentialBrokerServer) mustEmbedUnimplementedCredentialBrokerServer() {}
-func (UnimplementedCredentialBrokerServer) testEmbeddedByValue()                          {}
+func (UnimplementedWorkerSupportServer) AcquireWorkerEpoch(context.Context, *AcquireWorkerEpochRequest) (*AcquireWorkerEpochResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcquireWorkerEpoch not implemented")
+}
+func (UnimplementedWorkerSupportServer) RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterWorkerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterWorker not implemented")
+}
+func (UnimplementedWorkerSupportServer) SetWorkerSandboxRuntimes(context.Context, *SetWorkerSandboxRuntimesRequest) (*SetWorkerSandboxRuntimesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetWorkerSandboxRuntimes not implemented")
+}
+func (UnimplementedWorkerSupportServer) RequestActorSuspend(context.Context, *RequestActorSuspendRequest) (*RequestActorSuspendResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RequestActorSuspend not implemented")
+}
+func (UnimplementedWorkerSupportServer) GetActorEgressPolicy(context.Context, *GetActorEgressPolicyRequest) (*GetActorEgressPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetActorEgressPolicy not implemented")
+}
+func (UnimplementedWorkerSupportServer) ReportActorCrashed(context.Context, *ReportActorCrashedRequest) (*ReportActorCrashedResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportActorCrashed not implemented")
+}
+func (UnimplementedWorkerSupportServer) mustEmbedUnimplementedWorkerSupportServer() {}
+func (UnimplementedWorkerSupportServer) testEmbeddedByValue()                       {}
 
-// UnsafeCredentialBrokerServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to CredentialBrokerServer will
+// UnsafeWorkerSupportServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to WorkerSupportServer will
 // result in compilation errors.
-type UnsafeCredentialBrokerServer interface {
-	mustEmbedUnimplementedCredentialBrokerServer()
+type UnsafeWorkerSupportServer interface {
+	mustEmbedUnimplementedWorkerSupportServer()
 }
 
-func RegisterCredentialBrokerServer(s grpc.ServiceRegistrar, srv CredentialBrokerServer) {
-	// If the following call panics, it indicates UnimplementedCredentialBrokerServer was
+func RegisterWorkerSupportServer(s grpc.ServiceRegistrar, srv WorkerSupportServer) {
+	// If the following call panics, it indicates UnimplementedWorkerSupportServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&CredentialBroker_ServiceDesc, srv)
+	s.RegisterService(&WorkerSupport_ServiceDesc, srv)
 }
 
-func _CredentialBroker_MintActorCertificate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _WorkerSupport_MintActorCertificate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MintActorCertificateRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(CredentialBrokerServer).MintActorCertificate(ctx, in)
+		return srv.(WorkerSupportServer).MintActorCertificate(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: CredentialBroker_MintActorCertificate_FullMethodName,
+		FullMethod: WorkerSupport_MintActorCertificate_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CredentialBrokerServer).MintActorCertificate(ctx, req.(*MintActorCertificateRequest))
+		return srv.(WorkerSupportServer).MintActorCertificate(ctx, req.(*MintActorCertificateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// CredentialBroker_ServiceDesc is the grpc.ServiceDesc for CredentialBroker service.
-// It's only intended for direct use with grpc.RegisterService,
-// and not to be introspected or modified (even as a copy)
-var CredentialBroker_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "atelet.CredentialBroker",
-	HandlerType: (*CredentialBrokerServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "MintActorCertificate",
-			Handler:    _CredentialBroker_MintActorCertificate_Handler,
-		},
-	},
-	Streams:  []grpc.StreamDesc{},
-	Metadata: "atelet.proto",
-}
-
-const (
-	WorkerCapacity_SetWorkerCapacity_FullMethodName = "/atelet.WorkerCapacity/SetWorkerCapacity"
-)
-
-// WorkerCapacityClient is the client API for WorkerCapacity service.
-//
-// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-//
-// WorkerCapacity is how a worker tells the node-local atelet what it can
-// supply to the actors it hosts, for atelet to forward to the control plane's
-// WorkerService.SetWorkerCapacity, which this mirrors. The worker is identified
-// by its mTLS certificate, never by the request.
-type WorkerCapacityClient interface {
-	SetWorkerCapacity(ctx context.Context, in *SetWorkerCapacityRequest, opts ...grpc.CallOption) (*SetWorkerCapacityResponse, error)
-}
-
-type workerCapacityClient struct {
-	cc grpc.ClientConnInterface
-}
-
-func NewWorkerCapacityClient(cc grpc.ClientConnInterface) WorkerCapacityClient {
-	return &workerCapacityClient{cc}
-}
-
-func (c *workerCapacityClient) SetWorkerCapacity(ctx context.Context, in *SetWorkerCapacityRequest, opts ...grpc.CallOption) (*SetWorkerCapacityResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(SetWorkerCapacityResponse)
-	err := c.cc.Invoke(ctx, WorkerCapacity_SetWorkerCapacity_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// WorkerCapacityServer is the server API for WorkerCapacity service.
-// All implementations must embed UnimplementedWorkerCapacityServer
-// for forward compatibility.
-//
-// WorkerCapacity is how a worker tells the node-local atelet what it can
-// supply to the actors it hosts, for atelet to forward to the control plane's
-// WorkerService.SetWorkerCapacity, which this mirrors. The worker is identified
-// by its mTLS certificate, never by the request.
-type WorkerCapacityServer interface {
-	SetWorkerCapacity(context.Context, *SetWorkerCapacityRequest) (*SetWorkerCapacityResponse, error)
-	mustEmbedUnimplementedWorkerCapacityServer()
-}
-
-// UnimplementedWorkerCapacityServer must be embedded to have
-// forward compatible implementations.
-//
-// NOTE: this should be embedded by value instead of pointer to avoid a nil
-// pointer dereference when methods are called.
-type UnimplementedWorkerCapacityServer struct{}
-
-func (UnimplementedWorkerCapacityServer) SetWorkerCapacity(context.Context, *SetWorkerCapacityRequest) (*SetWorkerCapacityResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method SetWorkerCapacity not implemented")
-}
-func (UnimplementedWorkerCapacityServer) mustEmbedUnimplementedWorkerCapacityServer() {}
-func (UnimplementedWorkerCapacityServer) testEmbeddedByValue()                        {}
-
-// UnsafeWorkerCapacityServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to WorkerCapacityServer will
-// result in compilation errors.
-type UnsafeWorkerCapacityServer interface {
-	mustEmbedUnimplementedWorkerCapacityServer()
-}
-
-func RegisterWorkerCapacityServer(s grpc.ServiceRegistrar, srv WorkerCapacityServer) {
-	// If the following call panics, it indicates UnimplementedWorkerCapacityServer was
-	// embedded by pointer and is nil.  This will cause panics if an
-	// unimplemented method is ever invoked, so we test this at initialization
-	// time to prevent it from happening at runtime later due to I/O.
-	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
-		t.testEmbeddedByValue()
-	}
-	s.RegisterService(&WorkerCapacity_ServiceDesc, srv)
-}
-
-func _WorkerCapacity_SetWorkerCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SetWorkerCapacityRequest)
+func _WorkerSupport_AcquireWorkerEpoch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireWorkerEpochRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(WorkerCapacityServer).SetWorkerCapacity(ctx, in)
+		return srv.(WorkerSupportServer).AcquireWorkerEpoch(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: WorkerCapacity_SetWorkerCapacity_FullMethodName,
+		FullMethod: WorkerSupport_AcquireWorkerEpoch_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkerCapacityServer).SetWorkerCapacity(ctx, req.(*SetWorkerCapacityRequest))
+		return srv.(WorkerSupportServer).AcquireWorkerEpoch(ctx, req.(*AcquireWorkerEpochRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// WorkerCapacity_ServiceDesc is the grpc.ServiceDesc for WorkerCapacity service.
+func _WorkerSupport_RegisterWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).RegisterWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_RegisterWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).RegisterWorker(ctx, req.(*RegisterWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerSupport_SetWorkerSandboxRuntimes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetWorkerSandboxRuntimesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).SetWorkerSandboxRuntimes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_SetWorkerSandboxRuntimes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).SetWorkerSandboxRuntimes(ctx, req.(*SetWorkerSandboxRuntimesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerSupport_RequestActorSuspend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestActorSuspendRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).RequestActorSuspend(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_RequestActorSuspend_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).RequestActorSuspend(ctx, req.(*RequestActorSuspendRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerSupport_GetActorEgressPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetActorEgressPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).GetActorEgressPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_GetActorEgressPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).GetActorEgressPolicy(ctx, req.(*GetActorEgressPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerSupport_ReportActorCrashed_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportActorCrashedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).ReportActorCrashed(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_ReportActorCrashed_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).ReportActorCrashed(ctx, req.(*ReportActorCrashedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// WorkerSupport_ServiceDesc is the grpc.ServiceDesc for WorkerSupport service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var WorkerCapacity_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "atelet.WorkerCapacity",
-	HandlerType: (*WorkerCapacityServer)(nil),
+var WorkerSupport_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "atelet.WorkerSupport",
+	HandlerType: (*WorkerSupportServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "SetWorkerCapacity",
-			Handler:    _WorkerCapacity_SetWorkerCapacity_Handler,
+			MethodName: "MintActorCertificate",
+			Handler:    _WorkerSupport_MintActorCertificate_Handler,
+		},
+		{
+			MethodName: "AcquireWorkerEpoch",
+			Handler:    _WorkerSupport_AcquireWorkerEpoch_Handler,
+		},
+		{
+			MethodName: "RegisterWorker",
+			Handler:    _WorkerSupport_RegisterWorker_Handler,
+		},
+		{
+			MethodName: "SetWorkerSandboxRuntimes",
+			Handler:    _WorkerSupport_SetWorkerSandboxRuntimes_Handler,
+		},
+		{
+			MethodName: "RequestActorSuspend",
+			Handler:    _WorkerSupport_RequestActorSuspend_Handler,
+		},
+		{
+			MethodName: "GetActorEgressPolicy",
+			Handler:    _WorkerSupport_GetActorEgressPolicy_Handler,
+		},
+		{
+			MethodName: "ReportActorCrashed",
+			Handler:    _WorkerSupport_ReportActorCrashed_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "atelet.proto",
+	Metadata: "internal/proto/ateletpb/atelet.proto",
 }
 
 const (
-	AteomHerder_Run_FullMethodName                    = "/atelet.AteomHerder/Run"
-	AteomHerder_Checkpoint_FullMethodName             = "/atelet.AteomHerder/Checkpoint"
-	AteomHerder_Restore_FullMethodName                = "/atelet.AteomHerder/Restore"
-	AteomHerder_UploadPausedCheckpoint_FullMethodName = "/atelet.AteomHerder/UploadPausedCheckpoint"
-	AteomHerder_Terminate_FullMethodName              = "/atelet.AteomHerder/Terminate"
+	Atelet_Run_FullMethodName             = "/atelet.Atelet/Run"
+	Atelet_Checkpoint_FullMethodName      = "/atelet.Atelet/Checkpoint"
+	Atelet_Restore_FullMethodName         = "/atelet.Atelet/Restore"
+	Atelet_PromoteSnapshot_FullMethodName = "/atelet.Atelet/PromoteSnapshot"
+	Atelet_DetachActor_FullMethodName     = "/atelet.Atelet/DetachActor"
+	Atelet_Terminate_FullMethodName       = "/atelet.Atelet/Terminate"
 )
 
-// AteomHerderClient is the client API for AteomHerder service.
+// AteletClient is the client API for Atelet service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-type AteomHerderClient interface {
-	// Run tells atelet to create a new containerized workload from scratch on an
-	// ateom.
+//
+// Atelet allows ate-apiserver to issue control calls to the atelet.
+//
+// Called by ate-api-server over cluster networking.  ate-api-server
+// authenticates with its k8s pod identity mTLS certificate.
+//
+// atelet runs at most one Run, Restore, Checkpoint, PromoteSnapshot,
+// DetachActor, or Terminate of an actor at a time. A call waits for the one in
+// progress, up to the call's deadline.
+type AteletClient interface {
+	// Run tells atelet to create a new containerized workload from scratch on a
+	// worker.
 	Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error)
-	// Checkpoint tells atelet to save the current state of the workload on an
-	// ateom to object storage, and then completely the ateom to a blank state
-	// (back to "available" state.)
+	// Checkpoint saves the workload's state as a new snapshot of the actor and
+	// returns the worker to a blank state. upload_config says when the snapshot
+	// becomes durable. Once the new snapshot is uploaded or stored locally,
+	// atelet deletes the actor's older local snapshots, except one still being
+	// uploaded, which it deletes after that upload ends. A Checkpoint that fails
+	// before then leaves the actor's previous local snapshot in place.
+	//
+	// A Checkpoint of a snapshot already committed, as a retry's is, returns the
+	// actor's state without checkpointing the workload again; under
+	// UPLOAD_MODE_IMMEDIATE it first uploads the snapshot if it is not durable
+	// yet.
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
-	// Restore restores a workload from checkpoint onto an ateom.
+	// Restore restores a workload from a snapshot onto a worker.
 	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error)
-	// UploadPausedCheckpoint copies a local (pause) checkpoint from this node's
-	// disk to object storage. Unlike Checkpoint it drives no ateom: the actor is
-	// paused, its sandbox is gone; the checkpoint files plus their manifest
-	// already sit under the actor's local-checkpoints directory.
-	UploadPausedCheckpoint(ctx context.Context, in *UploadPausedCheckpointRequest, opts ...grpc.CallOption) (*UploadPausedCheckpointResponse, error)
+	// PromoteSnapshot makes `snapshot` durable in object storage while keeping
+	// its local copy on this node. Used when a snapshot needs to be in object
+	// storage (e.g. for tagging) without evicting the suspended actor's local
+	// snapshot from the node. Waits for an in-flight detach, and fails for an
+	// actor running on this node.
+	//
+	// atelet never uploads a local copy written before the node last rebooted,
+	// since its files may be torn: it answers from the manifest at
+	// `snapshot.object` instead, and fails with NOT_FOUND if there is none.
+	//
+	// Idempotent: once the snapshot is durable, atelet answers from the
+	// manifest at `snapshot.object`, and fails if there is none.
+	//
+	// TODO: Temporarily, this does not check whether the actor is running.
+	PromoteSnapshot(ctx context.Context, in *PromoteSnapshotRequest, opts ...grpc.CallOption) (*PromoteSnapshotResponse, error)
+	// DetachActor makes the actor's latest local snapshot durable, then deletes
+	// the actor's local snapshots on this node, so it can resume on any node.
+	// atelet also detaches a suspended actor on its own after its detach delay.
+	// It reports either detach with WorkerService.ReportActorSnapshotState, so
+	// the control plane records a DetachActor call's detach even if the caller
+	// does not, and once reported, forgets the actor. The detach doesn't end with
+	// the call: if the caller's context ends first, DetachActor returns that
+	// error and the detach runs on. Waits for an operation already in progress on
+	// the actor, such as an upload or a detach. Does nothing when atelet holds no
+	// local snapshot for the actor. Returns ABORTED when the actor runs on this
+	// node, and FAILED_PRECONDITION when atelet cannot make the latest local
+	// snapshot durable, such as when it has no `snapshot.object`.
+	DetachActor(ctx context.Context, in *DetachActorRequest, opts ...grpc.CallOption) (*DetachActorResponse, error)
 	// Terminate tells atelet to terminate/kill any running workload for an actor,
 	// unmount its volumes, and clean up actor state on the node.
 	Terminate(ctx context.Context, in *TerminateRequest, opts ...grpc.CallOption) (*TerminateResponse, error)
 }
 
-type ateomHerderClient struct {
+type ateletClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewAteomHerderClient(cc grpc.ClientConnInterface) AteomHerderClient {
-	return &ateomHerderClient{cc}
+func NewAteletClient(cc grpc.ClientConnInterface) AteletClient {
+	return &ateletClient{cc}
 }
 
-func (c *ateomHerderClient) Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error) {
+func (c *ateletClient) Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RunResponse)
-	err := c.cc.Invoke(ctx, AteomHerder_Run_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Atelet_Run_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *ateomHerderClient) Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+func (c *ateletClient) Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointResponse)
-	err := c.cc.Invoke(ctx, AteomHerder_Checkpoint_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Atelet_Checkpoint_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *ateomHerderClient) Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error) {
+func (c *ateletClient) Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RestoreResponse)
-	err := c.cc.Invoke(ctx, AteomHerder_Restore_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Atelet_Restore_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *ateomHerderClient) UploadPausedCheckpoint(ctx context.Context, in *UploadPausedCheckpointRequest, opts ...grpc.CallOption) (*UploadPausedCheckpointResponse, error) {
+func (c *ateletClient) PromoteSnapshot(ctx context.Context, in *PromoteSnapshotRequest, opts ...grpc.CallOption) (*PromoteSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(UploadPausedCheckpointResponse)
-	err := c.cc.Invoke(ctx, AteomHerder_UploadPausedCheckpoint_FullMethodName, in, out, cOpts...)
+	out := new(PromoteSnapshotResponse)
+	err := c.cc.Invoke(ctx, Atelet_PromoteSnapshot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *ateomHerderClient) Terminate(ctx context.Context, in *TerminateRequest, opts ...grpc.CallOption) (*TerminateResponse, error) {
+func (c *ateletClient) DetachActor(ctx context.Context, in *DetachActorRequest, opts ...grpc.CallOption) (*DetachActorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DetachActorResponse)
+	err := c.cc.Invoke(ctx, Atelet_DetachActor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ateletClient) Terminate(ctx context.Context, in *TerminateRequest, opts ...grpc.CallOption) (*TerminateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TerminateResponse)
-	err := c.cc.Invoke(ctx, AteomHerder_Terminate_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Atelet_Terminate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// AteomHerderServer is the server API for AteomHerder service.
-// All implementations must embed UnimplementedAteomHerderServer
+// AteletServer is the server API for Atelet service.
+// All implementations must embed UnimplementedAteletServer
 // for forward compatibility.
-type AteomHerderServer interface {
-	// Run tells atelet to create a new containerized workload from scratch on an
-	// ateom.
+//
+// Atelet allows ate-apiserver to issue control calls to the atelet.
+//
+// Called by ate-api-server over cluster networking.  ate-api-server
+// authenticates with its k8s pod identity mTLS certificate.
+//
+// atelet runs at most one Run, Restore, Checkpoint, PromoteSnapshot,
+// DetachActor, or Terminate of an actor at a time. A call waits for the one in
+// progress, up to the call's deadline.
+type AteletServer interface {
+	// Run tells atelet to create a new containerized workload from scratch on a
+	// worker.
 	Run(context.Context, *RunRequest) (*RunResponse, error)
-	// Checkpoint tells atelet to save the current state of the workload on an
-	// ateom to object storage, and then completely the ateom to a blank state
-	// (back to "available" state.)
+	// Checkpoint saves the workload's state as a new snapshot of the actor and
+	// returns the worker to a blank state. upload_config says when the snapshot
+	// becomes durable. Once the new snapshot is uploaded or stored locally,
+	// atelet deletes the actor's older local snapshots, except one still being
+	// uploaded, which it deletes after that upload ends. A Checkpoint that fails
+	// before then leaves the actor's previous local snapshot in place.
+	//
+	// A Checkpoint of a snapshot already committed, as a retry's is, returns the
+	// actor's state without checkpointing the workload again; under
+	// UPLOAD_MODE_IMMEDIATE it first uploads the snapshot if it is not durable
+	// yet.
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
-	// Restore restores a workload from checkpoint onto an ateom.
+	// Restore restores a workload from a snapshot onto a worker.
 	Restore(context.Context, *RestoreRequest) (*RestoreResponse, error)
-	// UploadPausedCheckpoint copies a local (pause) checkpoint from this node's
-	// disk to object storage. Unlike Checkpoint it drives no ateom: the actor is
-	// paused, its sandbox is gone; the checkpoint files plus their manifest
-	// already sit under the actor's local-checkpoints directory.
-	UploadPausedCheckpoint(context.Context, *UploadPausedCheckpointRequest) (*UploadPausedCheckpointResponse, error)
+	// PromoteSnapshot makes `snapshot` durable in object storage while keeping
+	// its local copy on this node. Used when a snapshot needs to be in object
+	// storage (e.g. for tagging) without evicting the suspended actor's local
+	// snapshot from the node. Waits for an in-flight detach, and fails for an
+	// actor running on this node.
+	//
+	// atelet never uploads a local copy written before the node last rebooted,
+	// since its files may be torn: it answers from the manifest at
+	// `snapshot.object` instead, and fails with NOT_FOUND if there is none.
+	//
+	// Idempotent: once the snapshot is durable, atelet answers from the
+	// manifest at `snapshot.object`, and fails if there is none.
+	//
+	// TODO: Temporarily, this does not check whether the actor is running.
+	PromoteSnapshot(context.Context, *PromoteSnapshotRequest) (*PromoteSnapshotResponse, error)
+	// DetachActor makes the actor's latest local snapshot durable, then deletes
+	// the actor's local snapshots on this node, so it can resume on any node.
+	// atelet also detaches a suspended actor on its own after its detach delay.
+	// It reports either detach with WorkerService.ReportActorSnapshotState, so
+	// the control plane records a DetachActor call's detach even if the caller
+	// does not, and once reported, forgets the actor. The detach doesn't end with
+	// the call: if the caller's context ends first, DetachActor returns that
+	// error and the detach runs on. Waits for an operation already in progress on
+	// the actor, such as an upload or a detach. Does nothing when atelet holds no
+	// local snapshot for the actor. Returns ABORTED when the actor runs on this
+	// node, and FAILED_PRECONDITION when atelet cannot make the latest local
+	// snapshot durable, such as when it has no `snapshot.object`.
+	DetachActor(context.Context, *DetachActorRequest) (*DetachActorResponse, error)
 	// Terminate tells atelet to terminate/kill any running workload for an actor,
 	// unmount its volumes, and clean up actor state on the node.
 	Terminate(context.Context, *TerminateRequest) (*TerminateResponse, error)
-	mustEmbedUnimplementedAteomHerderServer()
+	mustEmbedUnimplementedAteletServer()
 }
 
-// UnimplementedAteomHerderServer must be embedded to have
+// UnimplementedAteletServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedAteomHerderServer struct{}
+type UnimplementedAteletServer struct{}
 
-func (UnimplementedAteomHerderServer) Run(context.Context, *RunRequest) (*RunResponse, error) {
+func (UnimplementedAteletServer) Run(context.Context, *RunRequest) (*RunResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Run not implemented")
 }
-func (UnimplementedAteomHerderServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
+func (UnimplementedAteletServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
 }
-func (UnimplementedAteomHerderServer) Restore(context.Context, *RestoreRequest) (*RestoreResponse, error) {
+func (UnimplementedAteletServer) Restore(context.Context, *RestoreRequest) (*RestoreResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Restore not implemented")
 }
-func (UnimplementedAteomHerderServer) UploadPausedCheckpoint(context.Context, *UploadPausedCheckpointRequest) (*UploadPausedCheckpointResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method UploadPausedCheckpoint not implemented")
+func (UnimplementedAteletServer) PromoteSnapshot(context.Context, *PromoteSnapshotRequest) (*PromoteSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PromoteSnapshot not implemented")
 }
-func (UnimplementedAteomHerderServer) Terminate(context.Context, *TerminateRequest) (*TerminateResponse, error) {
+func (UnimplementedAteletServer) DetachActor(context.Context, *DetachActorRequest) (*DetachActorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DetachActor not implemented")
+}
+func (UnimplementedAteletServer) Terminate(context.Context, *TerminateRequest) (*TerminateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Terminate not implemented")
 }
-func (UnimplementedAteomHerderServer) mustEmbedUnimplementedAteomHerderServer() {}
-func (UnimplementedAteomHerderServer) testEmbeddedByValue()                     {}
+func (UnimplementedAteletServer) mustEmbedUnimplementedAteletServer() {}
+func (UnimplementedAteletServer) testEmbeddedByValue()                {}
 
-// UnsafeAteomHerderServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to AteomHerderServer will
+// UnsafeAteletServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AteletServer will
 // result in compilation errors.
-type UnsafeAteomHerderServer interface {
-	mustEmbedUnimplementedAteomHerderServer()
+type UnsafeAteletServer interface {
+	mustEmbedUnimplementedAteletServer()
 }
 
-func RegisterAteomHerderServer(s grpc.ServiceRegistrar, srv AteomHerderServer) {
-	// If the following call panics, it indicates UnimplementedAteomHerderServer was
+func RegisterAteletServer(s grpc.ServiceRegistrar, srv AteletServer) {
+	// If the following call panics, it indicates UnimplementedAteletServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&AteomHerder_ServiceDesc, srv)
+	s.RegisterService(&Atelet_ServiceDesc, srv)
 }
 
-func _AteomHerder_Run_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _Atelet_Run_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RunRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AteomHerderServer).Run(ctx, in)
+		return srv.(AteletServer).Run(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AteomHerder_Run_FullMethodName,
+		FullMethod: Atelet_Run_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AteomHerderServer).Run(ctx, req.(*RunRequest))
+		return srv.(AteletServer).Run(ctx, req.(*RunRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _AteomHerder_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _Atelet_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AteomHerderServer).Checkpoint(ctx, in)
+		return srv.(AteletServer).Checkpoint(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AteomHerder_Checkpoint_FullMethodName,
+		FullMethod: Atelet_Checkpoint_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AteomHerderServer).Checkpoint(ctx, req.(*CheckpointRequest))
+		return srv.(AteletServer).Checkpoint(ctx, req.(*CheckpointRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _AteomHerder_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _Atelet_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RestoreRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AteomHerderServer).Restore(ctx, in)
+		return srv.(AteletServer).Restore(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AteomHerder_Restore_FullMethodName,
+		FullMethod: Atelet_Restore_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AteomHerderServer).Restore(ctx, req.(*RestoreRequest))
+		return srv.(AteletServer).Restore(ctx, req.(*RestoreRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _AteomHerder_UploadPausedCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(UploadPausedCheckpointRequest)
+func _Atelet_PromoteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PromoteSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AteomHerderServer).UploadPausedCheckpoint(ctx, in)
+		return srv.(AteletServer).PromoteSnapshot(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AteomHerder_UploadPausedCheckpoint_FullMethodName,
+		FullMethod: Atelet_PromoteSnapshot_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AteomHerderServer).UploadPausedCheckpoint(ctx, req.(*UploadPausedCheckpointRequest))
+		return srv.(AteletServer).PromoteSnapshot(ctx, req.(*PromoteSnapshotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _AteomHerder_Terminate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _Atelet_DetachActor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DetachActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AteletServer).DetachActor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Atelet_DetachActor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AteletServer).DetachActor(ctx, req.(*DetachActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Atelet_Terminate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TerminateRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AteomHerderServer).Terminate(ctx, in)
+		return srv.(AteletServer).Terminate(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AteomHerder_Terminate_FullMethodName,
+		FullMethod: Atelet_Terminate_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AteomHerderServer).Terminate(ctx, req.(*TerminateRequest))
+		return srv.(AteletServer).Terminate(ctx, req.(*TerminateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// AteomHerder_ServiceDesc is the grpc.ServiceDesc for AteomHerder service.
+// Atelet_ServiceDesc is the grpc.ServiceDesc for Atelet service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var AteomHerder_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "atelet.AteomHerder",
-	HandlerType: (*AteomHerderServer)(nil),
+var Atelet_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "atelet.Atelet",
+	HandlerType: (*AteletServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "Run",
-			Handler:    _AteomHerder_Run_Handler,
+			Handler:    _Atelet_Run_Handler,
 		},
 		{
 			MethodName: "Checkpoint",
-			Handler:    _AteomHerder_Checkpoint_Handler,
+			Handler:    _Atelet_Checkpoint_Handler,
 		},
 		{
 			MethodName: "Restore",
-			Handler:    _AteomHerder_Restore_Handler,
+			Handler:    _Atelet_Restore_Handler,
 		},
 		{
-			MethodName: "UploadPausedCheckpoint",
-			Handler:    _AteomHerder_UploadPausedCheckpoint_Handler,
+			MethodName: "PromoteSnapshot",
+			Handler:    _Atelet_PromoteSnapshot_Handler,
+		},
+		{
+			MethodName: "DetachActor",
+			Handler:    _Atelet_DetachActor_Handler,
 		},
 		{
 			MethodName: "Terminate",
-			Handler:    _AteomHerder_Terminate_Handler,
+			Handler:    _Atelet_Terminate_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "atelet.proto",
+	Metadata: "internal/proto/ateletpb/atelet.proto",
 }

@@ -15,36 +15,58 @@
 package controlapi
 
 import (
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
 )
 
-func actorSnapshotContentScopeToAtelet(in ateapipb.SnapshotContentScope) ateletpb.SnapshotScope {
-	if in == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
-		return ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA
-	}
-	return ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL
-}
-
-// effectiveContentScope normalizes a template snapshot scope for comparisons:
-// UNSPECIFIED means FULL, on both the converted CRD and the stored resource.
-func effectiveContentScope(in ateapipb.SnapshotContentScope) ateapipb.SnapshotContentScope {
-	if in == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
-		return ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
-	}
-	return in
-}
-
-// sandboxClassString renders the proto enum in the CRD's lower-case string
-// form, which the scheduler and the metric labels share.
-func sandboxClassString(in ateapipb.SandboxClass) string {
+// fidelityToAtelet maps the public fidelity ladder onto the identical atelet
+// wire enum, level by level. Anything else, including UNSPECIFIED, goes out
+// as UNSPECIFIED, which atelet rejects, rather than being silently promoted.
+func fidelityToAtelet(in ateapi.SnapshotFidelity) ateletpb.SnapshotFidelity {
 	switch in {
-	case ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR:
-		return string(atev1alpha1.SandboxClassGvisor)
-	case ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM:
-		return string(atev1alpha1.SandboxClassMicroVM)
+	case ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES:
+		return ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+	case ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
+		return ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+	case ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
+		return ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
 	default:
-		return ""
+		return ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED
 	}
+}
+
+// fidelityFromAtelet maps atelet's fidelity enum back onto the identical
+// public one. Anything else comes back UNSPECIFIED.
+func fidelityFromAtelet(in ateletpb.SnapshotFidelity) ateapi.SnapshotFidelity {
+	switch in {
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES:
+		return ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
+		return ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
+		return ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	default:
+		return ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED
+	}
+}
+
+// snapshotReportFromAtelet converts a snapshot atelet reports into the form
+// ReportActorSnapshotState takes, which carries the snapshot's fields inline.
+// A report that names no snapshot converts to nil.
+func snapshotReportFromAtelet(r *ateletpb.SnapshotReport) *ateapi.SnapshotReport {
+	if r.GetSnapshot() == nil {
+		return nil
+	}
+	snap := r.GetSnapshot()
+	out := &ateapi.SnapshotReport{
+		Uuid:                snap.GetSnapshotUuid(),
+		Generation:          snap.GetGeneration(),
+		Fidelity:            fidelityFromAtelet(snap.GetFidelity()),
+		LocalCommitTime:     r.GetLocalCommitTime(),
+		DurableCompleteTime: r.GetDurableCompleteTime(),
+	}
+	if obj := snap.GetObject(); obj != nil {
+		out.Object = &ateapi.ObjectSnapshot{SnapshotUri: obj.GetSnapshotUri()}
+	}
+	return out
 }

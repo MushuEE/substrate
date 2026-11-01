@@ -16,9 +16,11 @@ package extproc
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"go.ate.dev/substrate/internal/atenet"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -101,6 +103,18 @@ func TestExtractMetadata(t *testing.T) {
 			wantPath: "",
 			wantHost: "",
 		},
+		{
+			name: "repeated headers are joined with commas",
+			headers: []*corev3.HeaderValue{
+				{Key: "X-Repeated", Value: "first"},
+				{Key: "x-repeated", Value: "second"},
+			},
+			wantHeaders: map[string]string{
+				"x-repeated": "first,second",
+			},
+			wantPath: "",
+			wantHost: "",
+		},
 	}
 
 	for _, tc := range tests {
@@ -120,11 +134,35 @@ func TestExtractMetadata(t *testing.T) {
 	}
 }
 
+func TestRequestMetadataHeaderCommaJoinsDuplicates(t *testing.T) {
+	headers := []*corev3.HeaderValue{
+		{Key: "X-Single", Value: "single-val"},
+		{Key: "X-Multiple", Value: "val-1"},
+		{Key: "X-Multiple", Value: "val-2"},
+	}
+	md := NewRequestMetadata(headers, nil)
+
+	if got := md.Header("X-Single"); got != "single-val" {
+		t.Errorf("Header(X-Single) = %q, want %q", got, "single-val")
+	}
+	if got := md.Header("X-Multiple"); got != "val-1,val-2" {
+		t.Errorf("Header(X-Multiple) = %q, want %q", got, "val-1,val-2")
+	}
+	if got := md.Header("X-Missing"); got != "" {
+		t.Errorf("Header(X-Missing) = %q, want empty string", got)
+	}
+
+	var nilMD *RequestMetadata
+	if got := nilMD.Header("X-Single"); got != "" {
+		t.Errorf("nil.Header() = %q, want empty string", got)
+	}
+}
+
 func TestRequestMetadataAttribute(t *testing.T) {
 	attrs := map[string]*structpb.Struct{
 		"envoy.filters.http.ext_proc": {
 			Fields: map[string]*structpb.Value{
-				"filter_state['dev.ate.authority']": structpb.NewStringValue("actor-1.team-a.actors.resources.substrate.ate.dev"),
+				TargetActorFilterStateAttribute: structpb.NewStringValue("team-a/actor-1"),
 			},
 		},
 	}
@@ -134,10 +172,36 @@ func TestRequestMetadataAttribute(t *testing.T) {
 	// The lookup scans every filter's attributes rather than hardcoding which
 	// filter reported the value (see filterChainName in dispatch.go for why),
 	// so it must not matter which filter name the value arrived under.
-	if got, want := md.Attribute("filter_state['dev.ate.authority']"), "actor-1.team-a.actors.resources.substrate.ate.dev"; got != want {
+	if got, want := md.Attribute(TargetActorFilterStateAttribute), "team-a/actor-1"; got != want {
 		t.Errorf("Attribute() = %q, want %q", got, want)
 	}
 	if got := md.Attribute("filter_state['does.not.exist']"); got != "" {
 		t.Errorf("Attribute() for a missing key = %q, want \"\"", got)
+	}
+}
+
+func TestRequestMetadataHeaderIsCaseInsensitive(t *testing.T) {
+	md := NewRequestMetadata([]*corev3.HeaderValue{
+		{Key: strings.ToUpper(atenet.TargetActorHeader), Value: "team-a/actor-1"},
+	}, nil)
+
+	for name, want := range map[string]string{
+		atenet.TargetActorHeader: "team-a/actor-1",
+	} {
+		if got := md.Header(name); got != want {
+			t.Errorf("Header(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestRequestMetadataAttributeNumber(t *testing.T) {
+	const port = "filter_state['some.object'].port"
+	md := NewRequestMetadata(nil, map[string]*structpb.Struct{
+		"envoy.filters.http.ext_proc": {Fields: map[string]*structpb.Value{
+			port: structpb.NewNumberValue(8443),
+		}},
+	})
+	if got, want := md.Attribute(port), "8443"; got != want {
+		t.Errorf("Attribute() for a number = %q, want %q", got, want)
 	}
 }

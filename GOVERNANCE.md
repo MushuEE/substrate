@@ -10,7 +10,7 @@ over time.
 For day-to-day collaboration norms (PR workflow, communication, AI-tool
 disclosure), see [COLLABORATING.md](COLLABORATING.md). For build and
 contribution instructions, see [CONTRIBUTING.md](CONTRIBUTING.md). For
-community conduct, see [code-of-conduct.md](code-of-conduct.md).
+community conduct, see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Roles
 
@@ -20,16 +20,16 @@ decided among current Maintainers.
 
 **Default** — No formal designation. Anyone may open issues and PRs on the
 project, or review other people's PRs and issues. Must follow the Code of
-Conduct.  Opening a PR requires that the author sign the [Google Contributor
-License Agreement](https://cla.developers.google.com/about) (see
+Conduct.  Every commit in a PR must be signed off under the [Developer
+Certificate of Origin](https://developercertificate.org/) (see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 **Contributor** — Someone who has made at least one non-trivial contribution
 and is known to or vouched for by a Maintainer, or has accumulated enough
 contributions over time. Granted `Read` access on the repository. Must follow
-the Code of Conduct and sign the [Google Contributor License
-Agreement](https://cla.developers.google.com/about) before their first
-contribution is merged (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+the Code of Conduct and sign off every commit under the [Developer Certificate
+of Origin](https://developercertificate.org/) (see
+[CONTRIBUTING.md](CONTRIBUTING.md)).
 
 **Reviewer** — A contributor who has made enough contributions and is vouched
 for by at least 2 Maintainers. Granted `Triage` access: can review, label, and
@@ -69,7 +69,7 @@ Maintainers are Reviewers or Contributors who have made significant
 contributions to the project, and are trusted to approve and merge other
 people's PRs.
 
-To become a Reviewer, you can either nominate yourself (via email to the
+To become a Maintainer, you can either nominate yourself (via email to the
 ate-dev mailing list) or be nominated by another Maintainer.
 
 ### Emeritus Maintainers
@@ -97,7 +97,7 @@ Maintainer requirements and can commit to ongoing participation.
 - **Disputes.** Try to resolve on the PR or issue first. If that fails, any
   participant can ask the Maintainers to decide.
 - **Code-of-Conduct issues.** Reported and handled per
-  [code-of-conduct.md](code-of-conduct.md).
+  [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Activity
 

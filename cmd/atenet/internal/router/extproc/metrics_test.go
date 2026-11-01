@@ -27,7 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
 func TestClassifyOutcome(t *testing.T) {
@@ -73,7 +73,7 @@ func TestClassifyOutcome(t *testing.T) {
 		},
 		{
 			name:     "ResourceExhausted gRPC code maps to no_capacity",
-			err:      status.Error(codes.ResourceExhausted, "no free workers available"),
+			err:      status.Error(codes.ResourceExhausted, "no worker has room for the actor"),
 			expected: "no_capacity",
 		},
 		{
@@ -82,8 +82,18 @@ func TestClassifyOutcome(t *testing.T) {
 			expected: "not_found",
 		},
 		{
-			name:     "StatusCode_ServiceUnavailable ReqError maps to no_capacity",
-			err:      NewReqError(envoy_type.StatusCode_ServiceUnavailable, "no free workers"),
+			name:     "bare StatusCode_ServiceUnavailable ReqError maps to unavailable",
+			err:      NewReqError(envoy_type.StatusCode_ServiceUnavailable, "router at capacity"),
+			expected: "unavailable",
+		},
+		{
+			name:     "StatusCode_ServiceUnavailable ReqError with an uncoded cause maps to unavailable",
+			err:      WrapReqError(envoy_type.StatusCode_ServiceUnavailable, errors.New("policy lookup failed"), "egress unavailable"),
+			expected: "unavailable",
+		},
+		{
+			name:     "StatusCode_ServiceUnavailable ReqError wrapping ResourceExhausted maps to no_capacity",
+			err:      WrapReqError(envoy_type.StatusCode_ServiceUnavailable, status.Error(codes.ResourceExhausted, "no worker has room for the actor"), "actor unavailable"),
 			expected: "no_capacity",
 		},
 		{
@@ -92,8 +102,33 @@ func TestClassifyOutcome(t *testing.T) {
 			expected: "rate_limited",
 		},
 		{
+			name:     "PermissionDenied gRPC code maps to denied",
+			err:      status.Error(codes.PermissionDenied, "access denied"),
+			expected: "denied",
+		},
+		{
+			name:     "StatusCode_Forbidden ReqError maps to denied",
+			err:      NewReqError(envoy_type.StatusCode_Forbidden, "egress denied"),
+			expected: "denied",
+		},
+		{
+			name:     "StatusCode_Forbidden ReqError with an uncoded cause maps to denied",
+			err:      WrapReqError(envoy_type.StatusCode_Forbidden, errors.New("invalid actor certificate"), "egress denied"),
+			expected: "denied",
+		},
+		{
 			name:     "Unknown error maps to resume_error",
 			err:      errors.New("internal storage glitch"),
+			expected: "resume_error",
+		},
+		{
+			name:     "Internal gRPC code maps to resume_error",
+			err:      status.Error(codes.Internal, "resume failed"),
+			expected: "resume_error",
+		},
+		{
+			name:     "StatusCode_InternalServerError ReqError maps to resume_error",
+			err:      NewReqError(envoy_type.StatusCode_InternalServerError, "resume failed"),
 			expected: "resume_error",
 		},
 	}
@@ -110,7 +145,7 @@ func TestClassifyOutcome(t *testing.T) {
 func TestRecordRouteDuration_Attributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	h, err := mp.Meter("atenet-router").Float64Histogram(routeDurationMetricName)
+	h, err := NewRouteDurationHistogram(mp.Meter("atenet-router"))
 	if err != nil {
 		t.Fatalf("failed to create histogram: %v", err)
 	}
@@ -138,5 +173,61 @@ func TestRecordRouteDuration_Attributes(t *testing.T) {
 		} else if val.AsString() != want {
 			t.Errorf("attribute %q = %q, want %q", k, val.AsString(), want)
 		}
+	}
+}
+
+func TestRecordRouteDuration_NormalizesEmptyTemplateDimensions(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	h, err := NewRouteDurationHistogram(mp.Meter("atenet-router"))
+	if err != nil {
+		t.Fatalf("failed to create histogram: %v", err)
+	}
+
+	s := NewServer(50051, h, nil)
+	s.recordRouteDuration(context.Background(), 5*time.Millisecond, "", "", classifyOutcome(errors.New("fail")), ateattr.RouterResumeUnknown)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	dp := rm.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[float64]).DataPoints[0]
+	wantAttrs := map[string]string{
+		"ate.template.atespace": "unknown",
+		"ate.template.name":     "unknown",
+		"ate.router.outcome":    "resume_error",
+		"ate.router.resume":     "unknown",
+	}
+
+	for k, want := range wantAttrs {
+		val, exists := dp.Attributes.Value(attribute.Key(k))
+		if !exists {
+			t.Errorf("missing metric attribute %q", k)
+		} else if val.AsString() != want {
+			t.Errorf("attribute %q = %q, want %q", k, val.AsString(), want)
+		}
+	}
+}
+
+func TestResultResume_DefaultsToUnknown(t *testing.T) {
+	tests := []struct {
+		name   string
+		resume string
+		want   string
+	}{
+		{name: "empty defaults to unknown", resume: "", want: ateattr.RouterResumeUnknown},
+		{name: "none preserved", resume: ateattr.RouterResumeNone, want: ateattr.RouterResumeNone},
+		{name: "triggered preserved", resume: ateattr.RouterResumeTriggered, want: ateattr.RouterResumeTriggered},
+		{name: "joined preserved", resume: ateattr.RouterResumeJoined, want: ateattr.RouterResumeJoined},
+		{name: "unknown preserved", resume: ateattr.RouterResumeUnknown, want: ateattr.RouterResumeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := Result{Resume: tt.resume}
+			if got := r.resume(); got != tt.want {
+				t.Errorf("Result.resume() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

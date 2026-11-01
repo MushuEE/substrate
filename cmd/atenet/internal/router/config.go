@@ -16,9 +16,12 @@ package router
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+
+	"go.ate.dev/substrate/cmd/atenet/internal/router/ingress"
 )
 
 type atenetRouter string
@@ -51,18 +54,32 @@ const (
 	// Nothing else runs: the egress gateway is statically configured, so there
 	// is no xDS server and no Kubernetes client.
 	ModeEgress Mode = "egress"
-	// ModeAll serves both directions from one instance. This is the default,
-	// and what a single-gateway or local development setup wants.
-	ModeAll Mode = "all"
 )
 
 // ServesIngress reports whether this mode answers ingress requests. It also
 // gates the ingress control plane: the xDS server that configures the ingress
 // dataplane (Envoy only).
-func (m Mode) ServesIngress() bool { return m != ModeEgress }
+func (m Mode) ServesIngress() bool { return m == ModeIngress }
 
 // ServesEgress reports whether this mode answers egress CONNECTs.
-func (m Mode) ServesEgress() bool { return m != ModeIngress }
+func (m Mode) ServesEgress() bool { return m == ModeEgress }
+
+// ingressAuthConfig holds the client authentication settings for the ingress
+// dataplane's listeners. Every client must present a certificate that chains
+// to ClientCAFile and carries one of AllowedSPIFFEIDs as a URI SAN. Envoy
+// enforces both during the TLS handshake.
+type ingressAuthConfig struct {
+	// ClientCAFile is the PEM bundle of CAs allowed to sign client
+	// certificates. Envoy reads it, so it must be mounted in the Envoy
+	// container at the same path.
+	ClientCAFile string
+	// AllowedSPIFFEIDs is the exact set of SPIFFE IDs allowed to connect to
+	// actors. When it is empty, the dataplane serves no traffic.
+	//
+	// Entries are complete SPIFFE IDs, like
+	// `spiffe://mytrustdomain.com/foo/bar/baz`.
+	AllowedSPIFFEIDs []string
+}
 
 // authConfig holds the router's mTLS settings for dialing ateapi.
 type authConfig struct {
@@ -71,27 +88,75 @@ type authConfig struct {
 	AteapiServerName     string
 }
 
+// credentialProviderConfig holds the egress gateway's connections to the
+// credential providers the MITM-leg injection resolves secrets through. Names,
+// Addresses and ServerNames pair up by position; the rest configures the mTLS
+// the gateway dials every provider with. See cmd/atenet/internal/router/egress.
+type credentialProviderConfig struct {
+	// Names are the providers this gateway serves, as ate-secret://
+	// prefixes; a policy credential URI naming any other provider is refused.
+	// A lone empty name disables the check (dev only).
+	Names []string
+	// Addresses are the providers' gRPC dial targets. None disables injection.
+	Addresses []string
+	// CAFile is the CA the provider's serving certificate must chain to.
+	// Required unless Insecure is set.
+	CAFile string
+	// ClientCert is the credential bundle presented to the provider as the
+	// client certificate. Required unless Insecure is set.
+	ClientCert string
+	// ServerNames are the SAN/SNI expected on each provider's serving
+	// certificate. Empty leaves them all unset.
+	ServerNames []string
+	// Insecure dials the provider without TLS; explicit development-only opt-in.
+	Insecure bool
+}
+
+// validate checks that the repeated provider flags pair up.
+func (p credentialProviderConfig) validate() error {
+	if len(p.Names) != len(p.Addresses) {
+		return fmt.Errorf("got %d --credential-provider-name for %d --credential-provider-address, want one per address", len(p.Names), len(p.Addresses))
+	}
+	if len(p.ServerNames) != 0 && len(p.ServerNames) != len(p.Addresses) {
+		return fmt.Errorf("got %d --credential-provider-server-name for %d --credential-provider-address, want one per address or none", len(p.ServerNames), len(p.Addresses))
+	}
+	for i, name := range p.Names {
+		if p.Addresses[i] == "" {
+			return fmt.Errorf("--credential-provider-address must not be empty")
+		}
+		if name == "" && len(p.Names) > 1 {
+			return fmt.Errorf("an empty --credential-provider-name serves every credential URI, so it must be the only provider")
+		}
+		if slices.Contains(p.Names[:i], name) {
+			return fmt.Errorf("--credential-provider-name %q repeats", name)
+		}
+	}
+	return nil
+}
+
 // routerConfig holds deployment setup and endpoint options for the router node instance.
 type routerConfig struct {
-	// Mode restricts the instance to one traffic direction. Empty means ModeAll.
-	Mode           Mode
-	AtenetRouter   string
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
-	ExtprocPort    int
-	ExtprocAddr    string
-	StatusPort     int
-	HealthInterval time.Duration
-	HttpsPort      int
-	// ConnectPlainTextPort and ConnectTLSPort are the plaintext and TLS
-	// listener ports for CONNECT-tunneled traffic. Non-positive disables the
-	// corresponding listener.
-	ConnectPlainTextPort int
-	ConnectTLSPort       int
-	EnvoyCertPath        string
+	// Mode is the one traffic direction this instance serves. Required.
+	Mode         Mode
+	AtenetRouter string
+	Namespace    string
+	// RouterServiceName is the Service name of this atenet-router in the
+	// operations namespace, used by /statusz to look up its own ClusterIP.
+	// Defaults to installdefaults.RouterServiceName.
+	RouterServiceName string
+	Kubeconfig        string
+	AteapiAddr        string
+	XdsPort           int
+	ExtprocPort       int
+	ExtprocAddr       string
+	StatusPort        int
+	StatusAddr        string
+	HealthInterval    time.Duration
+	HttpsPort         int
+	// ConnectTLSPort is the listener port for CONNECT-tunneled traffic.
+	// Non-positive disables the listener.
+	ConnectTLSPort int
+	EnvoyCertPath  string
 
 	// UpstreamCredentialBundlePath is the router's podidentity credential bundle
 	// (cert+key) presented as the client cert when dialing the actor's atunnel
@@ -99,9 +164,8 @@ type routerConfig struct {
 	// validate that server. Empty UpstreamCredentialBundlePath disables upstream mTLS.
 	UpstreamCredentialBundlePath string
 	UpstreamTrustBundlePath      string
-	// UpstreamSpiffePrefix validates the actor's atunnel server cert by its
-	// SPIFFE URI SAN prefix (trust domain) instead of the dialed pod IP.
-	UpstreamSpiffePrefix string
+	// UpstreamConnect tunnels actor traffic to atunnel's CONNECT listener.
+	UpstreamConnect bool
 
 	// ActorIdentityCAFile is the PEM trust bundle for the actor-identity CA,
 	// used by the egress gateway's ext_proc sidecar to verify the actor client
@@ -110,9 +174,20 @@ type routerConfig struct {
 	// every egress CONNECT fail closed and is correct for an ingress-only
 	// router (it never sees the egress listener).
 	ActorIdentityCAFile string
+	// EgressPolicyCacheTTL is how long the egress handler reuses a fetched
+	// EgressPolicy, and so how long a policy change takes to bite. 0 disables
+	// the cache.
+	EgressPolicyCacheTTL time.Duration
+
+	// CredentialProvider configures egress credential injection on the MITM leg.
+	// Only the egress gateway sets it, and only when injection is enabled: a
+	// CredentialProvider with no Addresses leaves the injector disabled, so a
+	// request that needs an injection is denied. See egress.Handler.
+	CredentialProvider credentialProviderConfig
 
 	LogLevel    string
 	MetricsAddr string
+	HealthAddr  string
 	// OtlpCollectorAddress is the OTLP gRPC collector that Envoy reports
 	// tracing spans to, as host:port or an http:// URL. It defaults to
 	// OTEL_EXPORTER_OTLP_ENDPOINT — Envoy gets its whole configuration over
@@ -125,11 +200,15 @@ type routerConfig struct {
 
 	Auth authConfig
 
+	// IngressAuth configures client authentication on the ingress listeners.
+	IngressAuth ingressAuthConfig
+
 	// RouteTimeout is Envoy's end-to-end timeout on the workload route: the
 	// ceiling on one request from the ingress listener to the actor's response.
 	// It bounds the actor's own handling time, not the resume that precedes it
 	// — parking and the ext_proc timeout cover that. A non-positive value
-	// leaves Envoy on defaultRouteTimeout.
+	// leaves Envoy on defaultRouteTimeout. It does not size shutdown; see
+	// drainRouteBudget.
 	RouteTimeout time.Duration
 
 	// ParkedRequest configures request parking: hold and retry requests whose
@@ -194,16 +273,16 @@ func (c routerConfig) extProcMaxRequests() int {
 const drainTimeoutMargin = 5 * time.Second
 
 // drainTimeout resolves the effective ext_proc drain deadline: an explicit
-// flag wins; 0 derives park budget + the DEFAULT route timeout + margin. The
-// derivation deliberately ignores a configured --route-timeout so a raised
-// route ceiling cannot silently stretch shutdown past the pod's grace period
-// (see defaultRouteTimeout); operators pair a long route timeout with an
-// explicit --drain-timeout instead.
+// flag wins; 0 derives park budget + drainRouteBudget + margin. The derivation
+// deliberately ignores the route timeout, configured or default, so a route
+// ceiling sized for the longest turn a workload might take cannot stretch
+// shutdown past the pod's grace period (see drainRouteBudget); operators pair a
+// long route timeout with an explicit --drain-timeout instead.
 func (c routerConfig) drainTimeout(parkCfg ingress.ParkedRequestConfig) time.Duration {
 	if c.DrainTimeout > 0 {
 		return c.DrainTimeout
 	}
-	return parkCfg.Budget + defaultRouteTimeout + drainTimeoutMargin
+	return parkCfg.Budget + drainRouteBudget + drainTimeoutMargin
 }
 
 // validate rejects flag combinations that would make the router misbehave
@@ -212,14 +291,20 @@ func (c routerConfig) validate() error {
 	switch c.atenetRouter() {
 	case atenetRouterEnvoy, atenetRouterAgentgateway:
 	default:
-		return fmt.Errorf("--atenet-router must be %q or %q, got %q", atenetRouterEnvoy, atenetRouterAgentgateway, c.AtenetRouter)
+		return fmt.Errorf("--atenet-dataplane must be %q or %q, got %q", atenetRouterEnvoy, atenetRouterAgentgateway, c.AtenetRouter)
 	}
 	switch c.Mode {
-	case "", ModeIngress, ModeEgress, ModeAll:
+	case ModeIngress, ModeEgress:
 	default:
-		return fmt.Errorf("--mode must be one of %q, %q, or %q, got %q", ModeIngress, ModeEgress, ModeAll, c.Mode)
+		return fmt.Errorf("--mode must be %q or %q, got %q", ModeIngress, ModeEgress, c.Mode)
 	}
 	if err := c.ParkedRequest.Validate(); err != nil {
+		return err
+	}
+	if err := c.validateIngressAuth(); err != nil {
+		return err
+	}
+	if err := c.CredentialProvider.validate(); err != nil {
 		return err
 	}
 
@@ -230,6 +315,13 @@ func (c routerConfig) validate() error {
 		return fmt.Errorf("--extproc-max-requests (%d) must be >= --parked-request-max (%d): a circuit breaker below the parking lot silently truncates it with Envoy-generated 503s",
 			c.ExtProcMaxRequests, c.ParkedRequest.Max)
 	}
+	// Only the Envoy ingress router uses this flag; agentgateway always uses CONNECT.
+	if c.UpstreamConnect && c.UpstreamCredentialBundlePath == "" && c.Mode.ServesIngress() && c.atenetRouter() == atenetRouterEnvoy {
+		return fmt.Errorf("--upstream-connect (on by default) requires --upstream-credential-bundle: atunnel's CONNECT listener accepts only mTLS. Set --upstream-connect=false to dial atunnel without it")
+	}
+	if c.EgressPolicyCacheTTL < 0 {
+		return fmt.Errorf("--egress-policy-cache-ttl must not be negative, got %s (0 disables the cache)", c.EgressPolicyCacheTTL)
+	}
 	if c.DrainDelay < 0 {
 		return fmt.Errorf("--drain-delay must not be negative, got %s", c.DrainDelay)
 	}
@@ -239,6 +331,31 @@ func (c routerConfig) validate() error {
 	if c.DrainTimeout > 0 && c.ParkedRequest.Enabled() && c.DrainTimeout < c.ParkedRequest.Normalized().Budget {
 		return fmt.Errorf("--drain-timeout (%s) must be >= --parked-request-budget (%s): a drain shorter than the parking budget resets parked requests on shutdown instead of letting them finish",
 			c.DrainTimeout, c.ParkedRequest.Normalized().Budget)
+	}
+	return nil
+}
+
+// validateIngressAuth rejects an Envoy ingress configuration with no TLS
+// listener, or one whose clients cannot be authenticated. Agentgateway's
+// listeners come from its static configuration, so the router has none to
+// check.
+func (c routerConfig) validateIngressAuth() error {
+	if !c.Mode.ServesIngress() || c.atenetRouter() != atenetRouterEnvoy {
+		return nil
+	}
+	if c.EnvoyCertPath == "" {
+		return fmt.Errorf("--envoy-cert-path is required: without a serving certificate there is no TLS listener")
+	}
+	if c.HttpsPort <= 0 && c.ConnectTLSPort <= 0 {
+		return fmt.Errorf("--port-https or --port-connect-tls is required: there is no TLS listener")
+	}
+	if c.IngressAuth.ClientCAFile == "" {
+		return fmt.Errorf("--ingress-client-ca-file is required")
+	}
+	for _, id := range c.IngressAuth.AllowedSPIFFEIDs {
+		if _, err := spiffeid.FromString(id); err != nil {
+			return fmt.Errorf("--ingress-allowed-spiffe-ids: %q is not a valid SPIFFE ID: %w", id, err)
+		}
 	}
 	return nil
 }

@@ -19,54 +19,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/testcert"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const networkingAtespace = "networking-e2e"
 
-// egressFixture returns the egress demo the egress tests build their actors
-// from, for the sandbox class under test and the egress gateway variant
-// deployed.
-//
-// Deploy the one matching the lane:
-//
-//	hack/install-ate-kind.sh --deploy-demo-egress                     # passthrough, gVisor
-//	hack/install-ate-kind.sh --deploy-demo-egress-microvm             # passthrough, micro-VM
-//	hack/install-ate-kind.sh --deploy-demo-egress-mitm                # sdsmint, gVisor
-//	hack/install-ate-kind.sh --deploy-demo-egress-microvm-mitm        # sdsmint, micro-VM
-func egressFixture() e2e.Fixture {
-	// E2E_EGRESS_MITM selects the egress gateway variant.
-	if os.Getenv("E2E_EGRESS_MITM") == "" {
-		return e2e.EgressFixture()
-	}
-	if e2e.IsMicroVM() {
-		return e2e.Fixture{
-			Namespace:  "ate-demo-egress-microvm-mitm",
-			Name:       "egress-microvm-mitm",
-			DeployWith: "hack/install-ate-kind.sh --deploy-demo-egress-microvm-mitm",
-		}
-	}
-	return e2e.Fixture{
-		Namespace:  "ate-demo-egress-mitm",
-		Name:       "egress-mitm",
-		DeployWith: "hack/install-ate-kind.sh --deploy-demo-egress-mitm",
-	}
-}
+// egressFixture returns the unified egress demo deployed by the E2E workflow.
+func egressFixture() e2e.Fixture { return e2e.EgressFixture() }
 
 func TestActorDirectAccess(t *testing.T) {
 	ctx := context.Background()
-	actorName, actor := createAndResumeSubstrateActor(t, ctx, "direct", e2e.SubstrateCounterFixture())
+	_, actorName, actor := createAndResumeSubstrateActor(t, ctx, "direct", e2e.SubstrateCounterFixture())
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -80,6 +59,25 @@ func TestActorDirectAccess(t *testing.T) {
 		})
 		t.Logf("Actor access through ingress succeeded; body: %s", body)
 	})
+	t.Run("duplicate actor header rejected", func(t *testing.T) {
+		actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, router.BaseURL()+"/readyz", nil)
+		if err != nil {
+			t.Fatalf("creating request: %v", err)
+		}
+		req.Header.Add(atenet.TargetActorHeader, actorRef.String())
+		req.Header.Add(atenet.TargetActorHeader, "untrusted/actor")
+
+		resp, err := router.DoReq(req)
+		if err != nil {
+			t.Fatalf("Error while sending request: %v", err)
+		}
+
+		if resp.StatusCode != http.StatusNotFound {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("duplicate actor header on plain HTTP returned %d, want 404; body: %s", resp.StatusCode, body)
+		}
+	})
 }
 
 // egressHTTPTarget returns a copy of the origin TestActorEgress dials:
@@ -87,7 +85,7 @@ func TestActorDirectAccess(t *testing.T) {
 func egressHTTPTarget() e2e.ServerPod {
 	return e2e.ServerPod{
 		Name:       "egresshttp",
-		ImportPath: "github.com/agent-substrate/substrate/internal/e2e/fixtures/testserver",
+		ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
 		Args:       []string{"http"},
 		Port:       80,
 		TargetPort: 8080,
@@ -110,7 +108,9 @@ func TestActorEgress(t *testing.T) {
 	origin := egressHTTPTarget()
 	target := e2e.DeployServerPod(t, ctx, origin)
 
-	actorName, _ := createAndResumeActor(t, ctx, "egress", egressFixture())
+	fixture := e2e.EgressFixture()
+
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress", fixture, e2e.EgressAllowAll()...)
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -126,11 +126,9 @@ func TestActorEgress(t *testing.T) {
 	}
 	t.Logf("Actor egress fetch of %s succeeded; body: %s", url, body)
 
-	assertEgressGatewayConnect(t, ctx, since, actorName, strconv.Itoa(origin.Port))
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, strconv.Itoa(origin.Port))
 
-	// The Actor resolves the name itself -- DNS leaves over the UDP masquerade,
-	// not the tunnel, and atunnel forwards the resolved address, never the
-	// name -- so dialing by name covers a leg the by-address fetch above skips.
+	// Test resolution by DNS.
 	t.Run("by DNS name", func(t *testing.T) {
 		url := fmt.Sprintf("http://%s.%s.svc.cluster.local/healthz", origin.Name, target.Namespace)
 		status, body := fetchThroughEgressActor(t, ctx, router, actorRef, url)
@@ -141,14 +139,57 @@ func TestActorEgress(t *testing.T) {
 	})
 }
 
+func TestActorEgressMultiplexing(t *testing.T) {
+	ctx := context.Background()
+
+	origin := egressHTTPTarget()
+	target := e2e.DeployServerPod(t, ctx, origin)
+
+	fixture := e2e.EgressFixture()
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-mux", fixture, e2e.EgressAllowAll()...)
+	router := mustRouterClient(t, ctx)
+	defer router.Close()
+
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	waitForActorRoute(t, ctx, router, actorRef)
+
+	url := fmt.Sprintf("http://%s/fetch", target.Address())
+	payload, err := json.Marshal(map[string]string{"url": url})
+	if err != nil {
+		t.Fatalf("marshaling the mux request for %s: %v", url, err)
+	}
+
+	since := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	status, body := postThroughEgressActor(t, ctx, router, actorRef, "/mux", payload)
+	if status != http.StatusOK {
+		t.Fatalf("Actor egress mux of %s returned HTTP %d, want 200; body: %s", url, status, body)
+	}
+	t.Logf("Actor egress mux of %s succeeded; body: %s", url, body)
+
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, strconv.Itoa(origin.Port))
+}
+
+// egressHTTPSTarget returns an origin whose /healthz answers with body over
+// HTTPS on 443 (and cleartext on 80): testserver's http subcommand serving a
+// service-DNS certificate, which the gateway trusts once
+// hack/setup-e2e-egress-tls-kind.sh has run.
+func egressHTTPSTarget(name, body string) e2e.ServerPod {
+	return e2e.ServiceDNSTLS(e2e.ServerPod{
+		Name:       name,
+		ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
+		Args:       []string{"http", "--body=" + body},
+	})
+}
+
 // TestActorEgressHTTPS covers the same path as TestActorEgress with a TLS
-// origin, where the gateway cannot see inside the request. atenet-egress
-// authorizes the CONNECT against the Actor's actor-identity certificate and
-// then relays raw TCP: it never decrypts, so the TLS session runs end to end
-// between the Actor and the origin.
+// origin, through the gateway's TLS interception.
 func TestActorEgressHTTPS(t *testing.T) {
 	ctx := context.Background()
-	actorName, _ := createAndResumeActor(t, ctx, "egress-https", egressFixture())
+	const originBody = "https origin"
+	target := e2e.DeployServerPod(t, ctx, egressHTTPSTarget("httpstarget", originBody))
+
+	fixture := e2e.EgressFixture()
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-https", fixture, e2e.EgressAllowAll()...)
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -157,13 +198,17 @@ func TestActorEgressHTTPS(t *testing.T) {
 	since := metav1.NewTime(time.Now().Add(-1 * time.Minute))
 
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
-	status, body := fetchThroughEgressActor(t, ctx, router, actorRef, "https://example.com/")
+	url := "https://" + target.SvcName() + "/healthz"
+	status, body := fetchThroughEgressActor(t, ctx, router, actorRef, url)
 	if status != http.StatusOK {
-		t.Fatalf("Actor HTTPS egress fetch returned HTTP %d, want 200; body: %s", status, body)
+		t.Fatalf("Actor HTTPS egress fetch of %s returned HTTP %d, want 200; body: %s", url, status, body)
 	}
-	t.Logf("Actor HTTPS egress fetch succeeded; body: %s", body)
+	if got := decodeEgressFetch(t, body); got.Body != originBody || !got.TLS {
+		t.Errorf("Actor HTTPS egress fetch of %s = %+v, want verified TLS and body %q", url, got, originBody)
+	}
+	t.Logf("Actor HTTPS egress fetch of %s succeeded; body: %s", url, body)
 
-	assertEgressGatewayConnect(t, ctx, since, actorName, "443")
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, "443")
 }
 
 // httpTarget is the origin TestActorEgressNonStandardPort dials: a plain HTTP
@@ -171,7 +216,7 @@ func TestActorEgressHTTPS(t *testing.T) {
 // serves nothing but /healthz, which is all this target is dialed for.
 var httpTarget = e2e.ServerPod{
 	Name:       "httptarget",
-	ImportPath: "github.com/agent-substrate/substrate/internal/e2e/fixtures/testserver",
+	ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
 	Args:       []string{"http"},
 	Port:       8080,
 }
@@ -194,7 +239,8 @@ func TestActorEgressNonStandardPort(t *testing.T) {
 	// resumed Actor idling in the cluster waiting for a destination.
 	target := e2e.DeployServerPod(t, ctx, httpTarget)
 
-	actorName, _ := createAndResumeActor(t, ctx, "egress-port", egressFixture())
+	fixture := e2e.EgressFixture()
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-port", fixture, e2e.EgressAllowAll()...)
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -215,7 +261,7 @@ func TestActorEgressNonStandardPort(t *testing.T) {
 	}
 	t.Logf("Actor egress fetch of %s succeeded", url)
 
-	assertEgressGatewayConnect(t, ctx, since, actorName, strconv.Itoa(httpTarget.Port))
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, strconv.Itoa(httpTarget.Port))
 }
 
 // fetchThroughEgressActor asks the egress demo Actor to fetch url and returns
@@ -229,6 +275,24 @@ func fetchThroughEgressActor(t *testing.T, ctx context.Context, router *e2e.Rout
 	return postThroughEgressActor(t, ctx, router, actorRef, "/", payload)
 }
 
+// egressFetchResponse is the egress demo's answer to a fetch.
+type egressFetchResponse struct {
+	StatusCode int    `json:"statusCode"`
+	Body       string `json:"body"`
+	TLS        bool   `json:"tls"`
+	Error      string `json:"error"`
+}
+
+// decodeEgressFetch parses the body fetchThroughEgressActor returned.
+func decodeEgressFetch(t *testing.T, body []byte) egressFetchResponse {
+	t.Helper()
+	var got egressFetchResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decoding the egress demo's fetch response: %v (body %q)", err, body)
+	}
+	return got
+}
+
 // postThroughEgressActor POSTs payload to path on the egress demo Actor and
 // returns the status and body it answered with. Retries a non-200 response for
 // up to 30s: ResumeActor can return before its route reaches atenet-router's
@@ -236,6 +300,15 @@ func fetchThroughEgressActor(t *testing.T, ctx context.Context, router *e2e.Rout
 // retry also rides out an origin that is reachable but not yet answering, which
 // the Actor reports as a 502.
 func postThroughEgressActor(t *testing.T, ctx context.Context, router *e2e.RouterClient, actorRef resources.ActorRef, path string, payload []byte) (int, []byte) {
+	t.Helper()
+	return postThroughEgressActorUntil(t, ctx, router, actorRef, path, payload, func(status int, _ []byte) bool {
+		return status == http.StatusOK
+	})
+}
+
+// postThroughEgressActorUntil is postThroughEgressActor with the caller
+// deciding which answer is final.
+func postThroughEgressActorUntil(t *testing.T, ctx context.Context, router *e2e.RouterClient, actorRef resources.ActorRef, path string, payload []byte, done func(status int, body []byte) bool) (int, []byte) {
 	t.Helper()
 
 	const timeout = 30 * time.Second
@@ -250,7 +323,7 @@ func postThroughEgressActor(t *testing.T, ctx context.Context, router *e2e.Route
 		if err != nil {
 			t.Fatalf("reading egress response body (HTTP %d): %v", response.StatusCode, err)
 		}
-		if response.StatusCode == http.StatusOK || time.Now().After(deadline) {
+		if done(response.StatusCode, body) || time.Now().After(deadline) {
 			return response.StatusCode, body
 		}
 		t.Logf("POST %s through egress Actor returned HTTP %d; retrying... body: %s", path, response.StatusCode, body)
@@ -258,38 +331,56 @@ func postThroughEgressActor(t *testing.T, ctx context.Context, router *e2e.Route
 	}
 }
 
-// assertEgressGatewayConnect waits for the atenet-egress access log to show a
-// CONNECT to port opened by actorName.
-func assertEgressGatewayConnect(t *testing.T, ctx context.Context, since metav1.Time, actorName, port string) {
+// assertEgressGatewayConnect waits for the atenet-egress log to show a CONNECT
+// to port opened by actorName. Envoy logs authenticated peer details and the
+// negotiated HTTP/2 protocol in its successful CONNECT access record;
+// AgentGateway logs the terminated tunnel.
+func assertEgressGatewayConnect(t *testing.T, ctx context.Context, since metav1.Time, atespace, actorName, port string) {
 	t.Helper()
-	want := fmt.Sprintf("a CONNECT to port %s by actor %s", port, actorName)
-	waitForAccessLog(t, ctx, since, want, func(lines []string) (bool, error) {
+	want := fmt.Sprintf("a CONNECT to port %s by actor %s/%s", port, atespace, actorName)
+	waitForAccessLog(t, ctx, since, want, func(lines []gatewayAccessLogLine) bool {
 		for _, line := range lines {
-			authority, ok := accessLogField(line, "authority")
-			if !ok || !strings.HasSuffix(authority, ":"+port) {
-				continue
+			if egressConnectAccessLogMatches(line, atespace, actorName, port) {
+				t.Logf("egress gateway tunneled the request: %s", line.text)
+				return true
 			}
-			if !strings.Contains(line, "/actor/"+actorName) {
-				continue
-			}
-			t.Logf("egress gateway tunneled the request: %s", line)
-			return true, nil
 		}
-		return false, nil
+		return false
 	})
+}
+
+func egressConnectAccessLogMatches(line gatewayAccessLogLine, atespace, actorName, port string) bool {
+	switch line.container {
+	case "envoy":
+		authority, ok := accessLogField(line.text, "authority")
+		if !ok || !strings.HasSuffix(authority, ":"+port) {
+			return false
+		}
+		if protocol, ok := accessLogField(line.text, "protocol"); !ok || protocol != "HTTP/2" {
+			return false
+		}
+		spiffeSlug := "/worker-for-actor/" + atespace + "/" + actorName
+		return strings.Contains(line.text, spiffeSlug)
+	case "agentgateway":
+		target, ok := accessLogField(line.text, "target")
+		return ok && strings.HasSuffix(target, ":"+port) &&
+			protocolGatewayAccessLogMatches(line, resources.ActorRef{Atespace: atespace, Name: actorName}, target, true)
+	}
+	return false
+}
+
+type gatewayAccessLogLine struct {
+	container string
+	text      string
 }
 
 // waitForAccessLog polls the atenet-egress access log, across every gateway
 // replica, until predicate accepts the lines written since.
-func waitForAccessLog(t *testing.T, ctx context.Context, since metav1.Time, want string, predicate func(lines []string) (bool, error)) {
+func waitForAccessLog(t *testing.T, ctx context.Context, since metav1.Time, want string, predicate func(lines []gatewayAccessLogLine) bool) {
 	t.Helper()
+	gatewayNamespace := e2e.SystemNamespace()
 	const (
-		gatewayNamespace = "ate-system"
-		gatewaySelector  = "app=atenet-egress"
-		gatewayContainer = "envoy"
-		// The access log's line prefix, from the HttpConnectionManager
-		// text_format_source in manifests/ate-install/atenet-egress.yaml.
-		accessLogPrefix = "[egress] "
+		gatewaySelector = "app=atenet-egress"
 	)
 
 	clients := e2e.GetClients()
@@ -305,32 +396,43 @@ func waitForAccessLog(t *testing.T, ctx context.Context, since metav1.Time, want
 	const timeout = 30 * time.Second
 	deadline := time.Now().Add(timeout)
 	for {
-		var lines []string
+		var lines []gatewayAccessLogLine
 		for _, pod := range pods.Items {
+			container := ""
+			for _, candidate := range pod.Spec.Containers {
+				if candidate.Name == "envoy" || candidate.Name == "agentgateway" {
+					container = candidate.Name
+					break
+				}
+			}
+			if container == "" {
+				t.Fatalf("egress gateway pod %s has neither an Envoy nor AgentGateway container", pod.Name)
+			}
 			logs, err := clients.K8s.CoreV1().Pods(gatewayNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				Container: gatewayContainer,
+				Container: container,
 				SinceTime: &since,
 			}).DoRaw(ctx)
 			if err != nil {
 				t.Fatalf("reading logs of %s/%s: %v", gatewayNamespace, pod.Name, err)
 			}
 			for line := range strings.SplitSeq(string(logs), "\n") {
-				if strings.Contains(line, accessLogPrefix) {
-					lines = append(lines, line)
+				if (container == "envoy" && strings.Contains(line, "[egress] ")) ||
+					(container == "agentgateway" && (strings.Contains(line, "substrate.connect.authority=") ||
+						strings.Contains(line, "CONNECT tunnel terminated"))) {
+					lines = append(lines, gatewayAccessLogLine{container: container, text: line})
 				}
 			}
 		}
 
-		matched, err := predicate(lines)
-		if err != nil {
-			t.Fatalf("looking for %s in the atenet-egress access log: %v", want, err)
-		}
-		if matched {
+		if predicate(lines) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no atenet-egress access-log line for %s after %v; lines seen:\n%s",
-				want, timeout, strings.Join(lines, "\n"))
+			seen := make([]string, 0, len(lines))
+			for _, line := range lines {
+				seen = append(seen, line.text)
+			}
+			t.Fatalf("no atenet-egress access-log line for %s after %v; lines seen:\n%s", want, timeout, strings.Join(seen, "\n"))
 		}
 		time.Sleep(1 * time.Second)
 	}
@@ -339,58 +441,67 @@ func waitForAccessLog(t *testing.T, ctx context.Context, since metav1.Time, want
 // accessLogField returns the value of the key=value field named key in an Envoy
 // access log line whose fields are separated by spaces.
 func accessLogField(line, key string) (string, bool) {
-	_, rest, ok := strings.Cut(line, key+"=")
-	if !ok {
-		return "", false
+	for field := range strings.FieldsSeq(line) {
+		fieldKey, value, ok := strings.Cut(field, "=")
+		if ok && fieldKey == key {
+			return strings.Trim(value, `"`), true
+		}
 	}
-	value, _, _ := strings.Cut(rest, " ")
-	return value, true
+	return "", false
 }
 
-func createAndResumeActor(t *testing.T, ctx context.Context, prefix string, template e2e.Fixture) (string, *ateapipb.Actor) {
+// createAndResumeActorWithEgress creates an actor from template, gives it an
+// EgressPolicy of exactly rules (none leaves it without one) and resumes it.
+func createAndResumeActorWithEgress(t *testing.T, ctx context.Context, prefix string, template e2e.Fixture, rules ...*ateapi.EgressRule) (string, string, *ateapi.Actor) {
 	t.Helper()
-	actor := &ateapipb.Actor{ActorTemplate: &ateapipb.ObjectRef{Atespace: template.Namespace, Name: template.Name}}
-	return createAndResume(t, ctx, prefix, actor, template.Namespace+"/"+template.Name, template.DeployWith)
+	actor := &ateapi.Actor{ActorTemplate: &ateapi.ObjectRef{Atespace: template.Namespace, Name: template.Name}}
+	return createAndResume(t, ctx, prefix, actor, template.Namespace+"/"+template.Name, template.DeployWith, rules)
 }
 
 // createAndResumeSubstrateActor is createAndResumeActor for a substrate
 // ActorTemplate fixture, referenced by atespace/name instead of the CRD pair.
-func createAndResumeSubstrateActor(t *testing.T, ctx context.Context, prefix string, template e2e.SubstrateFixture) (string, *ateapipb.Actor) {
+func createAndResumeSubstrateActor(t *testing.T, ctx context.Context, prefix string, template e2e.SubstrateFixture) (string, string, *ateapi.Actor) {
 	t.Helper()
-	actor := &ateapipb.Actor{ActorTemplate: &ateapipb.ObjectRef{Atespace: template.Atespace, Name: template.Name}}
-	return createAndResume(t, ctx, prefix, actor, template.Atespace+"/"+template.Name, template.DeployWith)
+	actor := &ateapi.Actor{ActorTemplate: &ateapi.ObjectRef{Atespace: template.Atespace, Name: template.Name}}
+	return createAndResume(t, ctx, prefix, actor, template.Atespace+"/"+template.Name, template.DeployWith, e2e.EgressAllowAll())
 }
 
-func createAndResume(t *testing.T, ctx context.Context, prefix string, actor *ateapipb.Actor, source, deployWith string) (string, *ateapipb.Actor) {
+// createAndResume creates the actor, gives it an EgressPolicy with rules (none
+// when rules is nil), and resumes it. The policy goes in before the resume so
+// the actor's first outbound connection already finds it.
+func createAndResume(t *testing.T, ctx context.Context, prefix string, actor *ateapi.Actor, source, deployWith string, rules []*ateapi.EgressRule) (string, string, *ateapi.Actor) {
 	t.Helper()
 	clients := e2e.GetClients()
 	actorName := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
-	actorRef := &ateapipb.ObjectRef{Atespace: networkingAtespace, Name: actorName}
+	actorRef := &ateapi.ObjectRef{Atespace: networkingAtespace, Name: actorName}
 
 	t.Logf("creating actor %s/%s", networkingAtespace, actorName)
-	_, _ = clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
-		Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: networkingAtespace}},
+	_, _ = clients.SubstrateAPI.CreateAtespace(ctx, &ateapi.CreateAtespaceRequest{
+		Atespace: &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: networkingAtespace}},
 	})
-	actor.Metadata = &ateapipb.ResourceMetadata{Atespace: networkingAtespace, Name: actorName}
-	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: actor}); err != nil {
+	actor.Metadata = &ateapi.ResourceMetadata{Atespace: networkingAtespace, Name: actorName}
+	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapi.CreateActorRequest{Actor: actor}); err != nil {
 		t.Fatalf("CreateActor from %s: %v (deploy the fixture with %s)", source, err, deployWith)
 	}
 	t.Cleanup(func() {
-		_, _ = clients.SubstrateAPI.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{Actor: actorRef})
-		_, _ = clients.SubstrateAPI.DeleteActor(context.Background(), &ateapipb.DeleteActorRequest{Actor: actorRef})
+		_, _ = clients.SubstrateAPI.SuspendActor(context.Background(), &ateapi.SuspendActorRequest{Actor: actorRef})
+		_, _ = clients.SubstrateAPI.DeleteActor(context.Background(), &ateapi.DeleteActorRequest{Actor: actorRef})
 	})
+	if rules != nil {
+		e2e.EnsureEgressPolicy(t, ctx, clients, actorRef, rules...)
+	}
 
-	resumeResponse, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{Actor: actorRef})
+	resumeResponse, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapi.ResumeActorRequest{Actor: actorRef})
 	if err != nil {
 		t.Fatalf("ResumeActor: %v", err)
 	}
 	t.Logf("resumed actor %s/%s", networkingAtespace, actorName)
-	return actorName, resumeResponse.GetActor()
+	return resumeResponse.GetActor().GetMetadata().GetAtespace(), resumeResponse.GetActor().GetMetadata().GetName(), resumeResponse.GetActor()
 }
 
 func mustRouterClient(t *testing.T, ctx context.Context) *e2e.RouterClient {
 	t.Helper()
-	router, err := e2e.NewRouterClient(ctx)
+	router, err := e2e.NewRouterClient(t, ctx)
 	if err != nil {
 		t.Fatalf("NewRouterClient: %v", err)
 	}
@@ -428,7 +539,7 @@ func waitForRouteReady(t *testing.T, what string, request func() (*http.Response
 	}
 }
 
-func assertDirectActorAccess(t *testing.T, ctx context.Context, clients *e2e.Clients, actor *ateapipb.Actor) {
+func assertDirectActorAccess(t *testing.T, ctx context.Context, clients *e2e.Clients, actor *ateapi.Actor) {
 	t.Helper()
 	if actor.GetStatus().GetWorkerAssignment().GetWorkerNamespace() == "" || actor.GetStatus().GetWorkerAssignment().GetWorkerPod() == "" {
 		t.Fatalf("resumed Actor has no worker pod assignment: %+v", actor)
@@ -451,4 +562,430 @@ func assertDirectActorAccess(t *testing.T, ctx context.Context, clients *e2e.Cli
 		t.Fatalf("direct Actor access through %s/%s:80 unexpectedly succeeded; body: %s", actor.GetStatus().GetWorkerAssignment().GetWorkerNamespace(), actor.GetStatus().GetWorkerAssignment().GetWorkerPod(), body)
 	}
 	t.Logf("direct Actor access through %s/%s:80 was blocked as expected: %v", actor.GetStatus().GetWorkerAssignment().GetWorkerNamespace(), actor.GetStatus().GetWorkerAssignment().GetWorkerPod(), err)
+}
+
+// TestActorEgressHTTPSNonStandardPort verifies HTTP/1.1 inside TLS while
+// preserving the original destination port through the egress tunnel.
+func TestActorEgressHTTPSNonStandardPort(t *testing.T) {
+	ctx := t.Context()
+	const expectedBody = "https nonstandard origin"
+	target, address, _ := prepareProtocolOrigin(t, ctx, e2e.ServerPod{
+		Name:       "https-origin",
+		ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
+		Args:       []string{"http", "--body=" + expectedBody},
+		Port:       8080,
+		TLSPort:    8443,
+	}, true)
+	actorName, router, actorRef := prepareProtocolActor(t, ctx, "https-port")
+	since := metav1.NewTime(time.Now().Add(-time.Minute))
+	raw := postEgressOnce(t, ctx, router, actorRef, "/", map[string]any{
+		"url": "https://" + address + "/healthz", "http1": true,
+	})
+	var got struct {
+		StatusCode int    `json:"statusCode"`
+		Body       string `json:"body"`
+		Protocol   string `json:"protocol"`
+		TLS        bool   `json:"tls"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decoding HTTPS observation: %v", err)
+	}
+	if got.Error != "" || got.StatusCode != http.StatusOK || got.Body != expectedBody || got.Protocol != "HTTP/1.1" || !got.TLS {
+		t.Errorf("HTTPS observation = %+v; want verified TLS, HTTP/1.1, status 200 and body %q", got, expectedBody)
+	}
+	assertProtocolGateway(t, ctx, since, actorName, target.TLSAddress())
+}
+
+func prepareProtocolOrigin(t *testing.T, ctx context.Context, spec e2e.ServerPod, encrypted bool) (e2e.Server, string, string) {
+	t.Helper()
+	spec.Namespace = e2e.CreateNamespace(t).Name
+	registerOriginDiagnostics(t, spec.Namespace, spec.Name)
+	var reserved e2e.Server
+	var rootCA string
+	if encrypted {
+		if spec.TLSPort == 0 {
+			t.Fatalf("encrypted origin %s sets no TLSPort to publish its HTTPS listener on", spec.Name)
+		}
+		reserved = e2e.CreateServerService(t, ctx, spec)
+		// The unified gateway verifies local origins against service-DNS roots.
+		secret, err := e2e.GetClients().K8s.CoreV1().Secrets("podcertificate-controller-system").Get(ctx, "service-dns-ca-pool", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("reading service-DNS CA pool: %v", err)
+		}
+		pool, err := localca.Unmarshal(secret.Data["pool"])
+		if err != nil {
+			t.Fatalf("parsing service-DNS CA pool: %v", err)
+		}
+		if len(pool.CAs) == 0 {
+			t.Fatal("service-DNS CA pool is empty")
+		}
+		material := testcert.ServerTLSWithCA(t, pool.CAs[0], net.ParseIP(reserved.ClusterIP), spec.Name+"."+spec.Namespace+".svc.cluster.local")
+		rootCA = string(material.RootCA)
+		originSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "origin-tls", Namespace: spec.Namespace}, Type: corev1.SecretTypeTLS,
+			Data: map[string][]byte{corev1.TLSCertKey: material.Certificate, corev1.TLSPrivateKeyKey: material.PrivateKey}}
+		if _, err := e2e.GetClients().K8s.CoreV1().Secrets(spec.Namespace).Create(ctx, originSecret, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("creating origin credentials: %v", err)
+		}
+		spec.Volumes = []corev1.Volume{{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: originSecret.Name}}}}
+		spec.VolumeMounts = []corev1.VolumeMount{{Name: "tls", MountPath: "/run/origin-tls", ReadOnly: true}}
+		spec.Args = append(spec.Args, "--tls-cert=/run/origin-tls/tls.crt", "--tls-key=/run/origin-tls/tls.key")
+	}
+	target := e2e.DeployServerPod(t, ctx, spec)
+	if encrypted && target.ClusterIP != reserved.ClusterIP {
+		t.Fatalf("Service IP changed from %s to %s after certificate issuance", reserved.ClusterIP, target.ClusterIP)
+	}
+	e2e.WaitForServerEndpoint(t, ctx, spec)
+	family := "IPv6"
+	if net.ParseIP(target.ClusterIP).To4() != nil {
+		family = "IPv4"
+	}
+	dialed := target.Address()
+	if encrypted {
+		dialed = target.TLSAddress()
+	}
+	t.Logf("origin %s/%s at %s (%s), TLS=%v", target.Namespace, spec.Name, dialed, family, encrypted)
+	address := protocolOriginRequest(target)
+	return target, address, rootCA
+}
+
+const (
+	originDiagnosticLogLines   = 80
+	originDiagnosticLogBytes   = 16 << 10
+	originDiagnosticFieldBytes = 1024
+	originDiagnosticItems      = 20
+)
+
+func registerOriginDiagnostics(t *testing.T, namespace, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		collectOriginDiagnostics(t, ctx, namespace, name)
+	})
+}
+
+func collectOriginDiagnostics(t *testing.T, ctx context.Context, namespace, name string) {
+	t.Helper()
+	clients := e2e.GetClients().K8s
+	observed := time.Now().UTC().Format(time.RFC3339Nano)
+	t.Logf("origin diagnostics observed_at=%s namespace=%s name=%s", observed, namespace, name)
+
+	pod, err := clients.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("origin diagnostics: get Pod %s/%s: %v", namespace, name, err)
+	} else {
+		deletion := ""
+		if pod.DeletionTimestamp != nil {
+			deletion = formatOriginTimestamp(*pod.DeletionTimestamp)
+		}
+		t.Logf("origin Pod status: uid=%s phase=%s pod_ip=%s host_ip=%s reason=%s message=%q created=%s deletion=%s containers=%s", pod.UID, pod.Status.Phase, pod.Status.PodIP, pod.Status.HostIP, pod.Status.Reason, boundedOriginDiagnosticField(pod.Status.Message), formatOriginTimestamp(pod.CreationTimestamp), deletion, formatOriginContainerStatuses(pod.Status.ContainerStatuses))
+		for _, previous := range []bool{false, true} {
+			logs, logErr := clients.CoreV1().Pods(namespace).GetLogs(name, &corev1.PodLogOptions{
+				Previous:   previous,
+				TailLines:  ptrInt64(originDiagnosticLogLines),
+				LimitBytes: ptrInt64(originDiagnosticLogBytes),
+				Timestamps: true,
+			}).DoRaw(ctx)
+			label := "current"
+			if previous {
+				label = "previous"
+			}
+			if logErr != nil {
+				t.Logf("origin %s logs unavailable: %v", label, logErr)
+				continue
+			}
+			t.Logf("origin %s logs (bounded):\n%s", label, boundedOriginDiagnosticText(string(logs), originDiagnosticLogLines, originDiagnosticLogBytes))
+		}
+	}
+
+	service, err := clients.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("origin diagnostics: get Service %s/%s: %v", namespace, name, err)
+	} else {
+		t.Logf("origin Service: cluster_ip=%s ports=%s selector=%s", service.Spec.ClusterIP, formatOriginServicePorts(service.Spec.Ports), formatOriginSelector(service.Spec.Selector))
+	}
+
+	slices, err := clients.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{LabelSelector: discoveryv1.LabelServiceName + "=" + name, Limit: 20})
+	if err != nil {
+		t.Logf("origin diagnostics: list EndpointSlices for %s/%s: %v", namespace, name, err)
+	} else {
+		for _, slice := range slices.Items {
+			t.Logf("origin EndpointSlice: name=%s uid=%s created=%s ports=%s endpoints=%s", slice.Name, slice.UID, formatOriginTimestamp(slice.CreationTimestamp), formatOriginEndpointPorts(slice.Ports), formatOriginEndpoints(slice.Endpoints))
+		}
+	}
+
+	events, err := clients.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{Limit: 50})
+	if err != nil {
+		t.Logf("origin diagnostics: list namespace events %s: %v", namespace, err)
+		return
+	}
+	for _, event := range events.Items {
+		if event.InvolvedObject.Name != name {
+			continue
+		}
+		t.Logf("origin event: type=%s reason=%s message=%q count=%d last=%s", event.Type, event.Reason, boundedOriginDiagnosticField(event.Message), event.Count, event.LastTimestamp.UTC().Format(time.RFC3339Nano))
+	}
+}
+
+func ptrInt64(value int) *int64 {
+	result := int64(value)
+	return &result
+}
+
+func boundedOriginDiagnosticText(value string, maxLines, maxBytes int) string {
+	lines := strings.Split(value, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	result := strings.Join(lines, "\n")
+	if len(result) > maxBytes {
+		result = result[len(result)-maxBytes:]
+	}
+	return result
+}
+
+func boundedOriginDiagnosticField(value string) string {
+	if len(value) <= originDiagnosticFieldBytes {
+		return value
+	}
+	return value[:originDiagnosticFieldBytes-3] + "..."
+}
+
+func formatOriginServicePorts(ports []corev1.ServicePort) string {
+	values := make([]string, 0, len(ports))
+	for _, port := range ports[:min(len(ports), originDiagnosticItems)] {
+		values = append(values, fmt.Sprintf("%s/%d->%s/%s", port.Name, port.Port, port.TargetPort.String(), port.Protocol))
+	}
+	return boundedOriginDiagnosticField(strings.Join(values, ","))
+}
+
+func formatOriginSelector(selector map[string]string) string {
+	values := make([]string, 0, len(selector))
+	for key, value := range selector {
+		values = append(values, boundedOriginDiagnosticField(key)+"="+boundedOriginDiagnosticField(value))
+	}
+	slices.Sort(values)
+	if len(values) > originDiagnosticItems {
+		values = values[:originDiagnosticItems]
+	}
+	return boundedOriginDiagnosticField(strings.Join(values, ","))
+}
+
+func formatOriginEndpointPorts(ports []discoveryv1.EndpointPort) string {
+	values := make([]string, 0, len(ports))
+	for _, port := range ports {
+		protocol := ""
+		if port.Protocol != nil {
+			protocol = string(*port.Protocol)
+		}
+		values = append(values, fmt.Sprintf("%s/%d/%s", boundedOriginDiagnosticField(valueString(port.Name)), valueInt32(port.Port), protocol))
+	}
+	if len(values) > originDiagnosticItems {
+		values = values[:originDiagnosticItems]
+	}
+	return boundedOriginDiagnosticField(strings.Join(values, ","))
+}
+
+func formatOriginEndpoints(endpoints []discoveryv1.Endpoint) string {
+	values := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		ready, terminating := "unknown", "unknown"
+		if endpoint.Conditions.Ready != nil {
+			ready = strconv.FormatBool(*endpoint.Conditions.Ready)
+		}
+		if endpoint.Conditions.Terminating != nil {
+			terminating = strconv.FormatBool(*endpoint.Conditions.Terminating)
+		}
+		uid := ""
+		if endpoint.TargetRef != nil {
+			uid = string(endpoint.TargetRef.UID)
+		}
+		addresses := make([]string, 0, len(endpoint.Addresses))
+		for _, address := range endpoint.Addresses {
+			addresses = append(addresses, boundedOriginDiagnosticField(address))
+		}
+		if len(addresses) > originDiagnosticItems {
+			addresses = addresses[:originDiagnosticItems]
+		}
+		values = append(values, boundedOriginDiagnosticField(fmt.Sprintf("addresses=%s uid=%s ready=%s terminating=%s", strings.Join(addresses, ","), uid, ready, terminating)))
+	}
+	if len(values) > originDiagnosticItems {
+		values = values[:originDiagnosticItems]
+	}
+	return strings.Join(values, "; ")
+}
+
+func formatOriginTimestamp(value metav1.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func formatOriginContainerStatuses(statuses []corev1.ContainerStatus) string {
+	values := make([]string, 0, len(statuses))
+	for _, status := range statuses[:min(len(statuses), originDiagnosticItems)] {
+		values = append(values, boundedOriginDiagnosticField(fmt.Sprintf("%s ready=%t restarts=%d", status.Name, status.Ready, status.RestartCount)))
+	}
+	return strings.Join(values, "; ")
+}
+
+func valueInt32(value *int32) int32 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func valueString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+// protocolOriginRequest is the host:port an actor fetches target at: its DNS
+// name, which the unified gateway needs for SNI, on its TLS port if it has one.
+// The CONNECT authority in the gateway's access log is the ClusterIP on the
+// same port, target.TLSAddress() or target.Address().
+func protocolOriginRequest(target e2e.Server) string {
+	port := target.Port
+	if target.TLSPort != 0 {
+		port = target.TLSPort
+	}
+	return net.JoinHostPort(target.Name+"."+target.Namespace+".svc.cluster.local", strconv.Itoa(port))
+}
+
+func TestProtocolOriginRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name, ip string
+		tlsPort  int
+		want     string
+	}{
+		{"IPv4", "10.0.0.7", 0, "origin.test.svc.cluster.local:8080"},
+		{"IPv6", "fd00::7", 0, "origin.test.svc.cluster.local:8080"},
+		{"TLS", "10.0.0.7", 8443, "origin.test.svc.cluster.local:8443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := e2e.Server{Name: "origin", Namespace: "test", ClusterIP: tc.ip, Port: 8080, TLSPort: tc.tlsPort}
+			if got, want := protocolOriginRequest(target), tc.want; got != want {
+				t.Fatalf("origin request = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestBoundedOriginDiagnosticText(t *testing.T) {
+	got := boundedOriginDiagnosticText("one\ntwo\nthree\nfour", 2, 16)
+	if got != "three\nfour" {
+		t.Fatalf("bounded diagnostic text = %q, want %q", got, "three\\nfour")
+	}
+	if got := boundedOriginDiagnosticText("123456789", 10, 4); got != "6789" {
+		t.Fatalf("byte-bounded diagnostic text = %q, want %q", got, "6789")
+	}
+}
+
+func prepareProtocolActor(t *testing.T, ctx context.Context, prefix string) (string, *e2e.RouterClient, resources.ActorRef) {
+	t.Helper()
+	https8443 := e2e.EgressAllowHTTPS("*")
+	https8443.Https.Ports = &ateapi.Ports{Numbers: []int32{8443}}
+	rules := append(e2e.EgressAllowAll(), https8443)
+	_, actorName, _ := createAndResumeActorWithEgress(t, ctx, prefix, egressFixture(), rules...)
+	router := mustRouterClient(t, ctx)
+	t.Cleanup(func() { router.Close() })
+	ref := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	waitForRouteReady(t, "egress actor ingress readiness", func() (*http.Response, error) { return router.Get(ctx, ref, "/readyz") })
+	return actorName, router, ref
+}
+
+// postEgressOnce starts the measured operation only after readiness. Unlike
+// postThroughEgressActor, an outbound failure is never retried.
+func postEgressOnce(t *testing.T, ctx context.Context, router *e2e.RouterClient, actorRef resources.ActorRef, path string, input any) []byte {
+	return postEgressWithStatus(t, ctx, router, actorRef, path, input, http.StatusOK)
+}
+
+func postEgressWithStatus(t *testing.T, ctx context.Context, router *e2e.RouterClient, actorRef resources.ActorRef, path string, input any, wantStatus int) []byte {
+	t.Helper()
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("encoding actor operation: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	response, err := router.PostJSON(ctx, actorRef, path, payload)
+	if err != nil {
+		t.Fatalf("actor %s operation %s transport failed: %v", actorRef.Name, path, err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil {
+		t.Fatalf("reading actor operation: %v", err)
+	}
+	if len(raw) > 1<<20 {
+		t.Fatal("actor operation response exceeds 1 MiB")
+	}
+	if response.StatusCode != wantStatus {
+		t.Fatalf("actor %s operation %s returned HTTP %d, want %d: %s", actorRef.Name, path, response.StatusCode, wantStatus, raw)
+	}
+	return raw
+}
+
+func assertProtocolGateway(t *testing.T, ctx context.Context, since metav1.Time, actorName, authority string) {
+	t.Helper()
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	identity := resources.WorkerForActorSPIFFEID(actorRef).String()
+	waitForAccessLog(t, ctx, since, "successful gateway traffic for "+identity+" to "+authority, func(lines []gatewayAccessLogLine) bool {
+		for _, entry := range lines {
+			if protocolGatewayAccessLogMatches(entry, actorRef, authority, false) {
+				t.Logf("gateway evidence: %s", entry.text)
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func protocolGatewayAccessLogMatches(entry gatewayAccessLogLine, actorRef resources.ActorRef, authority string, allowOpaque bool) bool {
+	switch entry.container {
+	case "envoy":
+		gotAuthority, _ := accessLogField(entry.text, "authority")
+		code, _ := accessLogField(entry.text, "code")
+		peers, _ := accessLogField(entry.text, "peer_san")
+		if gotAuthority != authority || code != "200" {
+			return false
+		}
+		for peer := range strings.SplitSeq(peers, ",") {
+			if peer == resources.WorkerForActorSPIFFEID(actorRef).String() {
+				return true
+			}
+		}
+	case "agentgateway":
+		gotAuthority, _ := accessLogField(entry.text, "substrate.connect.authority")
+		if allowOpaque && strings.Contains(entry.text, "CONNECT tunnel terminated") {
+			// Baseline TCP routes carry opaque CONNECT traffic and therefore do
+			// not emit an HTTP status. The accepted CONNECT record identifies the
+			// authenticated actor and destination; the operation assertion above
+			// supplies end-to-end success.
+			target, targetOK := accessLogField(entry.text, "target")
+			tunnelActor, actorOK := accessLogField(entry.text, "actor_name")
+			tunnelSpace, spaceOK := accessLogField(entry.text, "atespace")
+			_, errorOK := accessLogField(entry.text, "error")
+			return targetOK && target == authority && actorOK && tunnelActor == actorRef.Name && spaceOK && tunnelSpace == actorRef.Atespace && !errorOK
+		}
+		gotActor, _ := accessLogField(entry.text, "ate.actor.name")
+		gotAtespace, _ := accessLogField(entry.text, "ate.atespace")
+		status, _ := accessLogField(entry.text, "http.status")
+		if gotAuthority != authority || gotActor != actorRef.Name || gotAtespace != actorRef.Atespace {
+			return false
+		}
+		if status == "200" || status == "101" {
+			return true
+		}
+		return false
+	}
+	return false
 }

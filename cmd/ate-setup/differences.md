@@ -1,16 +1,16 @@
 # ate-setup vs. the install shell scripts
 
 `ate-setup` is a Go port of `hack/install-ate.sh`, the seven
-`hack/install-demo-*.sh` scripts it sources, and `hack/setup-csi-*-kind.sh`.
+`hack/install-demo-*.sh` scripts it sourced, `hack/setup-csi-*-kind.sh`, and
+`hack/install-microvm-deps.sh`.
 
-The shell scripts are still present and still work; this is an additive
-alternative to them, not yet a replacement. Retiring them behind compatibility
-shims is left to a follow-up, so for now the two installers coexist and either
-can be used against the same cluster. See [`commands.md`](commands.md) for the
-flag-by-flag mapping between them.
+The port has replaced them. `hack/install-ate.sh` and the demo, CSI, and
+microVM asset scripts are deleted. See [`commands.md`](commands.md) for the
+commands.
 
-This document covers what changed *behind* that mapping. For anything not listed
-here, the port is intended to be behavior-preserving.
+This document covers the design decisions of the port, against the shell it
+replaced. For anything not listed here, the port is intended to be
+behavior-preserving.
 
 ## What is deliberately unchanged
 
@@ -18,28 +18,30 @@ These were treated as contracts and reproduced exactly:
 
 - **Step log lines.** `log.Step` prints the same cyan `[step]: name` and the
   same step names (`deploy_ate_system`, `create_api_server_env_vars`,
-  `demo-counter_deploy (with_external_volume=true)`), so CI log scrapers keep
-  working.
+  `demo-counter_deploy`), so CI log scrapers keep working.
 - **Manifest ordering.** Applying a directory is non-recursive and lexical, as
-  `kubectl apply -f <dir>` was. `deploy_ate_system` depended on that ordering
+  `kubectl apply -f <dir>` was. `delete_ate_system` depends on that ordering
   and the shell comments called out specific filename hazards, so
   `kube.LoadPath` keeps it.
 - **Overlay selection.** `steps.SystemOverlay` is the same product of
   kind × router that `render_ate_system_manifests` computed with
-  nested `if`s.
+  nested `if`s, including the plain GKE install rendering the `base`
+  kustomization rather than the raw directory, which would re-apply the
+  podcertificate-controller and undo its size10 flags and worker count.
 - **Timeouts.** 60s namespace, 60s rollout (`--rollout-timeout` /
   `ATE_INSTALL_ROLLOUT_TIMEOUT`, as in the scripts), 120s for the
-  podcertificate-controller and CSI waits the scripts fixed there, 300s demo.
-  `--rollout-timeout` now reaches the 120s waits too, which it did not in the
-  shell, but only when it is passed: `Config.WaitTimeout` leaves each site at
-  its historical value otherwise, so the 60s default cannot shorten the slow
-  bootstrap paths.
+  podcertificate-controller and CSI waits the scripts fixed there, 300s for the
+  trust bundles (one deadline shared across both), 300s demo.
+  `--rollout-timeout` now reaches the 120s and 300s waits too, which it did not
+  in the shell, but only when it is passed: `Config.WaitTimeout` leaves each
+  site at its historical value otherwise, so the 60s default cannot shorten the
+  slow bootstrap paths.
 - **Rendered bytes.** `authentication.yaml` is trimmed of its trailing newline
-  because the shell built it inside `$(...)`, which strips them. Switching
-  between the two installers must not rewrite the ConfigMap.
-- **ko's ldflags.** `make ldflags` emitted `-X=<version pkg>.Version=$(git
+  because the shell built it inside `$(...)`, which strips them. Installing
+  over a shell-installed cluster must not rewrite the ConfigMap.
+- **ko's ldflags.** The shell scripts stamped `-X=<version pkg>.Version=$(git
   describe --tags --always --dirty)`; `ko.Runner.ldflags` computes the identical
-  string without depending on make.
+  string.
 
 ## Execution model
 
@@ -48,17 +50,19 @@ These were treated as contracts and reproduced exactly:
 | Actions per run | many, one per flag, in command-line order | exactly one subcommand |
 | Argument errors | detected when the dispatch loop reaches the flag, after earlier actions already ran | rejected by cobra before anything runs |
 | Value flags | pre-scanned so they could appear anywhere | positional, per-command, standard flag parsing |
-| Configuration | env vars (`ATE_INSTALL_KIND`, `ATE_ATENET_ROUTER`, `KUBECTL_CONTEXT`, …) | flags, with the env vars still honored as defaults |
+| Configuration | env vars (`ATE_INSTALL_KIND`, `ATE_ATENET_DATAPLANE`, `KUBECTL_CONTEXT`, …) | flags, with the env vars still honored as defaults |
 | Repository root | `git rev-parse --show-toplevel`, then `cd` | walk up for `go.mod`; no `chdir`, all paths absolute |
 
 The one-action-per-run change is the most visible: a line that passed
 `--deploy-ate-system --deploy-demo-counter` becomes two `ate-setup` calls.
-`hack/install-ate.sh` still accepts the combined form.
 
-Invalid input now fails before any cluster mutation. `--atenet-router=nginx`
+Invalid input now fails before any cluster mutation. `--atenet-dataplane=nginx`
 used to be caught by a pre-scan validation pass; `--worker-count 0` was not
 caught at all and surfaced from inside `deploy_locust.sh` after the microvm
-dependencies had already been installed.
+dependencies had already been installed. `--setup-csi` is checked the same way:
+an unknown driver is rejected during argument validation, before the
+configuration is even loaded, and `--setup-csi=hostpath` against a cluster that
+is not Kind is refused before `deploy ate-system` installs anything.
 
 `.ate-dev-env.sh` is still sourced through bash — a developer's file can contain
 arbitrary shell — but its variables are then layered under the process
@@ -76,15 +80,20 @@ Still required, and why:
 | `ko` | building and publishing images (`ko resolve` only); not used with `--image-repo` |
 | `go` | locating the pinned `ko` tool, exactly as `hack/run-tool.sh` does; not used with `--image-repo` |
 | `git` | the `git describe` version stamp passed to ko; not used with `--image-repo` |
-| `docker` | the kind CSI setup (`docker exec` into the node) and the claude-code-multiplex workload build |
-| `gcloud` | GKE `get-credentials`, only when `PROJECT_ID` is set and no context was given |
+| `docker` | the kind CSI setup (`docker exec` into the node), staging microVM assets into Kind's `rustfs`, and the claude-code-multiplex workload build |
+| `gcloud` | GKE `get-credentials` (when `PROJECT_ID` is set and no context was given) and `gcloud storage` when staging microVM assets on GKE |
 | `bash` | sourcing `.ate-dev-env.sh` |
 
-Two shell scripts are still invoked rather than reimplemented, because they
-orchestrate image builds, asset assembly, and object-store staging that are out
-of scope for an installer: `benchmarking/deploy_locust.sh` and
-`hack/install-microvm-deps.sh`. They receive `Config.ScriptEnv()`, which
-reconstructs the environment the shell installer would have exported to them.
+One shell script is still invoked rather than reimplemented, because it
+orchestrates benchmark image builds and Locust stack deployment:
+`benchmarking/deploy_locust.sh`. It receives `Config.ScriptEnv()`, which
+reconstructs the environment the shell installer would have exported to it, and
+is fronted by `deploy`/`delete benchmarks`.
+
+The microVM asset assembly (`kata-static` `.tar.zst` extraction and
+`cloud-hypervisor` download), object-store staging (`rustfs` on Kind,
+`<BUCKET_NAME>-assets` on GKE), and `microvm` `SandboxConfig` apply now run in
+Go as part of `deploy ate-system` (and `deploy sandboxconfig`).
 
 `ko` is no longer asked to apply anything. The scripts ran `run_ko apply`, which
 made ko shell out to kubectl and forced the awkward `-- --context=` special case
@@ -102,7 +111,7 @@ Manifests carry `ko://<import path>` references either way. With `--image-repo`
 each is looked up in `images.Components` and rewritten to
 `<repo>/<base of the import path>:<tag>`, which is ko's own
 `--base-import-paths` naming and so is how the release images are already
-published — `ateapi`, `atelet`, `atenet`, `ateom-gvisor`, and the rest.
+published — `ateapi`, `atelet`, `atenet`, `ateworker-gvisor`, and the rest.
 `--image-tag` supplies the tag. Each of the two requires the other: a tag with
 no repository to pull from would be dropped, leaving a build from source that
 looks like the release the tag names.
@@ -112,19 +121,13 @@ The rewritten reference then keeps that tag and adds the digest it names, as
 tagged release. Resolving the digest is one HEAD request per image, cached for
 the install, so `--image-repo` needs read access to the registry from wherever
 `ate-setup` runs rather than only from the cluster. It is not optional: an
-ActorTemplate's container image, an image volume's reference, and a
-SandboxConfig's `pauseImage` each carry the CEL rule `self.contains('@')`, so an
-unpinned reference is rejected by admission and every demo fails to deploy.
+ActorTemplate's container image and an image volume's reference each carry the
+CEL rule `self.contains('@')`, so an unpinned reference is rejected by admission
+and every demo fails to deploy.
 Pinning also gives a pre-built install the property a `ko` install had for free,
 that a tag moving afterwards cannot change what is running.
 
-That tag also becomes the substrate version, which names the atelet DaemonSet
-and sets the node label partitioning nodes across coexisting versions. It has
-to: that label must describe the atelet actually running, which came from the
-image, not the checkout `git describe` happens to be sitting on. `VERSION`
-overrides it, as it always has.
-
-The rewrite is textual, one token at a time, matching `SubstituteVersion` above.
+The rewrite is textual, one token at a time.
 A reference is replaced wherever it appears, so the code needs no list of which
 fields hold images — `workerImage:` in a CRD spec is rewritten like any other —
 and the applied manifest differs from the checked-in YAML only in the image
@@ -140,7 +143,17 @@ listed package would otherwise inherit its image. `images.Components` is checked
 against the real manifests by a test, so adding a component fails a test rather
 than an install — though only the list is checked that way. The release also has
 to publish the new image under the same repository and tag as the rest, and
-until it does, the component can only be installed by building it.
+until it does, an install has to build it or take it from a registry that
+holds it.
+
+Releases publish `images.ReleaseComponents` and
+`images.ReleaseDockerfileImages`, both allowlists: an image is published only
+once it is added to one, so a new entry in `images.Components`
+stays out of releases until someone adds it on purpose. See
+[`docs/dev/releasing.md`](../../docs/dev/releasing.md#release-images) for what
+releases cover. Under `--image-repo`, a component that is not on the allowlist
+is looked up like any other, so a registry that holds it works. If the lookup
+fails, the error adds that releases do not publish it.
 
 ## Cluster access
 
@@ -169,7 +182,23 @@ observed status (`3/5 replicas available`) instead of only a timeout.
 
 **Deletes are more precise.** `kubectl delete --ignore-not-found -f` was the
 model, so NotFound is ignored — and so is a kind that no longer resolves, since
-teardown after the CRDs are gone must not fail. Beyond that, deletes are strict.
+teardown after the CRDs are gone must not fail. Beyond that, deletes are
+strict.
+
+**Cluster profiles are new.** `--cluster-size` and `--cordon-system-infra-components`
+postdate the shell installer. `size10`
+renders the `podcert-size10` overlay and resizes the bundled PostgreSQL from
+`postgres-size10/postgres-config-patch.yaml`;
+`--cordon-system-infra-components` composes the
+`cordon-system-infra-components` component over every system infra apply
+path. The size10 PostgreSQL changes are made to the decoded objects before the
+one server-side apply, not patched on afterwards: one rollout, the rollout wait
+sees the resized pod, and there is no second field manager for a later apply to
+fight with.
+
+**Timing lines are new.** `ate-setup` prints `(kubectl apply took 1.234s)`
+after each apply, delete, rollout wait, trust bundle wait, `ko` invocation, and
+`gcloud` call, on stdout with the rest of the progress output.
 
 **`|| true` is gone.** The CSI hostpath bundle ships a `VolumeSnapshotClass`
 whose CRD is absent on a stock Kind cluster; the shell script handled that by
@@ -214,14 +243,6 @@ demo is its own package registering itself from `init`, and
 `internal/demos/all` is the single list of what gets linked in — with a test
 asserting no demo package is missing from it.
 
-**Kind-only demos are visible but refuse.** `demo-autoscaled-workerpool`
-registered itself only when `ATE_INSTALL_KIND=true`, so on GKE
-`--deploy-demo-autoscaled-workerpool` was rejected as an *unknown option*. The
-cobra tree is built before flags are parsed, so `--kind` is not known yet; the
-subcommand always exists and fails at run time with `demo-autoscaled-workerpool
-is only supported for Kind installations; re-run with --kind`. `delete all`
-still skips it on a non-Kind install, via `demos.For`.
-
 **Template expansion is not sed.** The demo templates were expanded by a stack
 of `sed -e` expressions doing two things: substitute `${PLACEHOLDER}`, or delete
 the whole line (`/${NAME}/d`) when the placeholder is not in play.
@@ -234,13 +255,14 @@ instead of vanishing.
 
 **Actor cleanup uses the API directly.** `delete_demo_actors` required `jq`,
 listed actors with `kubectl-ate get actors -A -o json`, and filtered with a jq
-expression. `steps.DeleteDemoActors` uses `internal/ateclient` and pages through
-`ListActors`. The tolerances are preserved: no `ate-api-server`, or an apiserver
+expression. `steps.DeleteSubstrateDemo` uses `internal/ateclient` and pages
+through `ListActors`. The tolerances are preserved: no `ate-api-server`, or an apiserver
 that cannot be reached, skips cleanup rather than failing, because `delete all`
 runs this for every demo.
 
-**`docker buildx imagetools inspect` output is parsed as JSON**, not piped
-through `jq -r '.manifest.digest'`. Build output still goes to stderr so the
+**The pushed digest comes from `docker buildx build --metadata-file`**, not
+from piping `docker buildx imagetools inspect` of the tag through
+`jq -r '.manifest.digest'`. Build output still goes to stderr so the
 stdout/stderr split matches under CI log capture.
 
 ## Errors and diagnostics
@@ -259,23 +281,40 @@ stdout/stderr split matches under CI log capture.
 
 ## Known differences worth flagging
 
-**`--setup-csi` on a non-Kind cluster.** Both installers now accept `nfs` off
-Kind — only the hostpath plugin is patched for the single-node Kind layout, and
-both reject `hostpath` and `both` there with a hard error rather than the
-shell's old warn-and-continue.
+**`--setup-csi` on a non-Kind cluster.** `nfs` is accepted off Kind, as it was
+— only the hostpath plugin is patched for the single-node Kind layout — but
+`hostpath` and `both` are a hard error there rather than the shell's old
+warn-and-continue.
 
-**Cloud SQL is shell-only.** `hack/install-ate.sh` automates Cloud SQL setup
-with IAM authentication, synthesized DSNs, and the Auth Proxy sidecar
-([`cloud-sql.md`](../../tools/setup-gcp/cloud-sql.md)). `ate-setup` does not yet
-port this: while it honors `ATE_API_POSTGRES_CONNECTION_STRING` for generic
-external databases, it ignores `ATE_API_POSTGRES_CLOUDSQL_*` and deploys the
-bundled StatefulSet. Running `ate-setup` on a Cloud SQL cluster reverts the DSN
-to the in-cluster database, leaving behind an orphaned proxy. Use
-`hack/install-ate.sh` for Cloud SQL clusters until ported.
+**The env-hash digest does not agree with the shell's.** Both stamp
+`ate.dev/env-hash` on the `ate-api-server` pod template so that a changed
+environment rolls the Deployment, but the shell computed it with `openssl
+dgst -sha256` over jsonpath output and `ate-setup` digests the ConfigMap and
+Secret contents directly. The value is opaque — only changes to it matter — so
+the only consequence is that the first `ate-setup` install over a
+shell-installed cluster rolls `ate-api-server` once.
+
+**Cloud SQL DSNs are synthesized, not adopted verbatim.** With
+`ATE_API_POSTGRES_CLOUDSQL_INSTANCE` set and no explicit
+`ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING`, the DSN is built passwordless
+against the proxy's loopback listener from the GSA's email
+([`cloud-sql.md`](../../tools/setup-gcp/cloud-sql.md)), so
+`ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH=false` is rejected rather than producing a
+DSN that cannot authenticate. The owner connection uses the same IAM login
+unless `ATE_API_POSTGRES_OWNER_CONNECTION_STRING` is set. An *unset* instance variable is distinct from an
+exported empty one: unset adopts whatever the cluster already records in
+`ate-api-server-envvars`, including the IP type and the GSA from the
+`iam.gke.io/gcp-service-account` annotation, so a redeploy from a shell that
+never exported the variables leaves a working proxy alone. Exporting it empty
+removes the sidecar and the annotation and falls back to the bundled
+StatefulSet.
 
 ## Testing
 
 The shell installer had no tests. `cmd/ate-setup` has unit tests for template
 rendering, overlay selection, config resolution, the authentication config, the
-apiserver environment ConfigMap, delegated script arguments, manifest deletion,
-per-demo rendering, and image reference rewriting.
+apiserver environment ConfigMap and Secret, Cloud SQL resolution, the OTLP
+endpoint override, delegated script arguments, manifest deletion, per-demo
+rendering, image reference rewriting, kustomize composition, the control plane
+pinning on every apply path, and the size10 PostgreSQL resize against the real
+manifests.

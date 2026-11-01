@@ -21,14 +21,16 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
+	"path"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,10 +40,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/substratex509"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 const (
@@ -82,59 +86,46 @@ func newTestCA(t *testing.T, commonName string) *testCA {
 	return &testCA{cert: cert, key: key}
 }
 
-func (ca *testCA) roots() *x509.CertPool {
+// loadRoots is an actor-identity roots loader for New that trusts only ca.
+func (ca *testCA) loadRoots() (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.cert)
-	return pool
-}
-
-// oidActorIdentity mirrors the unexported OID substratex509 encodes the
-// ActorIdentity extension under: the Substrate PEN arc, sub-identifier 2.
-var oidActorIdentity = append(append(asn1.ObjectIdentifier{}, substratex509.GoogleSubstratePEN...), 2)
-
-// addActorIdentityUnchecked encodes identity into template the way
-// substratex509.AddActorIdentityToCertificate does, minus its validation, so
-// tests can mint the malformed identities a real CA would refuse to produce and
-// confirm the gateway rejects them anyway.
-func addActorIdentityUnchecked(identity *substratex509.ActorIdentity, template *x509.Certificate) error {
-	value, err := json.Marshal(identity)
-	if err != nil {
-		return err
-	}
-	template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{Id: oidActorIdentity, Value: value})
-	return nil
+	return pool, nil
 }
 
 // actorCertOptions mutates the leaf template so each test can break exactly one
 // property of an otherwise-valid actor certificate.
 type actorCertOptions struct {
-	identity      *substratex509.ActorIdentity
-	extraIdentity *substratex509.ActorIdentity
-	mutate        func(*x509.Certificate)
+	mutate func(*x509.Certificate)
 }
 
 // issueActorCert mints a leaf off ca, mirroring what ateapi's actoridentity
 // service produces.
-func (ca *testCA) issueActorCert(t *testing.T, opts actorCertOptions) *x509.Certificate {
+func (ca *testCA) issueActorCert(t *testing.T, spiffeURI string, opts actorCertOptions) *x509.Certificate {
 	t.Helper()
-	cert, err := x509.ParseCertificate(ca.issueActorCertDER(t, opts))
+	cert, err := x509.ParseCertificate(ca.issueActorCertDER(t, spiffeURI, opts))
 	if err != nil {
 		t.Fatalf("parsing leaf certificate: %v", err)
 	}
 	return cert
 }
 
-// issueActorCertDER is issueActorCert without the parse, for the certificates
-// crypto/x509 itself refuses to read back.
-func (ca *testCA) issueActorCertDER(t *testing.T, opts actorCertOptions) []byte {
+func (ca *testCA) issueActorCertDER(t *testing.T, spiffeURI string, opts actorCertOptions) []byte {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generating leaf key: %v", err)
 	}
+
+	spiffeParsed, err := url.Parse(spiffeURI)
+	if err != nil {
+		t.Fatalf("parsing SPIFFE URI: %v", err)
+	}
+
 	template := &x509.Certificate{
 		SerialNumber:          big.NewInt(2),
 		Subject:               pkix.Name{CommonName: testEgressActor},
+		URIs:                  []*url.URL{spiffeParsed},
 		NotBefore:             time.Now().Add(-5 * time.Minute),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -142,28 +133,11 @@ func (ca *testCA) issueActorCertDER(t *testing.T, opts actorCertOptions) []byte 
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
-	identity := opts.identity
-	if identity == nil {
-		identity = &substratex509.ActorIdentity{
-			Atespace:  testEgressAtespace,
-			ActorName: testEgressActor,
-			ActorUid:  testEgressActorUID,
-			Purpose:   substratex509.ActorIdentityPurposeAtunnel,
-		}
-	}
-	// AddActorIdentityToCertificate validates its input, so identities a real CA
-	// would refuse to mint are encoded directly.
-	if err := addActorIdentityUnchecked(identity, template); err != nil {
-		t.Fatalf("adding ActorIdentity extension: %v", err)
-	}
-	if opts.extraIdentity != nil {
-		if err := addActorIdentityUnchecked(opts.extraIdentity, template); err != nil {
-			t.Fatalf("adding second ActorIdentity extension: %v", err)
-		}
-	}
+
 	if opts.mutate != nil {
 		opts.mutate(template)
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {
 		t.Fatalf("signing leaf certificate: %v", err)
@@ -190,36 +164,128 @@ func xfccHeaderDER(chain ...[]byte) string {
 		url.PathEscape(buf.String()))
 }
 
-// egressHandler builds a Handler whose GetActor returns actor/err.
-func egressHandler(roots *x509.CertPool, actor *ateapipb.Actor, err error) *Handler {
-	return New(&egressMockClient{actor: actor, err: err}, roots)
+// egressHandler builds a Handler with an allow-everything policy, so the
+// identity tests are about identity alone.
+func egressHandler(loadRoots func() (*x509.CertPool, error), actor *ateapi.Actor, err error) *Handler {
+	return New(&egressMockClient{actor: actor, err: err, policy: allowAllPolicy()}, loadRoots, DefaultPolicyCacheTTL, nil)
 }
 
+// egressMockClient is the slice of ateapi the egress handler talks to.
 type egressMockClient struct {
-	ateapipb.ControlClient
-	actor *ateapipb.Actor
+	ateapi.ControlClient
+	actor *ateapi.Actor
 	err   error
+
+	// policy is what GetActorEgressPolicy returns; nil answers NotFound.
+	// policyErr, when set, is returned instead.
+	policy    *ateapi.EgressPolicy
+	policyErr error
+	// policyCalls counts GetActorEgressPolicy calls, for the cache tests.
+	policyCalls atomic.Int32
+	// policyGate, when non-nil, blocks each GetActorEgressPolicy until it is
+	// closed, so a test can hold several callers on one fetch.
+	policyGate chan struct{}
+
+	// The nth MintActorJwt call returns "jwt-<n>", expiring
+	// expiration_seconds from now. mintErr, when set, is returned instead.
+	mintCalls atomic.Int32
+	lastMint  atomic.Pointer[ateapi.MintActorJwtRequest]
+	mintErr   error
 }
 
-func (m *egressMockClient) GetActor(context.Context, *ateapipb.GetActorRequest, ...grpc.CallOption) (*ateapipb.Actor, error) {
+func (m *egressMockClient) GetActor(context.Context, *ateapi.GetActorRequest, ...grpc.CallOption) (*ateapi.Actor, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
 	return m.actor, nil
 }
 
-func runningActor() *ateapipb.Actor {
-	return &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{
+func (m *egressMockClient) GetActorEgressPolicy(ctx context.Context, req *ateapi.GetActorEgressPolicyRequest, _ ...grpc.CallOption) (*ateapi.EgressPolicy, error) {
+	m.policyCalls.Add(1)
+	if req.GetName() != resources.SingletonName {
+		return nil, status.Errorf(codes.InvalidArgument, "name must be %q", resources.SingletonName)
+	}
+	if m.policyGate != nil {
+		select {
+		case <-m.policyGate:
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	}
+	if m.policyErr != nil {
+		return nil, m.policyErr
+	}
+	if m.policy == nil {
+		return nil, status.Error(codes.NotFound, "EgressPolicy not found")
+	}
+	return m.policy, nil
+}
+
+func (m *egressMockClient) MintActorJwt(_ context.Context, req *ateapi.MintActorJwtRequest, _ ...grpc.CallOption) (*ateapi.MintActorJwtResponse, error) {
+	n := m.mintCalls.Add(1)
+	m.lastMint.Store(req)
+	if m.mintErr != nil {
+		return nil, m.mintErr
+	}
+	return &ateapi.MintActorJwtResponse{
+		ActorJwt:   fmt.Sprintf("jwt-%d", n),
+		ExpireTime: timestamppb.New(time.Now().Add(time.Duration(req.GetExpirationSeconds()) * time.Second)),
+	}, nil
+}
+
+// allowAllPolicy allows every name and address: cleartext HTTP on any port
+// and HTTPS on 443.
+func allowAllPolicy() *ateapi.EgressPolicy {
+	return combined(httpPolicyOnPorts(allPorts(), "*"), httpsPolicy("*"))
+}
+
+func httpPolicy(patterns ...string) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: []*ateapi.EgressRule{{
+		Http: &ateapi.HttpRule{Hostnames: patterns},
+	}}}
+}
+
+func httpPolicyOnPorts(ports *ateapi.Ports, patterns ...string) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: []*ateapi.EgressRule{{
+		Http: &ateapi.HttpRule{Hostnames: patterns, Ports: ports},
+	}}}
+}
+
+func httpsPolicy(patterns ...string) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: []*ateapi.EgressRule{{
+		Https: &ateapi.HttpsRule{Hostnames: patterns},
+	}}}
+}
+
+func httpsPolicyOnPorts(ports *ateapi.Ports, patterns ...string) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: []*ateapi.EgressRule{{
+		Https: &ateapi.HttpsRule{Hostnames: patterns, Ports: ports},
+	}}}
+}
+
+func passthroughPolicy(ports *ateapi.Ports, patterns ...string) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: []*ateapi.EgressRule{{
+		TlsPassthrough: &ateapi.TlsPassthroughRule{Hostnames: patterns, Ports: ports},
+	}}}
+}
+
+func ports(numbers ...int32) *ateapi.Ports { return &ateapi.Ports{Numbers: numbers} }
+
+func allPorts() *ateapi.Ports { return &ateapi.Ports{All: &ateapi.AllPorts{}} }
+
+func runningActor() *ateapi.Actor {
+	return &ateapi.Actor{
+		Metadata: &ateapi.ResourceMetadata{
 			Atespace: testEgressAtespace,
 			Name:     testEgressActor,
 			Uid:      testEgressActorUID,
 		},
-		Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
+		Status: &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
 	}
 }
 
-// egressMetadata builds the CONNECT the egress listener hands to ext_proc.
+// egressMetadata builds the CONNECT the egress listener hands to ext_proc,
+// with the peer certificate and the chain name of the CONNECT leg.
 func egressMetadata(xfcc string) *extproc.RequestMetadata {
 	headers := []*corev3.HeaderValue{
 		{Key: ":method", RawValue: []byte("CONNECT")},
@@ -228,7 +294,13 @@ func egressMetadata(xfcc string) *extproc.RequestMetadata {
 	if xfcc != "" {
 		headers = append(headers, &corev3.HeaderValue{Key: forwardedClientCertHeader, RawValue: []byte(xfcc)})
 	}
-	return extproc.NewRequestMetadata(headers, nil)
+	return extproc.NewRequestMetadata(headers, map[string]*structpb.Struct{
+		"envoy.filters.http.ext_proc": {
+			Fields: map[string]*structpb.Value{
+				extproc.FilterChainNameAttribute: structpb.NewStringValue(extproc.EgressFilterChainName),
+			},
+		},
+	})
 }
 
 func agentgatewayEgressMetadata(certificate string) *extproc.RequestMetadata {
@@ -260,8 +332,8 @@ func wantStatus(t *testing.T, err error, want envoy_type.StatusCode) {
 
 func TestHandleRequestHeadersAllowsVerifiedActor(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
-	h := egressHandler(ca.roots(), runningActor(), nil)
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	h := egressHandler(ca.loadRoots, runningActor(), nil)
 
 	res, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
 	if err != nil {
@@ -277,12 +349,142 @@ func TestHandleRequestHeadersAllowsVerifiedActor(t *testing.T) {
 	if res.Target != "" {
 		t.Errorf("target = %q, want %q", res.Target, "")
 	}
+	if got := dialedPortOf(res); got != "80" {
+		t.Errorf("dialed port = %q, want %q", got, "80")
+	}
+}
+
+// dialedPortOf reads the port a CONNECT decision handed back for the
+// passthrough chain.
+func dialedPortOf(res extproc.Result) string {
+	return res.DynamicMetadata.GetFields()[extproc.EgressMetadataNamespace].GetStructValue().GetFields()[extproc.EgressDialedPortKey].GetStringValue()
+}
+
+// The CONNECT opens for any policy with rules and returns the https and
+// tls_passthrough SNI rules for the dialed port, most specific first.
+func TestConnectLegOpensForAnyRules(t *testing.T) {
+	ca := newTestCA(t, "actor-identity-ca")
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+
+	mitm := func(patterns ...string) []egresspolicy.SNIRule {
+		rules := make([]egresspolicy.SNIRule, len(patterns))
+		for i, p := range patterns {
+			rules[i] = egresspolicy.SNIRule{Pattern: p, Mode: egresspolicy.SNIModeMITM}
+		}
+		return rules
+	}
+	passthrough := func(patterns ...string) []egresspolicy.SNIRule {
+		rules := make([]egresspolicy.SNIRule, len(patterns))
+		for i, p := range patterns {
+			rules[i] = egresspolicy.SNIRule{Pattern: p, Mode: egresspolicy.SNIModePassthrough}
+		}
+		return rules
+	}
+	tests := []struct {
+		name   string
+		policy *ateapi.EgressPolicy
+		// dialed is the CONNECT authority; port 443 unless set.
+		dialed string
+		want   []egresspolicy.SNIRule
+	}{
+		{name: "http", policy: httpPolicy("api.example.com")},
+		{name: "https", policy: httpsPolicy("api.example.com"), want: mitm("api.example.com")},
+		{name: "tls passthrough", policy: passthroughPolicy(ports(443), "*"), want: passthrough("*")},
+		{name: "allow all", policy: allowAllPolicy(), want: mitm("*")},
+		{
+			name: "https and tls passthrough rules, most specific first",
+			policy: combined(
+				httpsPolicy("*.example.org", "api.example.com"),
+				httpPolicy("plain.example.com"),
+				passthroughPolicy(ports(443), "foo.bar.com"),
+			),
+			want: []egresspolicy.SNIRule{
+				{Pattern: "api.example.com", Mode: egresspolicy.SNIModeMITM},
+				{Pattern: "foo.bar.com", Mode: egresspolicy.SNIModePassthrough},
+				{Pattern: "*.example.org", Mode: egresspolicy.SNIModeMITM},
+			},
+		},
+		{name: "https rule on another port", policy: httpsPolicy("api.example.com"), dialed: "93.184.216.34:8443"},
+		{name: "https rule on the dialed port", policy: httpsPolicyOnPorts(ports(8443), "api.example.com"), dialed: "93.184.216.34:8443", want: mitm("api.example.com")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := New(&egressMockClient{actor: runningActor(), policy: tc.policy}, ca.loadRoots, 0, nil)
+			md := egressMetadata(xfccHeader(leaf))
+			md.Host = "93.184.216.34:443"
+			if tc.dialed != "" {
+				md.Host = tc.dialed
+			}
+			md.Headers[":authority"] = md.Host
+			res, err := h.HandleRequestHeaders(context.Background(), md)
+			if err != nil {
+				t.Fatalf("HandleRequestHeaders() error = %v, want the tunnel to open", err)
+			}
+			_, wantPort, _ := net.SplitHostPort(md.Host)
+			if got := dialedPortOf(res); got != wantPort {
+				t.Errorf("dialed port = %q, want %q", got, wantPort)
+			}
+			if got := sniRulesOf(t, res); !slices.Equal(got, tc.want) {
+				t.Errorf("SNI rules = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// sniRulesOf reads the SNI rules from a CONNECT result.
+func sniRulesOf(t *testing.T, res extproc.Result) []egresspolicy.SNIRule {
+	t.Helper()
+	nsStruct := res.DynamicMetadata.GetFields()[extproc.EgressPolicyMetadataNamespace].GetStructValue()
+	if nsStruct == nil {
+		t.Fatalf("missing %q struct in DynamicMetadata", extproc.EgressPolicyMetadataNamespace)
+	}
+	policyJSON := nsStruct.GetFields()[extproc.EgressPolicyJSONKey].GetStringValue()
+	if policyJSON == "" {
+		t.Fatalf("missing %q string in %q DynamicMetadata", extproc.EgressPolicyJSONKey, extproc.EgressPolicyMetadataNamespace)
+	}
+	var policyStruct structpb.Struct
+	if err := policyStruct.UnmarshalJSON([]byte(policyJSON)); err != nil {
+		t.Fatalf("unmarshaling %q in %q DynamicMetadata: %v", extproc.EgressPolicyJSONKey, extproc.EgressPolicyMetadataNamespace, err)
+	}
+	listVal := policyStruct.GetFields()[extproc.EgressSNIRulesKey].GetListValue()
+	if listVal == nil {
+		t.Fatalf("missing %q list in %q DynamicMetadata", extproc.EgressSNIRulesKey, extproc.EgressPolicyMetadataNamespace)
+	}
+	out := make([]egresspolicy.SNIRule, len(listVal.GetValues()))
+	for i, v := range listVal.GetValues() {
+		fields := v.GetStructValue().GetFields()
+		out[i] = egresspolicy.SNIRule{
+			Pattern: fields[extproc.EgressSNIRulePatternKey].GetStringValue(),
+			Mode:    egresspolicy.SNIMode(fields[extproc.EgressSNIRuleModeKey].GetStringValue()),
+		}
+	}
+	return out
+}
+
+// A callout with no filter chain name gets the same answer: the tunnel opens,
+// and an actor without a policy is refused.
+func TestConnectLegWithoutRequestLegs(t *testing.T) {
+	ca := newTestCA(t, "actor-identity-ca")
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	certificate := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}))
+
+	h := New(&egressMockClient{actor: runningActor(), policy: httpPolicy("api.example.com")}, ca.loadRoots, 0, nil)
+	res, err := h.HandleRequestHeaders(context.Background(), agentgatewayEgressMetadata(certificate))
+	if err != nil {
+		t.Fatalf("HandleRequestHeaders() error = %v, want the tunnel to open", err)
+	}
+	if got := dialedPortOf(res); got != "80" {
+		t.Errorf("dialed port = %q, want %q", got, "80")
+	}
+	h = New(&egressMockClient{actor: runningActor()}, ca.loadRoots, 0, nil)
+	_, err = h.HandleRequestHeaders(context.Background(), agentgatewayEgressMetadata(certificate))
+	wantStatus(t, err, envoy_type.StatusCode_Forbidden)
 }
 
 func TestHandleRequestHeadersAllowsAgentgatewayCertificateAttribute(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
-	h := egressHandler(ca.roots(), runningActor(), nil)
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	h := egressHandler(ca.loadRoots, runningActor(), nil)
 
 	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw})
 	if _, err := h.HandleRequestHeaders(context.Background(), agentgatewayEgressMetadata(string(certificate))); err != nil {
@@ -309,14 +511,14 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 		{
 			name: "signed by an unknown CA",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(otherCA.issueActorCert(t, actorCertOptions{}))
+				return xfccHeader(otherCA.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
 			name: "expired",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
 					c.NotBefore = time.Now().Add(-2 * time.Hour)
 					c.NotAfter = time.Now().Add(-time.Hour)
 				}}))
@@ -326,7 +528,7 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 		{
 			name: "not yet valid",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
 					c.NotBefore = time.Now().Add(time.Hour)
 					c.NotAfter = time.Now().Add(2 * time.Hour)
 				}}))
@@ -336,20 +538,8 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 		{
 			name: "no ClientAuth EKU",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
 					c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
-				}}))
-			},
-			want: envoy_type.StatusCode_Forbidden,
-		},
-		{
-			// An empty EKU means "any usage" to crypto/x509 and would pass
-			// VerifyOptions.KeyUsages; the explicit ClientAuth check is what
-			// catches it.
-			name: "empty EKU",
-			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
-					c.ExtKeyUsage = nil
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
@@ -357,7 +547,7 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 		{
 			name: "is a CA certificate",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
 					c.IsCA = true
 					c.KeyUsage |= x509.KeyUsageCertSign
 				}}))
@@ -365,86 +555,114 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			name: "no ActorIdentity extension",
+			name: "no URI SANs",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{mutate: func(c *x509.Certificate) {
-					c.ExtraExtensions = nil
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = nil
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			// Stays in DER: crypto/x509 refuses to parse a certificate with a
-			// duplicate extension OID at all, so the helper cannot hand back an
-			// *x509.Certificate here. That refusal is the first of the two
-			// layers guarding "exactly one ActorIdentity" — this case proves the
-			// handler denies rather than panics when the parse fails, and
-			// substratex509 rejects a second copy if a parser ever allowed one.
-			name: "two ActorIdentity extensions",
+			name: "multiple URI SANs",
 			xfcc: func(t *testing.T) string {
-				return xfccHeaderDER(ca.issueActorCertDER(t, actorCertOptions{
-					extraIdentity: &substratex509.ActorIdentity{
-						Atespace:  testEgressAtespace,
-						ActorName: "a-different-actor",
-						ActorUid:  "8f14e45f-ceea-467a-9575-25a0d5d5e4b0",
-						Purpose:   substratex509.ActorIdentityPurposeAtunnel,
-					},
-				}))
-			},
-			want: envoy_type.StatusCode_Forbidden,
-		},
-		{
-			name: "generic purpose",
-			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{identity: &substratex509.ActorIdentity{
-					Atespace:  testEgressAtespace,
-					ActorName: testEgressActor,
-					ActorUid:  testEgressActorUID,
-					Purpose:   "generic",
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = append(c.URIs, &url.URL{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", testEgressAtespace, "other-actor"),
+					})
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			name: "missing purpose",
+			name: "non-spiffe URI scheme",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{identity: &substratex509.ActorIdentity{
-					Atespace:  testEgressAtespace,
-					ActorName: testEgressActor,
-					ActorUid:  testEgressActorUID,
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "https",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", testEgressAtespace, testEgressActor),
+					}}
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			name: "empty atespace",
+			name: "empty trust domain",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{identity: &substratex509.ActorIdentity{
-					ActorName: testEgressActor,
-					ActorUid:  testEgressActorUID,
-					Purpose:   substratex509.ActorIdentityPurposeAtunnel,
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "",
+						Path:   "/" + path.Join("worker", "actor", testEgressAtespace, testEgressActor),
+					}}
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			name: "empty actor name",
+			name: "non-worker actor SPIFFE URI",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{identity: &substratex509.ActorIdentity{
-					Atespace: testEgressAtespace,
-					ActorUid: testEgressActorUID,
-					Purpose:  substratex509.ActorIdentityPurposeAtunnel,
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("actor", testEgressAtespace, testEgressActor),
+					}}
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
 		{
-			name: "empty actor UID",
+			name: "malformed SPIFFE URI path (too few segments)",
 			xfcc: func(t *testing.T) string {
-				return xfccHeader(ca.issueActorCert(t, actorCertOptions{identity: &substratex509.ActorIdentity{
-					Atespace:  testEgressAtespace,
-					ActorName: testEgressActor,
-					Purpose:   substratex509.ActorIdentityPurposeAtunnel,
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", testEgressAtespace),
+					}}
+				}}))
+			},
+			want: envoy_type.StatusCode_Forbidden,
+		},
+		{
+			name: "malformed SPIFFE URI path (extra segment)",
+			xfcc: func(t *testing.T) string {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", testEgressAtespace, testEgressActor, "extra"),
+					}}
+				}}))
+			},
+			want: envoy_type.StatusCode_Forbidden,
+		},
+		{
+			name: "invalid atespace resource name in SPIFFE URI",
+			xfcc: func(t *testing.T) string {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", "INVALID_ATESPACE", testEgressActor),
+					}}
+				}}))
+			},
+			want: envoy_type.StatusCode_Forbidden,
+		},
+		{
+			name: "invalid actor resource name in SPIFFE URI",
+			xfcc: func(t *testing.T) string {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) {
+					c.URIs = []*url.URL{{
+						Scheme: "spiffe",
+						Host:   "substrate-actor.local",
+						Path:   path.Join("worker", "actor", testEgressAtespace, "INVALID_ACTOR"),
+					}}
 				}}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
@@ -454,7 +672,7 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 			// elements means we can no longer tell which one is our peer.
 			name: "two XFCC elements",
 			xfcc: func(t *testing.T) string {
-				leaf := ca.issueActorCert(t, actorCertOptions{})
+				leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
 				return xfccHeader(leaf) + "," + xfccHeader(leaf)
 			},
 			want: envoy_type.StatusCode_Forbidden,
@@ -463,6 +681,13 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 			name: "XFCC without a Chain value",
 			xfcc: func(*testing.T) string {
 				return `By=spiffe://cluster.local/ns/ate-system/sa/atenet-egress;Hash=abc123`
+			},
+			want: envoy_type.StatusCode_Forbidden,
+		},
+		{
+			name: "no URI SAN at all",
+			xfcc: func(t *testing.T) string {
+				return xfccHeader(ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{mutate: func(c *x509.Certificate) { c.URIs = nil }}))
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
@@ -477,7 +702,7 @@ func TestHandleRequestHeadersRejectsBadCertificates(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := egressHandler(ca.roots(), runningActor(), nil)
+			h := egressHandler(ca.loadRoots, runningActor(), nil)
 			_, err := h.HandleRequestHeaders(context.Background(), egressMetadata(tc.xfcc(t)))
 			wantStatus(t, err, tc.want)
 		})
@@ -491,42 +716,19 @@ func TestHandleRequestHeadersAuthorization(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		actor *ateapipb.Actor
+		actor *ateapi.Actor
 		err   error
 		want  envoy_type.StatusCode
 	}{
 		{
-			// The actor was deleted and recreated under the same name: the
-			// certificate is still cryptographically valid but names a UID that
-			// no longer exists, and must not carry over to the successor.
-			name: "actor UID does not match the certificate",
-			actor: &ateapipb.Actor{
-				Metadata: &ateapipb.ResourceMetadata{
-					Atespace: testEgressAtespace,
-					Name:     testEgressActor,
-					Uid:      "d41d8cd9-8f00-4204-a980-0998ecf8427e",
-				},
-				Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
-			},
-			want: envoy_type.StatusCode_Forbidden,
-		},
-		{
-			name: "actor has no UID",
-			actor: &ateapipb.Actor{
-				Metadata: &ateapipb.ResourceMetadata{Atespace: testEgressAtespace, Name: testEgressActor},
-				Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING},
-			},
-			want: envoy_type.StatusCode_Forbidden,
-		},
-		{
-			name: "actor is not running",
-			actor: &ateapipb.Actor{
-				Metadata: &ateapipb.ResourceMetadata{
+			name: "actor is suspended",
+			actor: &ateapi.Actor{
+				Metadata: &ateapi.ResourceMetadata{
 					Atespace: testEgressAtespace,
 					Name:     testEgressActor,
 					Uid:      testEgressActorUID,
 				},
-				Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+				Status: &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
 			},
 			want: envoy_type.StatusCode_Forbidden,
 		},
@@ -544,29 +746,113 @@ func TestHandleRequestHeadersAuthorization(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := egressHandler(ca.roots(), tc.actor, tc.err)
-			leaf := ca.issueActorCert(t, actorCertOptions{})
+			h := egressHandler(ca.loadRoots, tc.actor, tc.err)
+			leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
 			_, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
 			wantStatus(t, err, tc.want)
 		})
 	}
 }
 
-// An ingress-only router has no actor-identity CA. If an egress CONNECT somehow
-// reaches it, it must fail closed rather than tunnel unauthenticated traffic.
-func TestHandleRequestHeadersWithoutConfiguredCA(t *testing.T) {
+// Egress follows the actor's placement on a worker: a resuming actor is booting
+// or restoring there and may fetch what it needs to become ready; every other
+// state has left its worker or is leaving it.
+func TestHandleRequestHeadersActorState(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
-	h := egressHandler(nil, runningActor(), nil)
+	allowed := map[ateapi.ActorState]bool{
+		ateapi.ActorState_ACTOR_STATE_RESUMING: true,
+		ateapi.ActorState_ACTOR_STATE_RUNNING:  true,
+	}
+	for value := range ateapi.ActorState_name {
+		state := ateapi.ActorState(value)
+		if state == ateapi.ActorState_ACTOR_STATE_UNSPECIFIED {
+			continue
+		}
+		t.Run(state.String(), func(t *testing.T) {
+			actor := runningActor()
+			actor.Status.State = state
+			h := egressHandler(ca.loadRoots, actor, nil)
+			leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+			_, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
+			if allowed[state] {
+				if err != nil {
+					t.Fatalf("HandleRequestHeaders() error = %v, want nil", err)
+				}
+				return
+			}
+			wantStatus(t, err, envoy_type.StatusCode_Forbidden)
+		})
+	}
+}
+
+// Without actor-identity roots the gateway must fail closed rather than tunnel
+// unauthenticated traffic. An ingress-only router has no CA configured, and a
+// configured bundle can become unreadable after startup.
+func TestHandleRequestHeadersWithoutUsableCA(t *testing.T) {
+	ca := newTestCA(t, "actor-identity-ca")
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+
+	tests := []struct {
+		name      string
+		loadRoots func() (*x509.CertPool, error)
+	}{
+		{
+			name: "no CA configured",
+		},
+		{
+			name: "CA fails to load",
+			loadRoots: func() (*x509.CertPool, error) {
+				return nil, errors.New("trust bundle contains no certificates")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := egressHandler(tc.loadRoots, runningActor(), nil)
+			_, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
+			wantStatus(t, err, envoy_type.StatusCode_ServiceUnavailable)
+		})
+	}
+}
+
+// A rotated actor-identity CA applies to the next CONNECT without a restart.
+func TestHandleRequestHeadersPicksUpRotatedCA(t *testing.T) {
+	oldCA := newTestCA(t, "actor-identity-ca")
+	newCA := newTestCA(t, "actor-identity-ca-rotated")
+	leaf := newCA.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	load := oldCA.loadRoots
+	h := egressHandler(func() (*x509.CertPool, error) { return load() }, runningActor(), nil)
 
 	_, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
-	wantStatus(t, err, envoy_type.StatusCode_ServiceUnavailable)
+	wantStatus(t, err, envoy_type.StatusCode_Forbidden)
+
+	load = newCA.loadRoots
+	if _, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf))); err != nil {
+		t.Fatalf("HandleRequestHeaders() after rotation error = %v, want nil", err)
+	}
+}
+
+// atunnel always sends the address the actor's kernel dialed; a name here is
+// not a tunnel this gateway can carry, and is refused where it can still say so.
+func TestHandleRequestHeadersRejectsNonAddressAuthority(t *testing.T) {
+	ca := newTestCA(t, "actor-identity-ca")
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	h := egressHandler(ca.loadRoots, runningActor(), nil)
+
+	for _, authority := range []string{"example.com:443", "93.184.216.34", ""} {
+		md := egressMetadata(xfccHeader(leaf))
+		md.Host = authority
+		md.Headers[":authority"] = authority
+		_, err := h.HandleRequestHeaders(context.Background(), md)
+		wantStatus(t, err, envoy_type.StatusCode_Forbidden)
+	}
 }
 
 func TestHandleRequestHeadersRejectsNonConnect(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
-	h := egressHandler(ca.roots(), runningActor(), nil)
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
+	h := egressHandler(ca.loadRoots, runningActor(), nil)
 
 	md := egressMetadata(xfccHeader(leaf))
 	md.Method = "GET"
@@ -583,7 +869,7 @@ func TestParseXFCCChainPreservesPlusInPEM(t *testing.T) {
 	// Serials differ per certificate, so mint until one encodes with a '+'.
 	var leaf *x509.Certificate
 	for i := 0; i < 50; i++ {
-		candidate := ca.issueActorCert(t, actorCertOptions{})
+		candidate := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
 		if strings.Contains(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: candidate.Raw})), "+") {
 			leaf = candidate
 			break
@@ -604,7 +890,7 @@ func TestParseXFCCChainPreservesPlusInPEM(t *testing.T) {
 
 func TestParseXFCCChainIncludesIntermediates(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/foo/bar", actorCertOptions{})
 
 	chain, err := parseXFCCChain(xfccHeader(leaf, ca.cert))
 	if err != nil {

@@ -25,7 +25,7 @@ import grpc
 import requests
 from common import ateapi_pb2
 from common import ateapi_pb2_grpc
-from common.ateapi_channel import ateapi_channel
+from common.ateapi_channel import CA_FILE, CRED_BUNDLE, ateapi_channel
 from common.atespace import ATESPACE, ensure_atespace
 from common.grpc_tracing import traced_grpc
 
@@ -48,11 +48,9 @@ init_wait_time()
 tracer = get_tracer(__name__)
 
 
-# Atenet router fronts all actor traffic. Actors are addressed by setting
-# the HTTP Host header to <actor-name>.<atespace>.actors.resources.substrate.ate.dev;
-# the router resolves that to the actor's current worker pod.
-ROUTER_URL = "http://atenet-router.ate-system.svc.cluster.local"
-ACTOR_DOMAIN = "actors.resources.substrate.ate.dev"
+# Atenet router fronts all actor traffic. The actor routing header selects
+# the actor whose current worker pod the router resolves.
+ROUTER_URL = "https://atenet-router.ate-system.svc"
 
 
 class CounterUser(User):
@@ -99,19 +97,21 @@ class CounterUser(User):
         except Exception as e:
             logger.error(f"Failed to create actor {self.actor_name}: {e}")
 
-        # One HTTP session per user, talking to the router. The Host header
-        # pins each request to this actor regardless of which worker pod
-        # hosts it after a resume.
+        # One HTTP session per user, talking to the router over mTLS.
         self.http_session = requests.Session()
+        self.http_session.verify = CA_FILE
+        self.http_session.cert = CRED_BUNDLE
         self.run_url = f"{ROUTER_URL}/"
-        self.host_header = f"{self.actor_name}.{ATESPACE}.{ACTOR_DOMAIN}"
 
     def on_stop(self) -> None:
         update_user_count(-1, self.__class__.__name__)
         try:
             with traced_grpc("SuspendActor", self.__class__.__name__) as metadata:
                 _, metadata.call = self.stub.SuspendActor.with_call(
-                    ateapi_pb2.SuspendActorRequest(actor=self.actor_ref),
+                    ateapi_pb2.SuspendActorRequest(
+                        actor=self.actor_ref,
+                        options=ateapi_pb2.SuspendOptions(mode=ateapi_pb2.DURABILITY_MODE_SYNCHRONOUS),
+                    ),
                     metadata=metadata,
                 )
         except Exception as e:
@@ -139,7 +139,9 @@ class CounterUser(User):
         # 2. Run/Increment (HTTP via atenet-router)
         start_time = time.time()
         with tracer.start_as_current_span("RunCounter") as span:
-            headers = {"Host": self.host_header}
+            headers = {
+                "ate-target-actor": f"{ATESPACE}/{self.actor_name}",
+            }
             inject(headers)
             try:
                 response = self.http_session.post(self.run_url, headers=headers)
@@ -173,7 +175,10 @@ class CounterUser(User):
         try:
             with traced_grpc("SuspendActor", self.__class__.__name__) as metadata:
                 _, metadata.call = self.stub.SuspendActor.with_call(
-                    ateapi_pb2.SuspendActorRequest(actor=self.actor_ref),
+                    ateapi_pb2.SuspendActorRequest(
+                        actor=self.actor_ref,
+                        options=ateapi_pb2.SuspendOptions(mode=ateapi_pb2.DURABILITY_MODE_SYNCHRONOUS),
+                    ),
                     metadata=metadata,
                 )
         except Exception:

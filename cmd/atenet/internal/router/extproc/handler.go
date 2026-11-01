@@ -20,7 +20,7 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
 // Handler applies one direction's policy to a request. Implementations live in
@@ -37,7 +37,7 @@ type Handler interface {
 	// A returned error denies the request: a *ReqError carries the status code
 	// and client-safe body to answer with, anything else becomes a 500. The
 	// Result is read even when an error is returned, so a handler that got far
-	// enough to learn the metric attributes (template identity, resume outcome)
+	// enough to learn the metric attributes (template reference, resume outcome)
 	// should still fill them in.
 	HandleRequestHeaders(ctx context.Context, md *RequestMetadata) (Result, error)
 }
@@ -60,8 +60,8 @@ type Result struct {
 	TemplateName     string
 
 	// Resume is the actor-resume outcome, as one of the ateattr.RouterResume*
-	// values. Empty means "none" — the direction never resumes an actor, or the
-	// request never got that far.
+	// values. Empty means "unknown" — the direction never resumes an actor, or
+	// the request never got far enough to learn whether an activation ran.
 	Resume string
 
 	// DynamicMetadata is attached to the ProcessingResponse alongside Response,
@@ -72,10 +72,10 @@ type Result struct {
 }
 
 // resume returns the resume label for the route-duration metric, defaulting an
-// unset outcome to "none".
+// unset outcome to "unknown".
 func (r Result) resume() string {
 	if r.Resume == "" {
-		return ateattr.RouterResumeNone
+		return ateattr.RouterResumeUnknown
 	}
 	return r.Resume
 }

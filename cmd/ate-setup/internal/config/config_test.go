@@ -15,22 +15,27 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
+	"github.com/spf13/pflag"
+
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
+	"go.ate.dev/substrate/internal/preview"
 )
 
 // loadEnv isolates Load from the ambient environment.
 //
 // Load deliberately reads the developer's environment, so a test that sets only
 // what it cares about is at the mercy of whatever the shell or CI job happens
-// to export: an ambient PROJECT_ID or ATE_ATENET_ROUTER quietly changes the
+// to export: an ambient PROJECT_ID or ATE_ATENET_DATAPLANE quietly changes the
 // result. Every variable Load consults is blanked here -- empty reads as unset,
 // which is what these tests mean by "not configured" -- and NO_DEV_ENV keeps
 // .ate-dev-env.sh out of it. Tests then set back only what they exercise.
@@ -38,21 +43,44 @@ func loadEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("NO_DEV_ENV", "1")
 	for _, name := range []string{
+		"ACTOR_JWT_ALGORITHM",
+		"ACTOR_JWT_ISSUER",
 		"ANTHROPIC_API_KEY",
 		"ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE",
-		"ATE_API_POSTGRES_CONNECTION_STRING",
+		"ATE_API_AUTHZ_BOOTSTRAP_OWNERS",
+		"ATE_API_LOG_LEVEL",
+		"ATE_API_POSTGRES_CLOUDSQL_GSA",
+		"ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH",
+		"ATE_API_POSTGRES_CLOUDSQL_IP_TYPE",
+		"ATE_API_POSTGRES_OWNER_CONNECTION_STRING",
+		"ATE_API_POSTGRES_OWNER_ROLE",
+		"ATE_API_POSTGRES_POOL_MAX_CONNS",
+		"ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING",
+		"ATE_API_POSTGRES_READ_WRITE_ROLE",
 		"ATE_API_POSTGRES_SCHEMA",
-		"ATE_ATENET_ROUTER",
-		"ATE_EXPERIMENTAL_USE_SDSMINT",
+		"ATE_API_POSTGRES_SERVER_CA_FILE",
+		"ATE_ATENET_DATAPLANE",
+		"ATE_CREDENTIAL_PROVIDER",
+		"ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS",
 		"ATE_IMAGE_REPO",
 		"ATE_IMAGE_TAG",
+		"ATE_INGRESS_ALLOWED_SPIFFE_IDS",
+		"ATE_INSTALL_CLUSTER_SIZE",
+		"ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS",
+		"ATE_INSTALL_E2E_TUNING",
+		"ATE_INSTALL_FAKE_DATA_PLANE",
+		"ATE_INSTALL_KIND",
 		"ATE_INSTALL_PODCERT_WORKERS_PER_SIGNER",
 		"ATE_INSTALL_ROLLOUT_TIMEOUT",
 		"ATE_OTLP_ENDPOINT",
+		"ATE_PREVIEW",
 		"BENCHMARK_ACTOR_MEMORY",
 		"BUCKET_NAME",
 		"CLUSTER_LOCATION",
 		"CLUSTER_NAME",
+		"DOCKER_BUILD_FLAGS",
+		"E2E_ATE_ENVOY_CONCURRENCY",
+		"EXPECTED_JWT_ISSUER",
 		"KIND_CLUSTER_NAME",
 		"KO_DEFAULTPLATFORMS",
 		"KO_DOCKER_REPO",
@@ -60,8 +88,24 @@ func loadEnv(t *testing.T) {
 		"KUBECTL_CONTEXT",
 		"MEMORYSTORE_INSTANCE",
 		"PROJECT_ID",
+		"SNAPSHOT_LOCATION",
+		"SNAPSHOT_TRANSFER_GSA_NAME",
+		"ATE_API_POSTGRES_CLOUDSQL_INSTANCE",
 	} {
-		t.Setenv(name, "")
+		// Unset, not blanked. An exported empty variable is a value a channel
+		// supplied, which is what an operator writes to clear a setting; a
+		// test that blanked these would be configuring every one of them.
+		unsetEnv(t, name)
+	}
+}
+
+// unsetEnv removes a variable for the duration of the test. t.Setenv first, so
+// that its cleanup restores whatever the caller's environment had.
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("os.Unsetenv(%s) = %v", name, err)
 	}
 }
 
@@ -75,17 +119,407 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Router != RouterEnvoy {
 		t.Errorf("Router = %q, want %q", cfg.Router, RouterEnvoy)
 	}
-	if cfg.PostgresConnString() != DefaultPostgresConnectionString {
-		t.Errorf("PostgresConnString() = %q, want %q", cfg.PostgresConnString(), DefaultPostgresConnectionString)
+	if cfg.PostgresReadWriteConnectionString != "" || cfg.PostgresOwnerConnectionString != "" {
+		t.Errorf("unexpected external PostgreSQL connections: %q, %q", cfg.PostgresReadWriteConnectionString, cfg.PostgresOwnerConnectionString)
+	}
+	if cfg.PostgresReadWriteRole != DefaultPostgresReadWriteRole || cfg.PostgresOwnerRole != DefaultPostgresOwnerRole {
+		t.Errorf("unexpected default PostgreSQL roles: %q, %q", cfg.PostgresReadWriteRole, cfg.PostgresOwnerRole)
 	}
 	if cfg.RolloutTimeout != DefaultRolloutTimeout {
 		t.Errorf("RolloutTimeout = %v, want %v", cfg.RolloutTimeout, DefaultRolloutTimeout)
+	}
+	if cfg.ClusterSize != ClusterSizeSize0 {
+		t.Errorf("ClusterSize = %q, want %q", cfg.ClusterSize, ClusterSizeSize0)
+	}
+	if cfg.CordonSystemInfraComponents {
+		t.Error("CordonSystemInfraComponents = true, want false")
+	}
+}
+
+func TestLoadClusterSize(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		opts     Options
+		env      map[string]string
+		wantSize string
+	}{
+		{
+			name:     "flag",
+			opts:     Options{ClusterSize: ClusterSizeSize10},
+			wantSize: ClusterSizeSize10,
+		},
+		{
+			name:     "environment",
+			env:      map[string]string{"ATE_INSTALL_CLUSTER_SIZE": ClusterSizeSize10},
+			wantSize: ClusterSizeSize10,
+		},
+		{
+			name:     "flag beats the environment",
+			opts:     Options{ClusterSize: ClusterSizeSize0},
+			env:      map[string]string{"ATE_INSTALL_CLUSTER_SIZE": ClusterSizeSize10},
+			wantSize: ClusterSizeSize0,
+		},
+		{
+			name:     "explicit connection string is untouched",
+			opts:     Options{ClusterSize: ClusterSizeSize10},
+			env:      map[string]string{"ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING": "postgresql://someone@db.example:5432/atepg"},
+			wantSize: ClusterSizeSize10,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.ClusterSize != tc.wantSize {
+				t.Errorf("ClusterSize = %q, want %q", cfg.ClusterSize, tc.wantSize)
+			}
+			if cfg.Size10() != (tc.wantSize == ClusterSizeSize10) {
+				t.Errorf("Size10() = %v, want %v", cfg.Size10(), tc.wantSize == ClusterSizeSize10)
+			}
+			env := scriptEnvMap(t, cfg)
+			if tc.wantSize == ClusterSizeSize10 {
+				if env["ATE_INSTALL_CLUSTER_SIZE"] != ClusterSizeSize10 {
+					t.Errorf("ScriptEnv()[ATE_INSTALL_CLUSTER_SIZE] = %q, want size10", env["ATE_INSTALL_CLUSTER_SIZE"])
+				}
+			} else if _, ok := env["ATE_INSTALL_CLUSTER_SIZE"]; ok {
+				t.Errorf("ScriptEnv() exports ATE_INSTALL_CLUSTER_SIZE = %q for the default profile, want it absent", env["ATE_INSTALL_CLUSTER_SIZE"])
+			}
+		})
+	}
+}
+
+func TestLoadCordonSystemInfraComponents(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+		env  string
+		want bool
+	}{
+		{name: "flag", opts: Options{CordonSystemInfraComponents: true}, want: true},
+		{name: "environment true", env: "true", want: true},
+		{name: "environment false", env: "false", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS", tc.env)
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.CordonSystemInfraComponents != tc.want {
+				t.Errorf("CordonSystemInfraComponents = %v, want %v", cfg.CordonSystemInfraComponents, tc.want)
+			}
+			_, exported := scriptEnvMap(t, cfg)["ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS"]
+			if exported != tc.want {
+				t.Errorf("ScriptEnv() exports ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS = %v, want %v", exported, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadFakeDataPlane(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+		env  string
+		want bool
+	}{
+		{name: "off by default"},
+		{name: "flag", opts: Options{FakeDataPlane: true}, want: true},
+		{name: "environment", env: "true", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_INSTALL_FAKE_DATA_PLANE", tc.env)
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.FakeDataPlane != tc.want {
+				t.Errorf("FakeDataPlane = %v, want %v", cfg.FakeDataPlane, tc.want)
+			}
+			if _, exported := scriptEnvMap(t, cfg)["ATE_INSTALL_FAKE_DATA_PLANE"]; exported != tc.want {
+				t.Errorf("ScriptEnv() exports ATE_INSTALL_FAKE_DATA_PLANE = %v, want %v", exported, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadE2ETuning(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+		env  string
+		want bool
+	}{
+		{name: "off by default"},
+		{name: "flag", opts: Options{E2ETuning: true}, want: true},
+		{name: "environment", env: "true", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_INSTALL_E2E_TUNING", tc.env)
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.E2ETuning != tc.want {
+				t.Errorf("E2ETuning = %v, want %v", cfg.E2ETuning, tc.want)
+			}
+			if _, exported := scriptEnvMap(t, cfg)["ATE_INSTALL_E2E_TUNING"]; exported != tc.want {
+				t.Errorf("ScriptEnv() exports ATE_INSTALL_E2E_TUNING = %v, want %v", exported, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadIngressAllowedSPIFFEIDs(t *testing.T) {
+	const a, b = "spiffe://cluster.local/ns/a/sa/a", "spiffe://cluster.local/ns/b/sa/b"
+	for _, tc := range []struct {
+		name    string
+		env     string
+		want    []string
+		wantErr string
+	}{
+		{name: "unset", want: nil},
+		{name: "one", env: a, want: []string{a}},
+		{name: "several, with stray separators", env: " " + a + ",," + b + ", ", want: []string{a, b}},
+		{name: "not a SPIFFE ID", env: a + ",https://example.com/x", wantErr: "ingressAllowedSPIFFEIDs must be a comma-separated list of SPIFFE IDs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			if tc.env != "" {
+				t.Setenv("ATE_INGRESS_ALLOWED_SPIFFE_IDS", tc.env)
+			}
+			cfg, err := Load(Options{})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !slices.Equal(cfg.IngressAllowedSPIFFEIDs, tc.want) {
+				t.Errorf("IngressAllowedSPIFFEIDs = %q, want %q", cfg.IngressAllowedSPIFFEIDs, tc.want)
+			}
+			got, exported := scriptEnvMap(t, cfg)["ATE_INGRESS_ALLOWED_SPIFFE_IDS"]
+			if want := strings.Join(tc.want, ","); exported != (want != "") || got != want {
+				t.Errorf("ScriptEnv() ATE_INGRESS_ALLOWED_SPIFFE_IDS = %q (exported %v), want %q", got, exported, want)
+			}
+		})
+	}
+}
+
+func TestLoadEgressGatewayExtraSPIFFEIDs(t *testing.T) {
+	const a, b = "spiffe://cluster.local/ns/a/sa/a", "spiffe://cluster.local/ns/b/sa/b"
+	for _, tc := range []struct {
+		name    string
+		env     string
+		want    []string
+		wantErr string
+	}{
+		{name: "unset", want: nil},
+		{name: "several, with stray separators", env: " " + a + ",," + b + ", ", want: []string{a, b}},
+		{name: "not a SPIFFE ID", env: a + ",https://example.com/x", wantErr: "ateapi.authz.egressGatewayExtraSPIFFEIDs must be a comma-separated list of SPIFFE IDs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			if tc.env != "" {
+				t.Setenv("ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS", tc.env)
+			}
+			cfg, err := Load(Options{})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !slices.Equal(cfg.EgressGatewayExtraSPIFFEIDs, tc.want) {
+				t.Errorf("EgressGatewayExtraSPIFFEIDs = %q, want %q", cfg.EgressGatewayExtraSPIFFEIDs, tc.want)
+			}
+			got, exported := scriptEnvMap(t, cfg)["ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS"]
+			if want := strings.Join(tc.want, ","); exported != (want != "") || got != want {
+				t.Errorf("ScriptEnv() ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS = %q (exported %v), want %q", got, exported, want)
+			}
+		})
+	}
+}
+
+// The credential exchange impersonates the transfer account only on GCS, so
+// only a GKE deploy needs one, and its email needs both the name and the
+// project.
+func TestRequireTransferServiceAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cfg     Config
+		wantKey string
+	}{
+		{name: "GKE without a name", cfg: Config{ProjectID: "proj"}, wantKey: "storage.transferGSAName"},
+		{name: "GKE without a project", cfg: Config{TransferGSAName: "xfer"}, wantKey: "gcp.projectID"},
+		{name: "GKE with both", cfg: Config{TransferGSAName: "xfer", ProjectID: "proj"}},
+		{name: "kind without either", cfg: Config{Kind: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.RequireTransferServiceAccount()
+			if tc.wantKey == "" {
+				if err != nil {
+					t.Fatalf("RequireTransferServiceAccount() = %v, want nil", err)
+				}
+				return
+			}
+			var required *RequiredError
+			if !errors.As(err, &required) || required.Setting.Key != tc.wantKey {
+				t.Fatalf("RequireTransferServiceAccount() = %v, want a RequiredError for %s", err, tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestLoadTransferServiceAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		opts     Options
+		env      map[string]string
+		wantName string
+		want     string
+	}{
+		{name: "built from the name and the project", env: map[string]string{"SNAPSHOT_TRANSFER_GSA_NAME": "xfer", "PROJECT_ID": "proj"}, wantName: "xfer", want: "xfer@proj.iam.gserviceaccount.com"},
+		{name: "no default name", env: map[string]string{"PROJECT_ID": "proj"}},
+		{name: "kind ignores the environment", opts: Options{Kind: true}, env: map[string]string{"SNAPSHOT_TRANSFER_GSA_NAME": "xfer", "PROJECT_ID": "proj"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.TransferGSAName != tc.wantName {
+				t.Errorf("TransferGSAName = %q, want %q", cfg.TransferGSAName, tc.wantName)
+			}
+			if got := cfg.TransferServiceAccount(); got != tc.want {
+				t.Errorf("TransferServiceAccount() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadDockerBuildFlags(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("DOCKER_BUILD_FLAGS", " --cache-from type=gha  --cache-to type=gha,mode=max ")
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"--cache-from", "type=gha", "--cache-to", "type=gha,mode=max"}
+	if !slices.Equal(cfg.DockerBuildFlags, want) {
+		t.Errorf("DockerBuildFlags = %q, want %q", cfg.DockerBuildFlags, want)
+	}
+}
+
+// The preview gates arrive from any channel as one comma-separated value. An
+// explicitly empty one turns every gate off, even over a lower channel's.
+func TestLoadPreviewGates(t *testing.T) {
+	preview.InitForTestFake(t, []preview.Gate{"A", "B"})
+
+	// nil leaves the channel out; a pointer to "" supplies it, empty.
+	val := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name            string
+		flag, file, env *string
+		want            []string
+	}{
+		{name: "default"},
+		{name: "flag all", flag: val("ALL"), want: []string{"ALL"}},
+		{name: "flag list", flag: val("A,B"), want: []string{"A", "B"}},
+		{name: "file", file: val("A, B"), want: []string{"A", "B"}},
+		{name: "environment", env: val("ALL"), want: []string{"ALL"}},
+		{name: "empty items dropped", env: val(",A,,"), want: []string{"A"}},
+		{name: "file beats environment", file: val("A"), env: val("ALL"), want: []string{"A"}},
+		{name: "flag beats file", flag: val("B"), file: val("A"), want: []string{"B"}},
+		{name: "empty flag beats environment", flag: val(""), env: val("ALL")},
+		{name: "empty file beats environment", file: val(""), env: val("ALL")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			if tc.env != nil {
+				t.Setenv("ATE_PREVIEW", *tc.env)
+			}
+			fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			BindFlags(fs)
+			if tc.flag != nil {
+				if err := fs.Set("preview", *tc.flag); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var lo LoadOptions
+			if tc.file != nil {
+				lo.ConfigPath = filepath.Join(t.TempDir(), "install.yaml")
+				body := "apiVersion: " + FileAPIVersion + "\nkind: " + FileKind + "\n" +
+					"preview: " + strconv.Quote(*tc.file) + "\n"
+				if err := os.WriteFile(lo.ConfigPath, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := LoadFlags(fs, lo)
+			if err != nil {
+				t.Fatalf("LoadFlags() error = %v", err)
+			}
+			if !slices.Equal(cfg.PreviewGates, tc.want) {
+				t.Errorf("PreviewGates = %q, want %q", cfg.PreviewGates, tc.want)
+			}
+			got, exported := scriptEnvMap(t, cfg)["ATE_PREVIEW"]
+			if want := strings.Join(tc.want, ","); got != want || exported != (want != "") {
+				t.Errorf("ScriptEnv() ATE_PREVIEW = %q (exported %v), want %q", got, exported, want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnknownPreviewGates(t *testing.T) {
+	preview.InitForTestFake(t, []preview.Gate{"Fake"})
+	for _, tc := range []struct {
+		name    string
+		env     string
+		wantErr string
+	}{
+		{name: "all", env: "ALL"},
+		{name: "known gate", env: "Fake"},
+		{name: "unknown gate", env: "NoSuchGate", wantErr: "ATE_PREVIEW"},
+		{name: "unknown among known", env: "ALL,NoSuchGate", wantErr: "ATE_PREVIEW"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_PREVIEW", tc.env)
+			_, err := Load(Options{})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), "NoSuchGate") {
+				t.Fatalf("Load() error = %v, want one naming NoSuchGate and %s", err, tc.wantErr)
+			}
+		})
 	}
 }
 
 func TestLoadFlagsBeatEnvironment(t *testing.T) {
 	loadEnv(t)
-	t.Setenv("ATE_ATENET_ROUTER", RouterEnvoy)
+	t.Setenv("ATE_ATENET_DATAPLANE", RouterEnvoy)
 	t.Setenv("ATE_INSTALL_ROLLOUT_TIMEOUT", "30s")
 
 	cfg, err := Load(Options{Router: RouterAgentgateway, RolloutTimeout: "120s"})
@@ -100,23 +534,48 @@ func TestLoadFlagsBeatEnvironment(t *testing.T) {
 	}
 }
 
-// ATE_API_POSTGRES_CONNECTION_STRING is how a developer points the apiserver at
-// their own database, the same override the shell installer honored.
-func TestLoadPostgresConnectionStringOverride(t *testing.T) {
+func TestLoadPostgresConnectionStrings(t *testing.T) {
 	loadEnv(t)
 	const dsn = "postgresql://someone@db.example:5432/atepg?sslmode=disable"
-	t.Setenv("ATE_API_POSTGRES_CONNECTION_STRING", dsn)
+	t.Setenv("ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING", dsn)
 
 	cfg, err := Load(Options{})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.PostgresConnString() != dsn {
-		t.Errorf("PostgresConnString() = %q, want %q", cfg.PostgresConnString(), dsn)
+	if cfg.PostgresReadWriteConnectionString != dsn || cfg.PostgresOwnerConnectionString != dsn {
+		t.Errorf("PostgreSQL connections = %q, %q, want %q for both", cfg.PostgresReadWriteConnectionString, cfg.PostgresOwnerConnectionString, dsn)
+	}
+
+	t.Setenv("ATE_API_POSTGRES_OWNER_CONNECTION_STRING", "owner-dsn")
+	cfg, err = Load(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PostgresReadWriteConnectionString != dsn || cfg.PostgresOwnerConnectionString != "owner-dsn" {
+		t.Errorf("separate PostgreSQL connections = %q, %q, want %q and owner-dsn", cfg.PostgresReadWriteConnectionString, cfg.PostgresOwnerConnectionString, dsn)
 	}
 }
 
-// ATE_API_POSTGRES_SCHEMA defaults to public, as in the shell installer, and
+func TestLoadPostgresIdentityOverrides(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING", "readwrite-dsn")
+	t.Setenv("ATE_API_POSTGRES_OWNER_CONNECTION_STRING", "owner-dsn")
+	t.Setenv("ATE_API_POSTGRES_READ_WRITE_ROLE", "tenant_readwrite")
+	t.Setenv("ATE_API_POSTGRES_OWNER_ROLE", "tenant_owner")
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PostgresReadWriteConnectionString != "readwrite-dsn" || cfg.PostgresOwnerConnectionString != "owner-dsn" || cfg.PostgresReadWriteRole != "tenant_readwrite" || cfg.PostgresOwnerRole != "tenant_owner" {
+		t.Fatalf("PostgreSQL identity overrides not loaded: %+v", cfg)
+	}
+	if !cfg.PostgresReadWriteRoleSet || !cfg.PostgresOwnerRoleSet {
+		t.Fatalf("PostgreSQL role overrides not marked as explicit: %+v", cfg)
+	}
+}
+
+// ATE_API_POSTGRES_SCHEMA defaults to substrate, as in the apiserver, and
 // an explicit value wins.
 func TestLoadPostgresSchema(t *testing.T) {
 	loadEnv(t)
@@ -124,17 +583,341 @@ func TestLoadPostgresSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.PostgresSchemaName() != DefaultPostgresSchema {
-		t.Errorf("PostgresSchemaName() = %q, want %q", cfg.PostgresSchemaName(), DefaultPostgresSchema)
+	if cfg.PostgresSchemaName() != "substrate" {
+		t.Errorf("PostgresSchemaName() = %q, want %q", cfg.PostgresSchemaName(), "substrate")
 	}
 
-	t.Setenv("ATE_API_POSTGRES_SCHEMA", "substrate")
+	t.Setenv("ATE_API_POSTGRES_SCHEMA", "tenant_schema")
 	cfg, err = Load(Options{})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.PostgresSchemaName() != "substrate" {
-		t.Errorf("PostgresSchemaName() = %q, want %q", cfg.PostgresSchemaName(), "substrate")
+	if cfg.PostgresSchemaName() != "tenant_schema" {
+		t.Errorf("PostgresSchemaName() = %q, want %q", cfg.PostgresSchemaName(), "tenant_schema")
+	}
+}
+
+// The apiserver reads its pool size and its server CA out of the DSN and a
+// mounted file respectively, neither of which the shell installer synthesizes.
+func TestLoadPostgresTuning(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ATE_API_POSTGRES_POOL_MAX_CONNS", "50")
+	t.Setenv("ATE_API_POSTGRES_SERVER_CA_FILE", "/etc/ssl/server-ca.pem")
+
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.PostgresPoolMaxConns != "50" {
+		t.Errorf("PostgresPoolMaxConns = %q, want 50", cfg.PostgresPoolMaxConns)
+	}
+	if want := "/etc/ssl/server-ca.pem"; cfg.PostgresServerCAFile != want {
+		t.Errorf("PostgresServerCAFile = %q, want %q", cfg.PostgresServerCAFile, want)
+	}
+}
+
+// ATE_API_POSTGRES_CLOUDSQL_INSTANCE is three-way, and Load is where the
+// distinction is made: everything downstream sees only Instance and
+// InstanceSet.
+func TestLoadCloudSQL(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		loadEnv(t)
+		cfg, err := Load(Options{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.CloudSQL.InstanceSet {
+			t.Errorf("CloudSQL = %+v, want InstanceSet false so the cluster's record is adopted", cfg.CloudSQL)
+		}
+	})
+
+	t.Run("exported but empty removes Cloud SQL", func(t *testing.T) {
+		loadEnv(t)
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_INSTANCE", "")
+		cfg, err := Load(Options{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.CloudSQL.InstanceSet || cfg.CloudSQL.Instance != "" {
+			t.Errorf("CloudSQL = %+v, want an explicitly empty instance", cfg.CloudSQL)
+		}
+	})
+
+	t.Run("fully specified", func(t *testing.T) {
+		loadEnv(t)
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_INSTANCE", "p:r:i")
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_GSA", "ate@p.iam.gserviceaccount.com")
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH", "false")
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_IP_TYPE", CloudSQLIPTypePSC)
+
+		cfg, err := Load(Options{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		want := CloudSQLConfig{
+			Instance:    "p:r:i",
+			InstanceSet: true,
+			GSA:         "ate@p.iam.gserviceaccount.com",
+			IAMAuth:     "false",
+			IPType:      CloudSQLIPTypePSC,
+		}
+		if cfg.CloudSQL != want {
+			t.Errorf("CloudSQL = %+v, want %+v", cfg.CloudSQL, want)
+		}
+	})
+
+	// An unrecognized IP type reaches the proxy as an unset flag, which silently
+	// dials the public address instead of the private one that was meant.
+	t.Run("rejects an unknown IP type", func(t *testing.T) {
+		loadEnv(t)
+		t.Setenv("ATE_API_POSTGRES_CLOUDSQL_IP_TYPE", "internal")
+		if _, err := Load(Options{}); err == nil || !strings.Contains(err.Error(), "ATE_API_POSTGRES_CLOUDSQL_IP_TYPE") {
+			t.Fatalf("Load() error = %v, want it to name the invalid IP type", err)
+		}
+	})
+}
+
+// EXPECTED_JWT_ISSUER overrides the issuer derived from the GKE coordinates,
+// which is how a cluster authenticating against something other than its own
+// OIDC discovery document is installed.
+func TestLoadExpectedJWTIssuer(t *testing.T) {
+	loadEnv(t)
+	const issuer = "https://issuer.example.com"
+	t.Setenv("EXPECTED_JWT_ISSUER", issuer)
+
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ExpectedJWTIssuer != issuer {
+		t.Errorf("ExpectedJWTIssuer = %q, want %q", cfg.ExpectedJWTIssuer, issuer)
+	}
+}
+
+// An unset level stays empty, so that a deploy keeps the level an existing
+// install has rather than resetting it to the default.
+func TestLoadAPILogLevel(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		env     string
+		flag    string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset", want: ""},
+		{name: "environment", env: "debug", want: "debug"},
+		{name: "flag beats environment", env: "debug", flag: "warn", want: "warn"},
+		{name: "unsupported", env: "verbose", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_API_LOG_LEVEL", tt.env)
+			fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			BindFlags(fs)
+			if tt.flag != "" {
+				if err := fs.Set("ateapi-log-level", tt.flag); err != nil {
+					t.Fatalf("Set(--ateapi-log-level) error = %v", err)
+				}
+			}
+
+			cfg, err := LoadFlags(fs, LoadOptions{NoDevEnv: true})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("LoadFlags() with ATE_API_LOG_LEVEL=%q returned nil error", tt.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadFlags() error = %v", err)
+			}
+			if cfg.APILogLevel != tt.want {
+				t.Errorf("APILogLevel = %q, want %q", cfg.APILogLevel, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadAPIAuthz(t *testing.T) {
+	const (
+		clientOwner = "system:serviceaccount:ate-system:ate-client"
+		owners      = "alice@example.com,bob@example.com"
+	)
+	for _, tc := range []struct {
+		name       string
+		env        map[string]string
+		wantOwners string
+		wantErr    bool
+	}{
+		{
+			name:       "owned by the client ServiceAccount by default",
+			wantOwners: clientOwner,
+		},
+		{
+			name:       "default owner follows the namespace",
+			env:        map[string]string{"ATE_NAMESPACE": "custom"},
+			wantOwners: "system:serviceaccount:custom:ate-client",
+		},
+		{
+			name:       "explicit owners replace the default",
+			env:        map[string]string{"ATE_API_AUTHZ_BOOTSTRAP_OWNERS": owners},
+			wantOwners: owners,
+		},
+		{
+			name:    "only separators",
+			env:     map[string]string{"ATE_API_AUTHZ_BOOTSTRAP_OWNERS": " , "},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+			cfg, err := Load(Options{})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "bootstrap owner") {
+					t.Fatalf("Load() error = %v, want the missing bootstrap owner error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.APIAuthzBootstrapOwners != tc.wantOwners {
+				t.Errorf("APIAuthzBootstrapOwners = %q, want %q", cfg.APIAuthzBootstrapOwners, tc.wantOwners)
+			}
+		})
+	}
+}
+
+func TestLoadActorJWTAlgorithm(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		env     string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset", env: "", want: "ES256"},
+		{name: "RS256", env: "RS256", want: "RS256"},
+		{name: "unsupported", env: "HS256", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			loadEnv(t)
+			// Unset rather than blanked for the case that wants the default:
+			// an exported empty value is an algorithm the operator supplied,
+			// and no empty string is a valid one.
+			if tt.env == "" {
+				unsetEnv(t, "ACTOR_JWT_ALGORITHM")
+			} else {
+				t.Setenv("ACTOR_JWT_ALGORITHM", tt.env)
+			}
+
+			cfg, err := Load(Options{})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Load() with ACTOR_JWT_ALGORITHM=%q returned nil error", tt.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.ActorJWTAlgorithm != tt.want {
+				t.Errorf("ActorJWTAlgorithm = %q, want %q", cfg.ActorJWTAlgorithm, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadActorJWTIssuer(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		env       string
+		namespace string
+		want      string
+		wantErr   bool
+	}{
+		{name: "unset", want: "https://idp.ate-system.svc"},
+		{name: "unset in a relocated install", namespace: "team-a", want: "https://idp.team-a.svc"},
+		{name: "set is used as given", env: "https://idp.example.com", want: "https://idp.example.com"},
+		{name: "not https", env: "http://idp.example.com", wantErr: true},
+		{name: "path", env: "https://idp.example.com/prod", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			loadEnv(t)
+			if tt.env != "" {
+				t.Setenv("ACTOR_JWT_ISSUER", tt.env)
+			}
+			if tt.namespace != "" {
+				t.Setenv("ATE_NAMESPACE", tt.namespace)
+			} else {
+				unsetEnv(t, "ATE_NAMESPACE")
+			}
+
+			cfg, err := Load(Options{})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Load() with ACTOR_JWT_ISSUER=%q returned nil error", tt.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.ActorJWTIssuer != tt.want {
+				t.Errorf("ActorJWTIssuer = %q, want %q", cfg.ActorJWTIssuer, tt.want)
+			}
+		})
+	}
+}
+
+// The endpoint has to reach both the Go steps and the shell scripts ate-setup
+// still delegates to, or the two halves of an install export different
+// collectors.
+func TestLoadOtlpEndpoint(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ATE_OTLP_ENDPOINT", "http://from-environment:4317")
+
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := "http://from-environment:4317"; cfg.OtlpEndpoint != want {
+		t.Errorf("OtlpEndpoint = %q, want %q", cfg.OtlpEndpoint, want)
+	}
+
+	cfg, err = Load(Options{OtlpEndpoint: "http://from-flag:4317"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := "http://from-flag:4317"; cfg.OtlpEndpoint != want {
+		t.Errorf("OtlpEndpoint = %q, want %q", cfg.OtlpEndpoint, want)
+	}
+	if got := scriptEnvMap(t, cfg)["ATE_OTLP_ENDPOINT"]; got != "http://from-flag:4317" {
+		t.Errorf("ScriptEnv()[ATE_OTLP_ENDPOINT] = %q, want the flag's value", got)
+	}
+}
+
+// ATE_INSTALL_KIND has to select the Kind profile as completely as --kind does;
+// a Kind install that only half-applied would push images to the wrong
+// registry.
+func TestLoadKindFromEnvironment(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ATE_INSTALL_KIND", "true")
+	t.Setenv("PROJECT_ID", "some-project")
+
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Kind {
+		t.Error("Kind = false, want true")
+	}
+	if cfg.KODockerRepo != "localhost:5001" {
+		t.Errorf("KODockerRepo = %q, want the Kind default", cfg.KODockerRepo)
+	}
+	if cfg.ProjectID != "" {
+		t.Errorf("ProjectID = %q, want it cleared by the Kind profile", cfg.ProjectID)
 	}
 }
 
@@ -168,6 +951,40 @@ func TestLoadKubeconfigFallsBackToEnvironment(t *testing.T) {
 	}
 }
 
+// A developer who juggles clusters sets KUBECONFIG to a list. client-go's
+// explicit path is one file, so forwarding the list makes every command fail
+// with "stat /a.yaml:/b.yaml: no such file or directory"; the loading rules
+// read and merge the list themselves when no explicit path is given.
+func TestLoadKubeconfigListStaysWithTheLoadingRules(t *testing.T) {
+	loadEnv(t)
+	list := strings.Join([]string{"/home/dev/a.yaml", "/home/dev/b.yaml"}, string(os.PathListSeparator))
+	t.Setenv("KUBECONFIG", list)
+
+	cfg, err := Load(Options{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Kubeconfig != "" {
+		t.Errorf("Kubeconfig = %q, want it empty so the client-go loading rules merge the list", cfg.Kubeconfig)
+	}
+	// kubectl understands the list, so the scripts still get it verbatim.
+	if !slices.Contains(cfg.ScriptEnv(), "KUBECONFIG="+list) {
+		t.Errorf("ScriptEnv() does not carry KUBECONFIG=%s: %v", list, cfg.ScriptEnv())
+	}
+
+	// An explicit --kubeconfig is one file by definition and still wins.
+	cfg, err = Load(Options{Kubeconfig: "/tmp/explicit.yaml"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := "/tmp/explicit.yaml"; cfg.Kubeconfig != want {
+		t.Errorf("Kubeconfig = %q, want %q", cfg.Kubeconfig, want)
+	}
+	if !slices.Contains(cfg.ScriptEnv(), "KUBECONFIG=/tmp/explicit.yaml") {
+		t.Errorf("ScriptEnv() does not carry the --kubeconfig value: %v", cfg.ScriptEnv())
+	}
+}
+
 // The shell installer left the podcertificate-controller and CSI waits at 120s
 // and pointed --rollout-timeout only at the ate-system rollouts. WaitTimeout
 // lets the flag reach every wait without its 60s default shortening the slow
@@ -188,7 +1005,14 @@ func TestWaitTimeout(t *testing.T) {
 		{"the environment counts as asking too", Options{}, "10m", 10 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ATE_INSTALL_ROLLOUT_TIMEOUT", tc.env)
+			// Unset rather than blanked for the cases that do not exercise
+			// the variable: an exported empty value is a duration the
+			// operator supplied, and no empty string is one.
+			if tc.env == "" {
+				unsetEnv(t, "ATE_INSTALL_ROLLOUT_TIMEOUT")
+			} else {
+				t.Setenv("ATE_INSTALL_ROLLOUT_TIMEOUT", tc.env)
+			}
 
 			cfg, err := Load(tc.opts)
 			if err != nil {
@@ -210,14 +1034,209 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	}{
 		{"router", Options{Router: "nginx"}},
 		{"rollout timeout", Options{RolloutTimeout: "invalid"}},
+		// Both parse. Accepted, they would turn every wait into a single probe
+		// that fails against a workload which has not started yet.
+		{"zero rollout timeout", Options{RolloutTimeout: "0s"}},
+		{"negative rollout timeout", Options{RolloutTimeout: "-30s"}},
 		{"podcert workers", Options{PodcertWorkersPerSigner: -1}},
-		{"extproc missing sdsmint", Options{AdditionalEgressExtprocService: "ate-system/extproc:50051"}},
-		{"extproc invalid format", Options{ExperimentalUseSDSMint: true, AdditionalEgressExtprocService: "extproc:50051"}},
-		{"extproc agentgateway", Options{ExperimentalUseSDSMint: true, Router: RouterAgentgateway, AdditionalEgressExtprocService: "ate-system/extproc:50051"}},
+		{"cluster size", Options{ClusterSize: "size5"}},
+		{"extproc invalid format", Options{AdditionalEgressExtprocService: "extproc:50051"}},
+		{"extproc agentgateway", Options{Router: RouterAgentgateway, AdditionalEgressExtprocService: "ate-system/extproc:50051"}},
+		{"provider not JSON", Options{CredentialProvider: "k8s.io"}},
+		{"provider as a JSON string", Options{CredentialProvider: `"off"`}},
+		{"provider null", Options{CredentialProvider: `null`}},
+		{"provider without a name", Options{CredentialProvider: `{"address":"vault.ate-system.svc:8200"}`}},
+		{"provider with an unknown key", Options{CredentialProvider: `{"name":"k8s.io","adress":"x:1"}`}},
+		{"provider with trailing data", Options{CredentialProvider: `{"enabled":false} {"name":"k8s.io"}`}},
+		{"provider name with a scheme", Options{CredentialProvider: `{"name":"ate-secret://k8s.io"}`}},
+		{"provider name not lowercase", Options{CredentialProvider: `{"name":"Vault.example.com","address":"vault.ate-system.svc:8200"}`}},
+		{"provider name with a port", Options{CredentialProvider: `{"name":"k8s.io:443"}`}},
+		{"provider name with a path", Options{CredentialProvider: `{"name":"k8s.io/default"}`}},
+		{"provider name with a query", Options{CredentialProvider: `{"name":"k8s.io?x=1"}`}},
+		{"disabled with a name", Options{CredentialProvider: `{"enabled":false,"name":"k8s.io"}`}},
+		{"disabled with an address", Options{CredentialProvider: `{"enabled":false,"address":"stale.ate-system.svc:50051"}`}},
+		{"enabled without a name", Options{CredentialProvider: `{"enabled":true}`}},
+		{"kubernetes address without a port", Options{CredentialProvider: `{"name":"k8s.io","address":"secrets.ate-system.svc"}`}},
+		{"other provider without an address", Options{CredentialProvider: `{"name":"vault.example.com"}`}},
+		{"other provider address without a port", Options{CredentialProvider: `{"name":"vault.example.com","address":"vault.ate-system.svc"}`}},
+		{"provider array empty", Options{CredentialProvider: `[]`}},
+		{"provider array entry disabled", Options{CredentialProvider: `[{"enabled":false}]`}},
+		{"provider array with a repeated name", Options{CredentialProvider: `[{"name":"k8s.io"},{"name":"k8s.io"}]`}},
+		{"provider array entry without an address", Options{CredentialProvider: `[{"name":"k8s.io"},{"name":"vault.example.com"}]`}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Load(tc.opts); err == nil {
 				t.Fatal("Load() succeeded, want an error")
+			}
+		})
+	}
+}
+
+// The provider selection is required only where the egress gateway is
+// rendered, so Load accepts an absent value and CredentialProviders refuses it.
+func TestCredentialProvider(t *testing.T) {
+	loadEnv(t)
+
+	for _, tc := range []struct {
+		name    string
+		opts    Options
+		env     map[string]string
+		want    CredentialProvider
+		wantErr bool
+	}{
+		{name: "absent is an error", opts: Options{}, wantErr: true},
+		{name: "disabled", opts: Options{CredentialProvider: `{"enabled":false}`}},
+		{name: "disabled on agentgateway", opts: Options{Router: RouterAgentgateway, CredentialProvider: `{"enabled":false}`}},
+		{
+			name: "kubernetes on agentgateway",
+			opts: Options{Router: RouterAgentgateway, CredentialProvider: `{"name":"k8s.io"}`},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress},
+		},
+		{
+			name: "another provider on agentgateway",
+			opts: Options{Router: RouterAgentgateway, CredentialProvider: `{"name":"vault.example.com","address":"vault.ate-system.svc:50051"}`},
+			want: CredentialProvider{Name: "vault.example.com", Address: "vault.ate-system.svc:50051"},
+		},
+		{
+			name: "enabled true names a provider",
+			opts: Options{CredentialProvider: `{"enabled":true,"name":"k8s.io"}`},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress},
+		},
+		{
+			name: "kubernetes gets the bundled address",
+			opts: Options{CredentialProvider: `{"name":"k8s.io"}`},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress},
+		},
+		{
+			name: "kubernetes keeps a given address",
+			opts: Options{CredentialProvider: `{"name":"k8s.io","address":"secrets.ate-system.svc:443"}`},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: "secrets.ate-system.svc:443"},
+		},
+		{
+			name: "another provider",
+			opts: Options{CredentialProvider: `{"name":"vault.example.com","address":"vault.ate-system.svc:50051"}`},
+			want: CredentialProvider{Name: "vault.example.com", Address: "vault.ate-system.svc:50051"},
+		},
+		{
+			name: "whitespace is allowed",
+			opts: Options{CredentialProvider: ` { "name" : "k8s.io" } `},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress},
+		},
+		{
+			name: "the environment selects too",
+			env:  map[string]string{"ATE_CREDENTIAL_PROVIDER": `{"name":"k8s.io"}`},
+			want: CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress},
+		},
+		{
+			name: "the flag overrides the environment",
+			opts: Options{CredentialProvider: `{"enabled":false}`},
+			env:  map[string]string{"ATE_CREDENTIAL_PROVIDER": `{"name":"vault.example.com","address":"vault.ate-system.svc:50051"}`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load(tc.opts)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			got, err := cfg.CredentialProviders()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("CredentialProviders() succeeded, want an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CredentialProviders() error = %v", err)
+			}
+			var want []CredentialProvider
+			if tc.want.Enabled() {
+				want = []CredentialProvider{tc.want}
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("CredentialProviders() = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestCredentialProvidersArray(t *testing.T) {
+	loadEnv(t)
+	k8s := CredentialProvider{Name: K8sCredentialProviderName, Address: K8sCredentialProviderAddress}
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		want    []CredentialProvider
+		wantErr string
+	}{
+		{name: "an array of one", raw: `[{"name":"k8s.io"}]`, want: []CredentialProvider{k8s}},
+		{
+			name: "several providers",
+			raw:  `[{"name":"k8s.io"},{"name":"sts.example.com","address":"sts.ate-system.svc:50051"}]`,
+			want: []CredentialProvider{k8s, {Name: "sts.example.com", Address: "sts.ate-system.svc:50051"}},
+		},
+		{name: "a null entry", raw: `[null]`, wantErr: "array entries must be JSON objects"},
+		{name: "a string entry", raw: `["k8s.io"]`, wantErr: "array entries must be JSON objects"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(Options{CredentialProvider: tc.raw})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			got, err := cfg.CredentialProviders()
+			if err != nil {
+				t.Fatalf("CredentialProviders() error = %v", err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("CredentialProviders() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasKubernetesProvider(t *testing.T) {
+	k8s := CredentialProvider{Name: K8sCredentialProviderName}
+	vault := CredentialProvider{Name: "vault.example.com"}
+	for _, tc := range []struct {
+		providers []CredentialProvider
+		want      bool
+	}{
+		{nil, false},
+		{[]CredentialProvider{vault}, false},
+		{[]CredentialProvider{vault, k8s}, true},
+	} {
+		if got := HasKubernetesProvider(tc.providers); got != tc.want {
+			t.Errorf("HasKubernetesProvider(%v) = %v, want %v", tc.providers, got, tc.want)
+		}
+	}
+}
+
+func TestCredentialProviderServerName(t *testing.T) {
+	for addr, want := range map[string]string{
+		"k8s-credential-provider.ate-system.svc:50051": "k8s-credential-provider.ate-system.svc",
+		"vault.example.com":                            "vault.example.com",
+	} {
+		if got := (CredentialProvider{Address: addr}).ServerName(); got != want {
+			t.Errorf("ServerName(%q) = %q, want %q", addr, got, want)
+		}
+	}
+}
+
+func TestLoadRejectsInvalidRolloutTimeoutEnv(t *testing.T) {
+	loadEnv(t)
+	for _, val := range []string{"0", "0s", "-1m", "forever"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("ATE_INSTALL_ROLLOUT_TIMEOUT", val)
+			if _, err := Load(Options{}); err == nil {
+				t.Fatalf("Load() with env %q succeeded, want an error", val)
 			}
 		})
 	}
@@ -235,8 +1254,32 @@ func TestLoadRejectsInvalidPodcertWorkersEnv(t *testing.T) {
 	}
 }
 
-// --kind must reproduce the exports in the shell kind installer, including
-// clearing the GKE coordinates and isolating the snapshot bucket name.
+func TestLoadEnvoyConcurrency(t *testing.T) {
+	loadEnv(t)
+	cfg, err := Load(Options{EnvoyConcurrency: 4})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.EnvoyConcurrency != 4 {
+		t.Errorf("EnvoyConcurrency = %d, want 4", cfg.EnvoyConcurrency)
+	}
+	if got := scriptEnvMap(t, cfg)["E2E_ATE_ENVOY_CONCURRENCY"]; got != "4" {
+		t.Errorf("ScriptEnv()[E2E_ATE_ENVOY_CONCURRENCY] = %q, want 4", got)
+	}
+
+	for _, val := range []string{"0", "-1", "abc"} {
+		t.Run("invalid_"+val, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("E2E_ATE_ENVOY_CONCURRENCY", val)
+			if _, err := Load(Options{}); err == nil {
+				t.Fatalf("Load() with E2E_ATE_ENVOY_CONCURRENCY=%q succeeded, want an error", val)
+			}
+		})
+	}
+}
+
+// --kind must apply the whole Kind profile, including clearing the GKE
+// coordinates and isolating the snapshot bucket name.
 func TestLoadKindProfile(t *testing.T) {
 	loadEnv(t)
 	t.Setenv("PROJECT_ID", "some-gke-project")
@@ -357,6 +1400,37 @@ func TestSourceShellEnv(t *testing.T) {
 	}
 }
 
+// Developer env files print: they call gcloud, they announce the project they
+// picked. That output must not land in the record stream, where it would be
+// glued onto the first variable printed and lose it.
+func TestSourceShellEnvIgnoresScriptOutput(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "env.sh")
+	script := "echo 'Using project demo-project'\n" +
+		"printf 'no trailing newline either'\n" +
+		"export AAA_FIRST=one\n" +
+		"export PROJECT_ID=demo-project\n"
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	env, err := sourceShellEnv(path, dir)
+	if err != nil {
+		t.Fatalf("sourceShellEnv() error = %v", err)
+	}
+	if env["AAA_FIRST"] != "one" {
+		t.Errorf("AAA_FIRST = %q, want one", env["AAA_FIRST"])
+	}
+	if env["PROJECT_ID"] != "demo-project" {
+		t.Errorf("PROJECT_ID = %q, want demo-project", env["PROJECT_ID"])
+	}
+	for name := range env {
+		if strings.Contains(name, "Using project") {
+			t.Errorf("script output was parsed as a variable name: %q", name)
+		}
+	}
+}
+
 func TestSourceShellEnvReportsFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "env.sh")
@@ -407,18 +1481,20 @@ func TestLoadImageSource(t *testing.T) {
 		{
 			name:      "a repo needs a tag",
 			opts:      Options{ImageRepo: "example.com/substrate"},
-			wantError: "--image-repo (or ATE_IMAGE_REPO) requires --image-tag",
+			wantError: `images.repo="example.com/substrate" (from --image-repo) conflicts with images.tag="" (from default)`,
 		},
 		{
 			name:      "a tag needs a repo",
 			opts:      Options{ImageTag: "v1"},
-			wantError: "--image-tag (or ATE_IMAGE_TAG) requires --image-repo",
+			wantError: `images.tag="v1" (from --image-tag) conflicts with images.repo="" (from default)`,
 		},
 		{
 			// The environment reaches validation the same way the flags do.
+			// The channel is named, so a reader who exported the variable is
+			// not sent to look for a flag they never used.
 			name:      "a tag from the environment needs a repo",
 			env:       map[string]string{"ATE_IMAGE_TAG": "v1"},
-			wantError: "--image-tag (or ATE_IMAGE_TAG) requires --image-repo",
+			wantError: `images.tag="v1" (from ATE_IMAGE_TAG) conflicts with images.repo="" (from default)`,
 		},
 	}
 

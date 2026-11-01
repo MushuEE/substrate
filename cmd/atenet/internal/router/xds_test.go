@@ -27,17 +27,22 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"sigs.k8s.io/yaml"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	streamaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
+	setfilterstatecommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/common/set_filter_state/v3"
+	setfilterstatev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/set_filter_state/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
@@ -46,9 +51,66 @@ import (
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
-	"github.com/agent-substrate/substrate/internal/atunnel"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/ingress"
+	atunnelingress "go.ate.dev/substrate/internal/atunnel/ingress"
 )
+
+func TestActorRoutingFilterStateFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		captureAuthority bool
+		want             map[string]string
+	}{
+		{
+			name: "ordinary ingress",
+			want: map[string]string{
+				extproc.TargetActorFilterStateKey: "%CEL(request.headers['ate-target-actor'])%",
+			},
+		},
+		{
+			name:             "CONNECT termination",
+			captureAuthority: true,
+			want: map[string]string{
+				extproc.TargetActorFilterStateKey:      "%CEL(request.headers['ate-target-actor'])%",
+				extproc.ConnectAuthorityFilterStateKey: "%REQ(:authority)%",
+				connectPoolFilterStateKey:              "%CEL(request.headers['ate-target-actor'])%|%REQ(:authority)%",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filter := actorRoutingFilterStateFilter(tc.captureAuthority)
+			config := &setfilterstatev3.Config{}
+			if err := filter.GetTypedConfig().UnmarshalTo(config); err != nil {
+				t.Fatalf("unmarshal set_filter_state config: %v", err)
+			}
+
+			if len(config.GetOnRequestHeaders()) != len(tc.want) {
+				t.Fatalf("captured values = %d, want %d", len(config.GetOnRequestHeaders()), len(tc.want))
+			}
+			for _, value := range config.GetOnRequestHeaders() {
+				key := value.GetObjectKey()
+				format := value.GetFormatString().GetTextFormatSource().GetInlineString()
+				if format != tc.want[key] {
+					t.Errorf("capture %q = %q, want %q", key, format, tc.want[key])
+				}
+				if key != extproc.ConnectAuthorityFilterStateKey && key != connectPoolFilterStateKey && strings.Contains(strings.ToLower(format), ":authority") {
+					t.Errorf("capture %q derives actor routing from authority", key)
+				}
+				// Only the pool key may be hashable: it partitions main_internal's
+				// connections by actor and authority, and a second hashable value
+				// would split the pool.
+				wantFactory := "envoy.string"
+				if key == connectPoolFilterStateKey {
+					wantFactory = "envoy.hashable_string"
+				}
+				if value.GetFactoryKey() != wantFactory {
+					t.Errorf("capture %q uses factory %q, want %q", key, value.GetFactoryKey(), wantFactory)
+				}
+			}
+		})
+	}
+}
 
 // assertDualStackIngress checks an ingress listener keeps its 0.0.0.0 primary
 // and gains exactly one "::" socket on the same port.
@@ -112,9 +174,17 @@ func assertHCMWebsocketUpgrade(t *testing.T, l *listenerv3.Listener) {
 	}
 }
 
+// setIngressTLS enables the HTTPS listener with the client authentication
+// every TLS listener requires.
+func setIngressTLS(server *XdsServer) {
+	server.SetTlsConfig(8443, "/run/servicedns.podcert.ate.dev/credential-bundle.pem")
+	server.SetDownstreamClientAuth("/run/podidentity.podcert.ate.dev/trust-bundle.pem", []string{"spiffe://cluster.local/ns/demo/sa/client"})
+}
+
 func TestXdsServer_UpdateSnapshot(t *testing.T) {
 	server := NewXdsServer(18000)
-	server.SetConfig(8081, 50052, "10.0.0.1")
+	server.SetConfig(50052, "10.0.0.1")
+	setIngressTLS(server)
 
 	err := server.UpdateSnapshot()
 	if err != nil {
@@ -211,11 +281,11 @@ func TestXdsServer_UpdateSnapshot(t *testing.T) {
 		t.Fatalf("Expected 1 listener definition, got %d", len(listenersMap))
 	}
 
-	if raw, exists := listenersMap[IngressHTTPListener]; !exists {
-		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPListener)
+	if raw, exists := listenersMap[IngressHTTPSListener]; !exists {
+		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPSListener)
 	} else {
 		l := raw.(*listenerv3.Listener)
-		assertDualStackIngress(t, l, 8081)
+		assertDualStackIngress(t, l, 8443)
 
 		assertHCMWebsocketUpgrade(t, l)
 	}
@@ -225,8 +295,9 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
 
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConfig(50053, "127.0.0.1")
 	server.SetTlsConfig(8443, certPath)
+	server.SetDownstreamClientAuth("/run/podidentity.podcert.ate.dev/trust-bundle.pem", []string{"spiffe://cluster.local/ns/demo/sa/client"})
 
 	err := server.UpdateSnapshot()
 	if err != nil {
@@ -244,8 +315,8 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 	}
 
 	listenersMap := snap.GetResources(resourcev3.ListenerType)
-	if len(listenersMap) != 2 {
-		t.Fatalf("Expected 2 listener definitions, got %d", len(listenersMap))
+	if len(listenersMap) != 1 {
+		t.Fatalf("Expected 1 listener definition, got %d", len(listenersMap))
 	}
 
 	if raw, exists := listenersMap[IngressHTTPSListener]; !exists {
@@ -285,8 +356,8 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 	// directory, so Envoy re-reads the files when kubelet rotates the
 	// projected volume.
 	secretsMap := snap.GetResources(resourcev3.SecretType)
-	if len(secretsMap) != 1 {
-		t.Fatalf("Expected 1 secret definition, got %d", len(secretsMap))
+	if len(secretsMap) != 2 {
+		t.Fatalf("Expected 2 secret definitions, got %d", len(secretsMap))
 	}
 	raw, exists := secretsMap[HTTPSCertSecretName]
 	if !exists {
@@ -305,47 +376,15 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 	}
 }
 
-func TestXdsServer_UpdateSnapshot_HttpsWithoutCertPath(t *testing.T) {
-	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
-	// This is the default flag combination: --port-https set, no
-	// --envoy-cert-path. An SDS secret with an empty filename would be
-	// NACKed by Envoy, so the HTTPS listener must be skipped entirely.
-	server.SetTlsConfig(8443, "")
-
-	if err := server.UpdateSnapshot(); err != nil {
-		t.Fatalf("UpdateSnapshot failed: %v", err)
-	}
-
-	res, err := server.snapshot.GetSnapshot(NodeID)
-	if err != nil {
-		t.Fatalf("Failed to get snapshot: %v", err)
-	}
-	snap, ok := res.(*cachev3.Snapshot)
-	if !ok {
-		t.Fatalf("Snapshot doesn't conform to type *cachev3.Snapshot, got %T", res)
-	}
-
-	listenersMap := snap.GetResources(resourcev3.ListenerType)
-	if _, exists := listenersMap[IngressHTTPSListener]; exists {
-		t.Error("HTTPS listener must not be built without a cert path")
-	}
-	if len(listenersMap) != 1 {
-		t.Errorf("Expected only the HTTP listener without a cert path, got %d listeners", len(listenersMap))
-	}
-	if got := snap.GetResources(resourcev3.SecretType); len(got) != 0 {
-		t.Errorf("Expected no secrets without a cert path, got %d", len(got))
-	}
-}
-
 // TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault locks in that the
-// CONNECT-terminating listeners/cluster are opt-in: with SetConnectPorts never
-// called (both ports default to 0), UpdateSnapshot must produce exactly the
-// same resources as if CONNECT support didn't exist, matching the HTTPS
-// listener's existing httpsPort>0 gating convention.
+// CONNECT-terminating listener and cluster are opt-in: with SetConnectTLSPort
+// never called, UpdateSnapshot must produce exactly the same resources as if
+// CONNECT support didn't exist, matching the HTTPS listener's existing
+// httpsPort>0 gating convention.
 func TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault(t *testing.T) {
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConfig(50053, "127.0.0.1")
+	setIngressTLS(server)
 
 	if err := server.UpdateSnapshot(); err != nil {
 		t.Fatalf("UpdateSnapshot failed: %v", err)
@@ -365,28 +404,29 @@ func TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault(t *testing.T) {
 	}
 
 	listenersMap := snap.GetResources(resourcev3.ListenerType)
-	for _, name := range []string{"connect_terminate", "connect_terminate_tls", MainInternalName} {
+	for _, name := range []string{"connect_terminate_tls", MainInternalName} {
 		if _, exists := listenersMap[name]; exists {
 			t.Errorf("listener %q must not be built when CONNECT is disabled", name)
 		}
 	}
 	if len(listenersMap) != 1 {
-		t.Errorf("Expected only the HTTP listener with CONNECT disabled, got %d listeners", len(listenersMap))
+		t.Errorf("Expected only the HTTPS listener with CONNECT disabled, got %d listeners", len(listenersMap))
 	}
 }
 
-// TestXdsServer_UpdateSnapshot_WithConnect enables both the plaintext and TLS
-// CONNECT listeners and checks the resources they need are wired up,
-// including that the TLS CONNECT listener triggers the shared cert secret
-// even when the ordinary HTTPS listener (httpsPort) is left disabled.
+// TestXdsServer_UpdateSnapshot_WithConnect enables the CONNECT listener and
+// checks the resources it needs are wired up, including that it triggers the
+// shared cert secret even when the ordinary HTTPS listener (httpsPort) is left
+// disabled.
 func TestXdsServer_UpdateSnapshot_WithConnect(t *testing.T) {
 	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
 
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
-	server.SetConnectPorts(8081, 8444)
+	server.SetConfig(50053, "127.0.0.1")
+	server.SetConnectTLSPort(8444)
 	// httpsPort left at 0: only the CONNECT-TLS listener wants the cert here.
 	server.SetTlsConfig(0, certPath)
+	server.SetDownstreamClientAuth("/run/podidentity.podcert.ate.dev/trust-bundle.pem", []string{"spiffe://cluster.local/ns/demo/sa/client"})
 
 	if err := server.UpdateSnapshot(); err != nil {
 		t.Fatalf("UpdateSnapshot failed: %v", err)
@@ -408,13 +448,6 @@ func TestXdsServer_UpdateSnapshot_WithConnect(t *testing.T) {
 	listenersMap := snap.GetResources(resourcev3.ListenerType)
 	if _, exists := listenersMap[IngressHTTPSListener]; exists {
 		t.Error("plain HTTPS listener must not be built when only httpsPort is left disabled")
-	}
-	if raw, exists := listenersMap["connect_terminate"]; !exists {
-		t.Error("connect_terminate listener missing")
-	} else {
-		l := raw.(*listenerv3.Listener)
-		assertDualStackIngress(t, l, 8081)
-		assertHCMWebsocketUpgrade(t, l)
 	}
 	if raw, exists := listenersMap["connect_terminate_tls"]; !exists {
 		t.Error("connect_terminate_tls listener missing")
@@ -438,27 +471,60 @@ func TestXdsServer_UpdateSnapshot_WithConnect(t *testing.T) {
 	}
 }
 
-func TestXdsServer_UpdateSnapshot_NoHttps_NoSecrets(t *testing.T) {
+// Actor traffic can carry credentials in the query string, so no HCM may log
+// the request path with its query.
+func TestXdsServer_AccessLogsOmitQueryString(t *testing.T) {
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConfig(50053, "127.0.0.1")
+	server.SetConnectTLSPort(8444)
+	setIngressTLS(server)
 
 	if err := server.UpdateSnapshot(); err != nil {
 		t.Fatalf("UpdateSnapshot failed: %v", err)
 	}
-
 	res, err := server.snapshot.GetSnapshot(NodeID)
 	if err != nil {
 		t.Fatalf("Failed to get snapshot: %v", err)
 	}
 	snap := res.(*cachev3.Snapshot)
-	if got := snap.GetResources(resourcev3.SecretType); len(got) != 0 {
-		t.Errorf("Expected no secrets without TLS config, got %d", len(got))
+
+	hcms := 0
+	for name, raw := range snap.GetResources(resourcev3.ListenerType) {
+		for _, fc := range raw.(*listenerv3.Listener).GetFilterChains() {
+			for _, f := range fc.GetFilters() {
+				if f.GetName() != "envoy.filters.network.http_connection_manager" {
+					continue
+				}
+				hcms++
+				hcm := &hcmv3.HttpConnectionManager{}
+				if err := f.GetTypedConfig().UnmarshalTo(hcm); err != nil {
+					t.Fatalf("listener %s: unmarshal HCM: %v", name, err)
+				}
+				if len(hcm.GetAccessLog()) == 0 {
+					t.Errorf("listener %s: HCM has no access log", name)
+				}
+				for _, al := range hcm.GetAccessLog() {
+					stdout := &streamaccesslogv3.StdoutAccessLog{}
+					if err := al.GetTypedConfig().UnmarshalTo(stdout); err != nil {
+						t.Fatalf("listener %s: unmarshal access log: %v", name, err)
+					}
+					// An unset format means Envoy's default, which logs the query.
+					format := stdout.GetLogFormat().GetTextFormatSource().GetInlineString()
+					if !strings.Contains(format, "%PATH(NQ:") {
+						t.Errorf("listener %s: access log format %q does not strip the query string", name, format)
+					}
+				}
+			}
+		}
+	}
+	if hcms == 0 {
+		t.Fatal("snapshot has no HTTP connection managers")
 	}
 }
 
 func TestXdsServer_Serve_Shutdown(t *testing.T) {
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConfig(50053, "127.0.0.1")
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -492,8 +558,9 @@ func TestXdsServer_ServesSecretOverSds(t *testing.T) {
 	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
 
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConfig(50053, "127.0.0.1")
 	server.SetTlsConfig(8443, certPath)
+	server.SetDownstreamClientAuth("/run/podidentity.podcert.ate.dev/trust-bundle.pem", []string{"spiffe://cluster.local/ns/demo/sa/client"})
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -515,10 +582,11 @@ func TestXdsServer_ServesSecretOverSds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open SDS stream: %v", err)
 	}
+	// The ADS cache answers only a request that names every secret.
 	if err := stream.Send(&discoverygrpc.DiscoveryRequest{
 		Node:          &corev3.Node{Id: NodeID},
 		TypeUrl:       resourcev3.SecretType,
-		ResourceNames: []string{HTTPSCertSecretName},
+		ResourceNames: []string{HTTPSCertSecretName, IngressClientTrustSecretName},
 	}); err != nil {
 		t.Fatalf("Failed to send SDS discovery request: %v", err)
 	}
@@ -527,17 +595,18 @@ func TestXdsServer_ServesSecretOverSds(t *testing.T) {
 		t.Fatalf("Failed to receive SDS discovery response: %v", err)
 	}
 
-	resources := resp.GetResources()
-	if len(resources) != 1 {
-		t.Fatalf("Expected 1 secret resource over SDS, got %d", len(resources))
+	var secret *tlsv3.Secret
+	for _, r := range resp.GetResources() {
+		s := &tlsv3.Secret{}
+		if err := r.UnmarshalTo(s); err != nil {
+			t.Fatalf("Failed to unmarshal SDS resource into Secret: %v", err)
+		}
+		if s.GetName() == HTTPSCertSecretName {
+			secret = s
+		}
 	}
-
-	secret := &tlsv3.Secret{}
-	if err := resources[0].UnmarshalTo(secret); err != nil {
-		t.Fatalf("Failed to unmarshal SDS resource into Secret: %v", err)
-	}
-	if secret.GetName() != HTTPSCertSecretName {
-		t.Errorf("Expected secret name '%s', got '%s'", HTTPSCertSecretName, secret.GetName())
+	if secret == nil {
+		t.Fatalf("Secret '%s' missing from the SDS response", HTTPSCertSecretName)
 	}
 	tlsCert := secret.GetTlsCertificate()
 	if got := tlsCert.GetCertificateChain().GetFilename(); got != certPath {
@@ -548,6 +617,95 @@ func TestXdsServer_ServesSecretOverSds(t *testing.T) {
 	}
 	if got, want := tlsCert.GetWatchedDirectory().GetPath(), filepath.Dir(certPath); got != want {
 		t.Errorf("Expected watched directory '%s', got '%s'", want, got)
+	}
+}
+
+// TestXdsServer_AnswersClusterSecretsBeforeListeners replays Envoy's startup
+// over delta xDS, which the router manifest must configure. While warming
+// clusters, Envoy subscribes only to the secrets the clusters reference, and
+// asks for listeners (and their secrets) only after. The server has to answer
+// that partial secret request, or Envoy stalls until its 15s
+// initial_fetch_timeout.
+func TestXdsServer_AnswersClusterSecretsBeforeListeners(t *testing.T) {
+	var bootstrap struct {
+		DynamicResources struct {
+			AdsConfig struct {
+				APIType string `json:"api_type"`
+			} `json:"ads_config"`
+		} `json:"dynamic_resources"`
+	}
+	if err := yaml.Unmarshal([]byte(envoyConfigFrom(t, routerManifestPath, "atenet-router-envoy-config")), &bootstrap); err != nil {
+		t.Fatalf("parsing envoy.yaml: %v", err)
+	}
+	if got := bootstrap.DynamicResources.AdsConfig.APIType; got != "DELTA_GRPC" {
+		t.Fatalf("Router Envoy ads_config.api_type is %q; it must be DELTA_GRPC, since the state-of-the-world ADS cache ignores a partial secret request", got)
+	}
+
+	server := NewXdsServer(18000)
+	server.SetConfig(50053, "127.0.0.1")
+	server.SetTlsConfig(8443, "/run/servicedns.podcert.ate.dev/credential-bundle.pem")
+	server.SetDownstreamClientAuth("/run/podidentity.podcert.ate.dev/trust-bundle.pem", []string{"spiffe://cluster.local/ns/demo/sa/client"})
+	server.SetUpstreamTls("/run/podidentity.podcert.ate.dev/credential-bundle.pem", "/run/podidentity.podcert.ate.dev/trust-bundle.pem")
+	server.SetUpstreamConnect(true)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create tcp listener: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go server.Serve(ctx, lis)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("Failed to dial xDS server: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(streamCancel)
+	stream, err := discoverygrpc.NewAggregatedDiscoveryServiceClient(conn).DeltaAggregatedResources(streamCtx)
+	if err != nil {
+		t.Fatalf("Failed to open delta ADS stream: %v", err)
+	}
+
+	if err := stream.Send(&discoverygrpc.DeltaDiscoveryRequest{
+		Node:    &corev3.Node{Id: NodeID},
+		TypeUrl: resourcev3.ClusterType,
+	}); err != nil {
+		t.Fatalf("Failed to send CDS request: %v", err)
+	}
+	cds, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Failed to receive CDS response: %v", err)
+	}
+	if got := cds.GetTypeUrl(); got != resourcev3.ClusterType {
+		t.Fatalf("Expected a CDS response, got %s", got)
+	}
+
+	clusterSecrets := []string{UpstreamCertSecretName, UpstreamTrustSecretName}
+	if err := stream.Send(&discoverygrpc.DeltaDiscoveryRequest{
+		TypeUrl:                resourcev3.SecretType,
+		ResourceNamesSubscribe: clusterSecrets,
+	}); err != nil {
+		t.Fatalf("Failed to send SDS request: %v", err)
+	}
+	// A server that ignores the request leaves Recv blocked until streamCtx
+	// expires.
+	sds, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("No SDS response for the cluster secrets: %v", err)
+	}
+	if got := sds.GetTypeUrl(); got != resourcev3.SecretType {
+		t.Fatalf("Expected an SDS response, got %s", got)
+	}
+	var names []string
+	for _, r := range sds.GetResources() {
+		names = append(names, r.GetName())
+	}
+	slices.Sort(names)
+	if want := slices.Sorted(slices.Values(clusterSecrets)); !slices.Equal(names, want) {
+		t.Errorf("Expected SDS response with secrets %v, got %v", want, names)
 	}
 }
 
@@ -701,13 +859,12 @@ func rotateProjectedVolume(t *testing.T, dir, newTsDir, oldTsDir string, bundle 
 // likewise never picked up.
 func TestUpstreamTransportSocket_DeliversCertsOverSds(t *testing.T) {
 	const (
-		credPath     = "/run/podidentity.podcert.ate.dev/credential-bundle.pem"
-		trustPath    = "/run/podidentity.podcert.ate.dev/trust-bundle.pem"
-		spiffePrefix = "spiffe://cluster.local/"
+		credPath  = "/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+		trustPath = "/run/podidentity.podcert.ate.dev/trust-bundle.pem"
 	)
 
 	server := NewXdsServer(18000)
-	server.SetUpstreamTls(credPath, trustPath, spiffePrefix)
+	server.SetUpstreamTls(credPath, trustPath)
 
 	ts := server.buildUpstreamTransportSocket()
 	if ts == nil {
@@ -750,10 +907,8 @@ func TestUpstreamTransportSocket_DeliversCertsOverSds(t *testing.T) {
 		t.Error("Expected the trust bundle SDS config to use the ADS config source")
 	}
 
-	// The SPIFFE SAN matcher has to survive the move into the combined
-	// context's default half. Losing it silently downgrades validation to a
-	// SAN check against the dialed pod IP, which the SPIFFE-only atunnel
-	// server cert never carries.
+	// The trust-domain matcher has to survive the move into the combined
+	// context: it still holds if the per-request filter is ever skipped.
 	sans := combined.GetDefaultValidationContext().GetMatchTypedSubjectAltNames()
 	if len(sans) != 1 {
 		t.Fatalf("Expected 1 SAN matcher, got %d", len(sans))
@@ -761,8 +916,82 @@ func TestUpstreamTransportSocket_DeliversCertsOverSds(t *testing.T) {
 	if got := sans[0].GetSanType(); got != tlsv3.SubjectAltNameMatcher_URI {
 		t.Errorf("Expected a URI SAN matcher, got %v", got)
 	}
-	if got := sans[0].GetMatcher().GetPrefix(); got != spiffePrefix {
-		t.Errorf("Expected SAN prefix '%s', got '%s'", spiffePrefix, got)
+	if got, want := sans[0].GetMatcher().GetPrefix(), "spiffe://cluster.local/"; got != want {
+		t.Errorf("Expected SAN prefix '%s', got '%s'", want, got)
+	}
+}
+
+// TestXdsServer_WorkerIdentityFilter checks every ext_proc HCM requires the
+// routed worker's identity from atunnel, on both the HTTPS and CONNECT paths.
+func TestXdsServer_WorkerIdentityFilter(t *testing.T) {
+	hcmFilters := func(t *testing.T, l *listenerv3.Listener) []*hcmv3.HttpFilter {
+		t.Helper()
+		hcm := &hcmv3.HttpConnectionManager{}
+		if err := l.GetFilterChains()[0].GetFilters()[0].GetTypedConfig().UnmarshalTo(hcm); err != nil {
+			t.Fatalf("listener %s: unmarshal HCM: %v", l.GetName(), err)
+		}
+		return hcm.GetHttpFilters()
+	}
+	setsUpstreamSANs := func(t *testing.T, f *hcmv3.HttpFilter) *setfilterstatecommonv3.FilterStateValue {
+		t.Helper()
+		if f.GetName() != "envoy.filters.http.set_filter_state" {
+			return nil
+		}
+		config := &setfilterstatev3.Config{}
+		if err := f.GetTypedConfig().UnmarshalTo(config); err != nil {
+			t.Fatalf("unmarshal set_filter_state: %v", err)
+		}
+		for _, v := range config.GetOnRequestHeaders() {
+			if v.GetObjectKey() == "envoy.network.upstream_subject_alt_names" {
+				return v
+			}
+		}
+		return nil
+	}
+
+	for _, upstreamConnect := range []bool{false, true} {
+		server := NewXdsServer(18000)
+		server.SetConfig(50053, "127.0.0.1")
+		server.SetConnectTLSPort(8444)
+		setIngressTLS(server)
+		server.SetUpstreamTls("/run/bundle.pem", "/run/trust.pem")
+		server.SetUpstreamConnect(upstreamConnect)
+		listeners := snapshotListeners(t, server)
+		for _, name := range []string{IngressHTTPSListener, MainInternalName} {
+			filters := hcmFilters(t, listeners[name])
+			n := len(filters)
+			if n < 2 || filters[n-1].GetName() != "envoy.filters.http.router" {
+				t.Fatalf("upstreamConnect=%v listener %s: filters do not end with the router", upstreamConnect, name)
+			}
+			// Last before the router, so ext_proc has written the metadata.
+			v := setsUpstreamSANs(t, filters[n-2])
+			if v == nil {
+				t.Fatalf("upstreamConnect=%v listener %s: filter before the router does not set the upstream SANs", upstreamConnect, name)
+			}
+			if got, want := v.GetFormatString().GetTextFormatSource().GetInlineString(), "%DYNAMIC_METADATA(envoy.filters.listener.original_dst:worker_spiffe_id)%"; got != want {
+				t.Errorf("upstreamConnect=%v listener %s: upstream SANs = %q, want %q", upstreamConnect, name, got, want)
+			}
+			// ONCE carries it to the tunnel's own connection to atunnel.
+			if got := v.GetSharedWithUpstream(); got != setfilterstatecommonv3.FilterStateValue_ONCE {
+				t.Errorf("upstreamConnect=%v listener %s: shared with upstream = %v, want ONCE", upstreamConnect, name, got)
+			}
+			// A factory key would make set_filter_state build a plain string
+			// that Envoy never reads as the SAN list.
+			if got := v.GetFactoryKey(); got != "" {
+				t.Errorf("upstreamConnect=%v listener %s: factory key = %q, want none", upstreamConnect, name, got)
+			}
+		}
+	}
+
+	// Without a trust bundle nothing is verified, so there is nothing to narrow.
+	server := NewXdsServer(18000)
+	server.SetConfig(50053, "127.0.0.1")
+	setIngressTLS(server)
+	server.SetUpstreamTls("/run/bundle.pem", "")
+	for _, f := range hcmFilters(t, snapshotListeners(t, server)[IngressHTTPSListener]) {
+		if setsUpstreamSANs(t, f) != nil {
+			t.Error("upstream SANs set although atunnel's certificate is not verified")
+		}
 	}
 }
 
@@ -778,13 +1007,11 @@ func TestXdsServer_UpdateSnapshot_UpstreamSecrets(t *testing.T) {
 
 	t.Run("PublishedWhenConfigured", func(t *testing.T) {
 		server := NewXdsServer(18000)
-		server.SetConfig(8085, 50053, "127.0.0.1")
-		server.SetUpstreamTls(credPath, trustPath, "spiffe://cluster.local/")
+		server.SetConfig(50053, "127.0.0.1")
+		setIngressTLS(server)
+		server.SetUpstreamTls(credPath, trustPath)
 
 		secrets := snapshotSecrets(t, server)
-		if len(secrets) != 2 {
-			t.Fatalf("Expected 2 secrets, got %d", len(secrets))
-		}
 
 		cert, exists := secrets[UpstreamCertSecretName]
 		if !exists {
@@ -816,21 +1043,26 @@ func TestXdsServer_UpdateSnapshot_UpstreamSecrets(t *testing.T) {
 
 	t.Run("AbsentWhenUpstreamMtlsDisabled", func(t *testing.T) {
 		server := NewXdsServer(18000)
-		server.SetConfig(8085, 50053, "127.0.0.1")
+		server.SetConfig(50053, "127.0.0.1")
+		setIngressTLS(server)
 
-		if got := len(snapshotSecrets(t, server)); got != 0 {
-			t.Fatalf("Expected no secrets when upstream mTLS is disabled, got %d", got)
+		secrets := snapshotSecrets(t, server)
+		for _, name := range []string{UpstreamCertSecretName, UpstreamTrustSecretName} {
+			if _, exists := secrets[name]; exists {
+				t.Errorf("Secret '%s' published although upstream mTLS is disabled", name)
+			}
 		}
 	})
 
 	t.Run("TrustSecretOmittedWithoutTrustBundle", func(t *testing.T) {
 		server := NewXdsServer(18000)
-		server.SetConfig(8085, 50053, "127.0.0.1")
-		server.SetUpstreamTls(credPath, "", "")
+		server.SetConfig(50053, "127.0.0.1")
+		setIngressTLS(server)
+		server.SetUpstreamTls(credPath, "")
 
 		secrets := snapshotSecrets(t, server)
-		if len(secrets) != 1 {
-			t.Fatalf("Expected only the client cert secret, got %d", len(secrets))
+		if _, exists := secrets[UpstreamTrustSecretName]; exists {
+			t.Errorf("Secret '%s' published without a trust bundle", UpstreamTrustSecretName)
 		}
 		if _, exists := secrets[UpstreamCertSecretName]; !exists {
 			t.Errorf("Secret '%s' is missing from snapshot secrets", UpstreamCertSecretName)
@@ -854,7 +1086,7 @@ func TestUpstreamCertSecret_ProjectedVolumeRotation(t *testing.T) {
 	writeProjectedVolume(t, dir, tsDirA, bundleA)
 
 	server := NewXdsServer(18000)
-	server.SetUpstreamTls(credPath, "", "")
+	server.SetUpstreamTls(credPath, "")
 	tlsCert := server.buildUpstreamCertSecret().GetTlsCertificate()
 
 	chainPath := tlsCert.GetCertificateChain().GetFilename()
@@ -974,15 +1206,18 @@ func TestXdsServer_RouteTimeout(t *testing.T) {
 	})
 
 	t.Run("SetterOverrides", func(t *testing.T) {
+		// Deliberately not 5m: that is the default, so it would pass whether or
+		// not the setter did anything. Lowering is also the direction an
+		// operator capping turn length actually goes.
 		x := NewXdsServer(0)
-		x.SetRouteTimeout(5 * time.Minute)
-		if got := routeTimeout(t, x); got != 5*time.Minute {
-			t.Errorf("route timeout after SetRouteTimeout(5m) = %v, want 5m", got)
+		x.SetRouteTimeout(30 * time.Second)
+		if got := routeTimeout(t, x); got != 30*time.Second {
+			t.Errorf("route timeout after SetRouteTimeout(30s) = %v, want 30s", got)
 		}
 	})
 
 	// The flag cannot produce a zero: --route-timeout carries defaultRouteTimeout,
-	// so an operator who never passes it gets 10s, not 0. The guard is on the
+	// so an operator who never passes it gets the default, not 0. The guard is on the
 	// setter because SetRouteTimeout is part of the type's API and reachable
 	// from any caller, and because a zero here is the one value Envoy reads as
 	// "no timeout at all" — a mis-set knob would silently turn every stuck
@@ -998,25 +1233,48 @@ func TestXdsServer_RouteTimeout(t *testing.T) {
 		}
 	})
 
-	// The route timeout alone does not bound a long turn. A stream carrying no
-	// bytes while the actor works is idle by Envoy's reckoning, and Envoy resets
-	// it at the 5m stream idle default whatever the route timeout says. These
-	// pin the relationship: the idle timer never bites before the ceiling the
-	// operator asked for, and it is not tightened below what applies today.
-	t.Run("IdleTimeoutTracksLongerRouteTimeout", func(t *testing.T) {
+	// The two timeouts bound different things: the route timeout bounds the
+	// upstream response, the idle timeout bounds a stream with no activity on
+	// it. A stream carrying no bytes while the actor works is idle by the second
+	// measure even though the turn is progressing, so the ordering between them
+	// decides which one a caller actually experiences. These pin that ordering:
+	// the idle timer is a backstop that never fires first, and it is not
+	// tightened below what applies today.
+	t.Run("IdleTimeoutStaysAfterALongerRouteTimeout", func(t *testing.T) {
 		x := NewXdsServer(0)
 		x.SetRouteTimeout(30 * time.Minute)
-		if got := idleTimeout(t, x); got != 30*time.Minute {
-			t.Errorf("idle timeout with a 30m route timeout = %v, want 30m: a shorter idle timer would reset the stream first", got)
+		if got, want := idleTimeout(t, x), 30*time.Minute+routeIdleTimeoutMargin; got != want {
+			t.Errorf("idle timeout with a 30m route timeout = %v, want %v: an idle timer at or below the route timeout would reset the stream first", got, want)
 		}
 	})
 
 	t.Run("IdleTimeoutKeepsEnvoyDefaultWhenRouteTimeoutIsShorter", func(t *testing.T) {
-		for _, d := range []time.Duration{defaultRouteTimeout, envoyDefaultStreamIdleTimeout} {
+		for _, d := range []time.Duration{10 * time.Second, time.Minute} {
 			x := NewXdsServer(0)
 			x.SetRouteTimeout(d)
 			if got := idleTimeout(t, x); got != envoyDefaultStreamIdleTimeout {
 				t.Errorf("idle timeout with a %v route timeout = %v, want %v (unchanged from Envoy's default)", d, got, envoyDefaultStreamIdleTimeout)
+			}
+		}
+	})
+
+	// The property the two cases above are instances of, checked across the
+	// range rather than at the values that happen to be interesting today. The
+	// default route timeout is 5m and so is Envoy's stream idle default, so
+	// without a margin the two would coincide there and either could fire. An
+	// idle-triggered end reaches the client as a torn stream where the route
+	// timeout reaches it as a 504, and only one of those is diagnosable.
+	t.Run("IdleTimeoutNeverFiresBeforeTheRouteTimeout", func(t *testing.T) {
+		for _, d := range []time.Duration{0, 10 * time.Second, time.Minute, defaultRouteTimeout, 30 * time.Minute} {
+			x := NewXdsServer(0)
+			x.SetRouteTimeout(d) // non-positive keeps the default; see above
+			action := routeAction(t, x)
+			if action.GetIdleTimeout() == nil {
+				t.Fatalf("SetRouteTimeout(%v): no idle timeout set on the workload route", d)
+			}
+			route, idle := action.GetTimeout().AsDuration(), action.GetIdleTimeout().AsDuration()
+			if idle <= route {
+				t.Errorf("SetRouteTimeout(%v): route timeout %v, idle timeout %v; the idle timer must be strictly later or the caller gets a reset instead of a 504", d, route, idle)
 			}
 		}
 	})
@@ -1047,7 +1305,7 @@ func TestXdsServer_BuildOriginalDstCluster_UsesMetadataKey(t *testing.T) {
 // TestXdsServer_ActorClusterProtocolOptions pins where downstream-protocol
 // mirroring is allowed: only on the mTLS atunnel leg, where atunnel guards
 // HTTP/1.1-only actors by downgrading non-gRPC HTTP/2 (see
-// atunnel.protocolMirrorTransport). The legacy plaintext cluster dials the
+// atunnelingress.protocolMirrorTransport). The legacy plaintext cluster dials the
 // actor directly with no such guard, so it must carry no protocol options at
 // all — Envoy's implicit HTTP/1.1.
 func TestXdsServer_ActorClusterProtocolOptions(t *testing.T) {
@@ -1057,7 +1315,7 @@ func TestXdsServer_ActorClusterProtocolOptions(t *testing.T) {
 		t.Errorf("legacy plaintext actor cluster has protocol options %v, want none (implicit HTTP/1.1)", opts)
 	}
 
-	x.SetUpstreamTls("/run/bundle.pem", "/run/trust.pem", "spiffe://ate.dev/")
+	x.SetUpstreamTls("/run/bundle.pem", "/run/trust.pem")
 	cluster := x.buildOriginalDstCluster()
 	ts := cluster.GetTransportSocket()
 	if ts == nil {
@@ -1093,31 +1351,25 @@ func TestXdsServer_ActorClusterProtocolOptions(t *testing.T) {
 	}
 }
 
-// TestXdsServer_BuildRoutes_DerivesTargetPortHeader covers the fix for atunnel
-// needing the target port as a real header (it can't read Envoy's dynamic
-// metadata directly): rather than ext_proc building that header mutation
-// itself, the route derives it declaratively from the same
-// ingress.OriginalDstMetadataKey/ingress.OriginalDstPortKey metadata ext_proc
-// already writes for the cluster's own MetadataKey, via a
-// %DYNAMIC_METADATA(...)% command operator.
-func TestXdsServer_BuildRoutes_DerivesTargetPortHeader(t *testing.T) {
+// TestXdsServer_BuildRoutesWritesTargetPortHeader ensures the route overwrites
+// the target-port header with the value from ext_proc's trusted metadata.
+func TestXdsServer_BuildRoutesWritesTargetPortHeader(t *testing.T) {
 	x := NewXdsServer(18000)
 	route := x.buildRoutes().GetVirtualHosts()[0].GetRoutes()[0]
 
 	headers := route.GetRequestHeadersToAdd()
 	if len(headers) != 1 {
-		t.Fatalf("Expected exactly 1 request header to add, got %d: %v", len(headers), headers)
+		t.Fatalf("route adds request headers %v, want exactly one", headers)
 	}
-	h := headers[0]
-	if got, want := h.GetHeader().GetKey(), atunnel.TargetPortHeader; got != want {
-		t.Errorf("Expected header key %q, got %q", want, got)
+	header := headers[0]
+	if got, want := header.GetHeader().GetKey(), atunnelingress.TargetPortHeader; got != want {
+		t.Errorf("header key = %q, want %q", got, want)
 	}
-	wantValue := "%DYNAMIC_METADATA(" + ingress.OriginalDstMetadataKey + ":" + ingress.OriginalDstPortKey + ")%"
-	if got := h.GetHeader().GetValue(); got != wantValue {
-		t.Errorf("Expected header value %q, got %q", wantValue, got)
+	if got, want := header.GetHeader().GetValue(), "%DYNAMIC_METADATA(envoy.filters.listener.original_dst:port)%"; got != want {
+		t.Errorf("header value = %q, want %q", got, want)
 	}
-	if got, want := h.GetAppendAction(), corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD; got != want {
-		t.Errorf("Expected append action %s, got %s", want, got)
+	if got, want := header.GetAppendAction(), corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD; got != want {
+		t.Errorf("append action = %v, want %v", got, want)
 	}
 }
 
@@ -1205,6 +1457,7 @@ func TestXdsServer_SetOtlpCollector_EmptyDisablesTracing(t *testing.T) {
 	// Empty has to stay a working off switch: the router's own spans keep
 	// flowing via OTEL_EXPORTER_OTLP_ENDPOINT, but Envoy emits none.
 	x := NewXdsServer(0)
+	setIngressTLS(x)
 	if err := x.SetOtlpCollector(""); err != nil {
 		t.Fatalf("SetOtlpCollector(\"\") failed: %v", err)
 	}
@@ -1302,6 +1555,7 @@ func TestSnapshotVersionsUniqueAcrossRestarts(t *testing.T) {
 
 	seen := map[string]bool{}
 	first := NewXdsServer(0)
+	setIngressTLS(first)
 	for range 3 {
 		v := deployAndGetVersion(t, first)
 		if seen[v] {
@@ -1311,6 +1565,7 @@ func TestSnapshotVersionsUniqueAcrossRestarts(t *testing.T) {
 	}
 
 	restarted := NewXdsServer(0)
+	setIngressTLS(restarted)
 	for range 3 {
 		v := deployAndGetVersion(t, restarted)
 		if seen[v] {
@@ -1336,18 +1591,16 @@ func downstreamTLS(t *testing.T, raw any) *tlsv3.DownstreamTlsContext {
 // listener always offers h2 before http/1.1: gRPC over TLS requires a
 // negotiated "h2", and the offer is unconditional because atunnel downgrades
 // every non-gRPC request to HTTP/1.1 on the actor leg (see
-// atunnel.protocolMirrorTransport and TestProtocolMirrorTransport), so an
+// atunnelingress.protocolMirrorTransport and TestProtocolMirrorTransport), so an
 // HTTP/1.1-only actor cannot tell what the client negotiated at the edge. The
 // CONNECT-TLS listener stays ALPN-free: its clients speak HTTP/1.1 CONNECT,
 // and an h2 offer there would move them onto extended CONNECT the tunnel path
 // does not serve.
 func TestXdsServer_ALPN(t *testing.T) {
-	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
-
 	server := NewXdsServer(18000)
-	server.SetConfig(8085, 50053, "127.0.0.1")
-	server.SetTlsConfig(8443, certPath)
-	server.SetConnectPorts(0, 8444)
+	server.SetConfig(50053, "127.0.0.1")
+	setIngressTLS(server)
+	server.SetConnectTLSPort(8444)
 	if err := server.UpdateSnapshot(); err != nil {
 		t.Fatalf("UpdateSnapshot failed: %v", err)
 	}
@@ -1380,5 +1633,150 @@ func TestXdsServer_ALPN(t *testing.T) {
 	}
 	if hcm.GetCodecType() != hcmv3.HttpConnectionManager_AUTO {
 		t.Errorf("HTTPS listener HCM codec = %v, want AUTO so the negotiated protocol is honored", hcm.GetCodecType())
+	}
+}
+
+// snapshotListeners builds the snapshot and returns its listeners by name.
+func snapshotListeners(t *testing.T, server *XdsServer) map[string]*listenerv3.Listener {
+	t.Helper()
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap, ok := res.(*cachev3.Snapshot)
+	if !ok {
+		t.Fatalf("Snapshot doesn't conform to type *cachev3.Snapshot, got %T", res)
+	}
+	listeners := make(map[string]*listenerv3.Listener)
+	for name, raw := range snap.GetResources(resourcev3.ListenerType) {
+		l, ok := raw.(*listenerv3.Listener)
+		if !ok {
+			t.Fatalf("Listener '%s' doesn't conform to type *listenerv3.Listener, got %T", name, raw)
+		}
+		listeners[name] = l
+	}
+	return listeners
+}
+
+// downstreamTlsContext returns the DownstreamTlsContext of a listener's only
+// filter chain.
+func downstreamTlsContext(t *testing.T, l *listenerv3.Listener) *tlsv3.DownstreamTlsContext {
+	t.Helper()
+	chains := l.GetFilterChains()
+	if len(chains) != 1 {
+		t.Fatalf("Listener '%s': expected 1 filter chain, got %d", l.GetName(), len(chains))
+	}
+	dtc := &tlsv3.DownstreamTlsContext{}
+	if err := chains[0].GetTransportSocket().GetTypedConfig().UnmarshalTo(dtc); err != nil {
+		t.Fatalf("Listener '%s': failed to unmarshal DownstreamTlsContext: %v", l.GetName(), err)
+	}
+	return dtc
+}
+
+func TestXdsServer_UpdateSnapshot_DownstreamClientAuth(t *testing.T) {
+	const (
+		certPath  = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+		caPath    = "/run/podidentity.podcert.ate.dev/trust-bundle.pem"
+		bundleDir = "/run/podidentity.podcert.ate.dev"
+	)
+	allowed := []string{
+		"spiffe://cluster.local/ns/demo/sa/client",
+		"spiffe://cluster.local/ns/other/sa/client",
+	}
+	tlsListeners := []string{IngressHTTPSListener, "connect_terminate_tls"}
+
+	server := NewXdsServer(18000)
+	server.SetConfig(50053, "127.0.0.1")
+	server.SetConnectTLSPort(8444)
+	server.SetTlsConfig(8443, certPath)
+	server.SetDownstreamClientAuth(caPath, allowed)
+
+	listeners := snapshotListeners(t, server)
+	for _, name := range tlsListeners {
+		l, exists := listeners[name]
+		if !exists {
+			t.Fatalf("TLS listener '%s' is missing from snapshot listeners", name)
+		}
+		dtc := downstreamTlsContext(t, l)
+		if !dtc.GetRequireClientCertificate().GetValue() {
+			t.Errorf("Listener '%s': require_client_certificate = false, want true", name)
+		}
+		combined := dtc.GetCommonTlsContext().GetCombinedValidationContext()
+		if combined == nil {
+			t.Fatalf("Listener '%s': expected a combined validation context", name)
+		}
+		if got := combined.GetValidationContextSdsSecretConfig().GetName(); got != IngressClientTrustSecretName {
+			t.Errorf("Listener '%s': validation SDS secret = '%s', want '%s'", name, got, IngressClientTrustSecretName)
+		}
+		if combined.GetValidationContextSdsSecretConfig().GetSdsConfig().GetAds() == nil {
+			t.Errorf("Listener '%s': expected the validation SDS config to use the ADS config source", name)
+		}
+		matchers := combined.GetDefaultValidationContext().GetMatchTypedSubjectAltNames()
+		if len(matchers) != len(allowed) {
+			t.Fatalf("Listener '%s': expected %d SAN matchers, got %d", name, len(allowed), len(matchers))
+		}
+		for i, m := range matchers {
+			if m.GetSanType() != tlsv3.SubjectAltNameMatcher_URI {
+				t.Errorf("Listener '%s': matcher %d SAN type = %v, want URI", name, i, m.GetSanType())
+			}
+			if got := m.GetMatcher().GetExact(); got != allowed[i] {
+				t.Errorf("Listener '%s': matcher %d exact = '%s', want '%s'", name, i, got, allowed[i])
+			}
+		}
+	}
+
+	secrets := snapshotSecrets(t, server)
+	trust, exists := secrets[IngressClientTrustSecretName]
+	if !exists {
+		t.Fatalf("Secret '%s' is missing from snapshot secrets", IngressClientTrustSecretName)
+	}
+	validation := trust.GetValidationContext()
+	if got := validation.GetTrustedCa().GetFilename(); got != caPath {
+		t.Errorf("Expected trusted CA filename '%s', got '%s'", caPath, got)
+	}
+	if got := validation.GetWatchedDirectory().GetPath(); got != bundleDir {
+		t.Errorf("Expected client CA watched directory '%s', got '%s'", bundleDir, got)
+	}
+}
+
+// A TLS listener without client authentication would let any client reach any
+// actor. With no allowlist UpdateSnapshot serves no TLS listener, and with an
+// allowlist but no CA it refuses to build one.
+func TestXdsServer_UpdateSnapshot_TLSListenerWithoutClientAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		httpsPort      int
+		connectTLSPort int
+		caPath         string
+		allowed        []string
+		wantErr        bool
+	}{
+		{name: "HTTPS without allowlist", httpsPort: 8443, caPath: "/run/podidentity.podcert.ate.dev/trust-bundle.pem"},
+		{name: "CONNECT-TLS without allowlist", connectTLSPort: 8444, caPath: "/run/podidentity.podcert.ate.dev/trust-bundle.pem"},
+		{name: "HTTPS without CA", httpsPort: 8443, allowed: []string{"spiffe://cluster.local/ns/demo/sa/client"}, wantErr: true},
+		{name: "CONNECT-TLS without CA", connectTLSPort: 8444, allowed: []string{"spiffe://cluster.local/ns/demo/sa/client"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewXdsServer(18000)
+			server.SetConfig(50053, "127.0.0.1")
+			server.SetConnectTLSPort(tc.connectTLSPort)
+			server.SetTlsConfig(tc.httpsPort, "/run/servicedns.podcert.ate.dev/credential-bundle.pem")
+			server.SetDownstreamClientAuth(tc.caPath, tc.allowed)
+			if tc.wantErr {
+				if err := server.UpdateSnapshot(); err == nil {
+					t.Fatal("UpdateSnapshot succeeded, want an error")
+				}
+				return
+			}
+			listeners := snapshotListeners(t, server)
+			for _, name := range []string{IngressHTTPSListener, "connect_terminate_tls"} {
+				if _, exists := listeners[name]; exists {
+					t.Errorf("TLS listener '%s' is served without an allowlist", name)
+				}
+			}
+		})
 	}
 }

@@ -18,37 +18,42 @@ import (
 	"context"
 	"sync"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/internal/volume"
-	"github.com/agent-substrate/substrate/internal/volume/csi"
-	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/api/objectstore/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
+	"go.ate.dev/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/volume"
+	"go.ate.dev/substrate/internal/volume/csi"
+	atelisters "go.ate.dev/substrate/pkg/client/listers/ate/v1"
 	storagev1listers "k8s.io/client-go/listers/storage/v1"
 )
 
-// RPCService implements ateapipb.ControlServer and provides the implementation of
+// RPCService implements ateapi.ControlServer and provides the implementation of
 // the RPC service.
 //
 // Methods on this service should be as light as possible, delegating to the
 // ServiceImpl for business logic and invariants.
 type RPCService struct {
-	ateapipb.UnimplementedControlServer
+	ateapi.UnimplementedControlServer
 	impl                  serviceStore
 	persistence           serviceStore
 	workerCache           *workercache.Cache
 	dialer                *AteletDialer
-	sandboxConfigLister   listersv1alpha1.SandboxConfigLister
-	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister
+	csiDriverConfigLister atelisters.CSIDriverConfigLister
 	actorWorkflow         *ActorWorkflow
 	workerWorkflow        *WorkerWorkflow
 	instruments           *Instruments
 	mu                    sync.RWMutex
 	volumePlugins         map[string]volume.VolumePluginControlPlane
+	objectStorePlugin     objectstore.ControlProviderClient
+
+	actorJWTIssuer string
+	actorIDJWTPool localjwtauthority.Pool
 }
 
-var _ ateapipb.ControlServer = (*RPCService)(nil)
+var _ ateapi.ControlServer = (*RPCService)(nil)
 
 // VolumePluginRegistry defines the interface for dynamic CSI plugin resolution.
 type VolumePluginRegistry interface {
@@ -59,63 +64,84 @@ type VolumePluginRegistry interface {
 // implements the outward-facing RPC interface.
 //
 // instruments may be nil; the record helpers no-op.
+//
+// objectStorePlugin may be nil, which leaves external snapshots in place instead
+// of copying and releasing them. Only tests that never reach those steps pass
+// nil; ate-api always builds one.
+//
+// actorJWTIssuer is copied verbatim into the iss claim of every actor JWT.
+//
+// snapshotLocation is ate-api-server's cluster-wide --snapshot-location; see
+// resolveSnapshotLocation.
 func NewRPCService(
 	persistence store.Interface,
 	workerCache *workercache.Cache,
-	sandboxConfigLister listersv1alpha1.SandboxConfigLister,
-	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister,
+	csiDriverConfigLister atelisters.CSIDriverConfigLister,
 	storageClassLister storagev1listers.StorageClassLister,
 	dialer *AteletDialer,
 	instruments *Instruments,
 	egressGatewayAddress string,
 	volumePlugins map[string]volume.VolumePluginControlPlane,
+	objectStorePlugin objectstore.ControlProviderClient,
+	actorJWTIssuer string,
+	actorIDJWTPool localjwtauthority.Pool,
+	snapshotLocation string,
 ) *RPCService {
 	impl := newServiceImpl(persistence, storageClassLister)
+	impl.clusterSnapshotLocation = snapshotLocation
 	s := &RPCService{
 		impl:                  impl,
 		persistence:           persistence,
 		workerCache:           workerCache,
-		sandboxConfigLister:   sandboxConfigLister,
 		csiDriverConfigLister: csiDriverConfigLister,
 		dialer:                dialer,
 		instruments:           instruments,
 		volumePlugins:         volumePlugins,
+		objectStorePlugin:     objectStorePlugin,
+		actorJWTIssuer:        actorJWTIssuer,
+		actorIDJWTPool:        actorIDJWTPool,
 	}
-	s.actorWorkflow = NewActorWorkflow(impl, workerCache, dialer, sandboxConfigLister, storageClassLister, instruments, egressGatewayAddress, s)
-	s.workerWorkflow = NewWorkerWorkflow(impl)
+	s.actorWorkflow = NewActorWorkflow(impl, workerCache, dialer, storageClassLister, instruments, egressGatewayAddress, s, objectStorePlugin)
+	s.actorWorkflow.clusterSnapshotLocation = snapshotLocation
+	s.workerWorkflow = NewWorkerWorkflow(impl, dialer)
 	return s
 }
 
 // serviceStore enumerates the exact storage methods needed by
 // the control API and nothing more.
 type serviceStore interface {
-	CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error)
-	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
-	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(toUpdate *ateapipb.Actor) error) (*ateapipb.Actor, error)
-	ListActors(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapipb.Actor], error)
-	CreateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, policy *ateapipb.EgressPolicy) (*ateapipb.EgressPolicy, error)
-	GetEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.EgressPolicy, error)
-	UpdateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(*ateapipb.EgressPolicy) error) (*ateapipb.EgressPolicy, error)
-	DeleteEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.EgressPolicy, error)
-	GetActorSnapshot(ctx context.Context, snapshotRef resources.ActorSnapshotRef) (*ateapipb.ActorSnapshot, error)
-	ListActorSnapshots(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapipb.ActorSnapshot], error)
-	CreateActorSnapshotTag(ctx context.Context, snapshotRef resources.ActorSnapshotRef, tag *ateapipb.ActorSnapshotTag) (*ateapipb.ActorSnapshotTag, error)
-	GetActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef) (*ateapipb.ActorSnapshotTag, error)
-	UpdateActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef, precondition store.Precondition, mutate func(toUpdate *ateapipb.ActorSnapshotTag) error) (*ateapipb.ActorSnapshotTag, error)
-	DeleteActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef) (*ateapipb.ActorSnapshotTag, error)
-	CreateAtespace(ctx context.Context, atespace *ateapipb.Atespace) (*ateapipb.Atespace, error)
-	GetAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
-	ListAtespaces(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Atespace], error)
-	DeleteAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
-	CreateActorTemplate(ctx context.Context, template *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error)
-	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
-	ListActorTemplates(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapipb.ActorTemplate], error)
-	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
-	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Worker], error)
-	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)
-	ListWorkerAssignments(ctx context.Context, workerName string, opts store.ListOptions) (store.ListResponse[*ateapipb.ActorAssignment], error)
-	CreateWorker(ctx context.Context, worker *ateapipb.Worker) (*ateapipb.Worker, error)
-	UpdateWorker(ctx context.Context, name string, precondition store.Precondition, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error)
+	CreateActor(ctx context.Context, actor *ateapi.Actor) (*ateapi.Actor, error)
+	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, error)
+	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
+	ListActors(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapi.Actor], error)
+	CreateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, policy *ateapi.EgressPolicy) (*ateapi.EgressPolicy, error)
+	GetEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapi.EgressPolicy, error)
+	UpdateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(*ateapi.EgressPolicy) error) (*ateapi.EgressPolicy, error)
+	DeleteEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions) (*ateapi.EgressPolicy, error)
+	GetTag(ctx context.Context, tagRef resources.TagRef) (*ateapi.Tag, error)
+	ListTags(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapi.Tag], error)
+	UpdateTag(ctx context.Context, tagRef resources.TagRef, precondition store.Precondition, mutate func(toUpdate *ateapi.Tag) error) (*ateapi.Tag, error)
+	DeleteTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions) (*ateapi.Tag, error)
+	CreateAtespace(ctx context.Context, atespace *ateapi.Atespace) (*ateapi.Atespace, error)
+	GetAtespace(ctx context.Context, name string) (*ateapi.Atespace, error)
+	ListAtespaces(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapi.Atespace], error)
+	DeleteAtespace(ctx context.Context, name string, precondition store.DeletePreconditions) (*ateapi.Atespace, error)
+	CreateGlobalAccessPolicy(ctx context.Context, policy *ateapi.AccessPolicy) (*ateapi.AccessPolicy, error)
+	GetGlobalAccessPolicy(ctx context.Context) (*ateapi.AccessPolicy, error)
+	UpdateGlobalAccessPolicy(ctx context.Context, precondition store.Precondition, mutate func(*ateapi.AccessPolicy) error) (*ateapi.AccessPolicy, error)
+	CreateAtespaceAccessPolicy(ctx context.Context, name string, policy *ateapi.AccessPolicy) (*ateapi.AccessPolicy, error)
+	GetAtespaceAccessPolicy(ctx context.Context, name string) (*ateapi.AccessPolicy, error)
+	UpdateAtespaceAccessPolicy(ctx context.Context, name string, precondition store.Precondition, mutate func(*ateapi.AccessPolicy) error) (*ateapi.AccessPolicy, error)
+	DeleteAtespaceAccessPolicy(ctx context.Context, name string, precondition store.DeletePreconditions) (*ateapi.AccessPolicy, error)
+	CreateActorTemplate(ctx context.Context, template *ateapi.ActorTemplate) (*ateapi.ActorTemplate, error)
+	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapi.ActorTemplate, error)
+	ListActorTemplates(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapi.ActorTemplate], error)
+	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapi.ActorTemplate, error)
+	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapi.Worker], error)
+	GetWorker(ctx context.Context, name string) (*ateapi.Worker, error)
+	ListWorkerAssignments(ctx context.Context, workerName string, opts store.ListOptions) (store.ListResponse[*ateapi.ActorAssignment], error)
+	CreateWorker(ctx context.Context, worker *ateapi.Worker) (*ateapi.Worker, error)
+	UpdateWorker(ctx context.Context, name string, precondition store.Precondition, mutate func(toUpdate *ateapi.Worker) error) (*ateapi.Worker, error)
 	AcquireLease(ctx context.Context, key string) (*store.Lease, error)
 }
 
@@ -150,6 +176,10 @@ type ServiceImpl struct {
 	store store.Interface
 
 	storageClassLister storagev1listers.StorageClassLister
+
+	// clusterSnapshotLocation is ate-api-server's --snapshot-location; see
+	// resolveSnapshotLocation.
+	clusterSnapshotLocation string
 }
 
 var _ store.Interface = (*ServiceImpl)(nil)

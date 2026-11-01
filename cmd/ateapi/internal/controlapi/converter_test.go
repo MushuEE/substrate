@@ -16,77 +16,134 @@ package controlapi
 
 import (
 	"testing"
+	"time"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
 )
 
-// TestSnapshotScopeToAtelet covers the wire scope derivation for template
-// content scopes: an unset scope falls back to Full.
-func TestSnapshotScopeToAtelet(t *testing.T) {
+// TestFidelityToAtelet pins the level-by-level mapping onto the atelet enum:
+// nothing is promoted, and an unset fidelity stays unset so atelet rejects it.
+func TestFidelityToAtelet(t *testing.T) {
 	tests := []struct {
 		name     string
-		in       ateapipb.SnapshotContentScope
-		expected ateletpb.SnapshotScope
+		in       ateapi.SnapshotFidelity
+		expected ateletpb.SnapshotFidelity
 	}{
 		{
-			name:     "Full scope",
-			in:       ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-			expected: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+			name:     "memory",
+			in:       ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			expected: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 		},
 		{
-			name:     "Data scope",
-			in:       ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
-			expected: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA,
+			name:     "rootfs",
+			in:       ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
+			expected: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
 		},
 		{
-			name:     "Default scope (unspecified)",
-			in:       ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED,
-			expected: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+			name:     "volumes",
+			in:       ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+			expected: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+		},
+		{
+			name:     "unspecified stays unspecified",
+			in:       ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED,
+			expected: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED,
+		},
+		{
+			name:     "value outside the enum",
+			in:       ateapi.SnapshotFidelity(99),
+			expected: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := actorSnapshotContentScopeToAtelet(tt.in)
+			result := fidelityToAtelet(tt.in)
 			if result != tt.expected {
-				t.Errorf("actorSnapshotContentScopeToAtelet(%v) = %v, want %v", tt.in, result, tt.expected)
+				t.Errorf("fidelityToAtelet(%v) = %v, want %v", tt.in, result, tt.expected)
 			}
 		})
 	}
 }
 
-// TestEffectiveContentScope pins UNSPECIFIED-means-FULL: stored substrate
-// templates may legitimately leave scopes unset.
-func TestEffectiveContentScope(t *testing.T) {
+// TestFidelityFromAtelet verifies each atelet fidelity maps back to the same
+// public level, and anything else to UNSPECIFIED.
+func TestFidelityFromAtelet(t *testing.T) {
 	tests := []struct {
-		in, expected ateapipb.SnapshotContentScope
+		name string
+		in   ateletpb.SnapshotFidelity
+		want ateapi.SnapshotFidelity
 	}{
-		{ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
-		{ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
-		{ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA, ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA},
+		{"memory", ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
+		{"rootfs", ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS},
+		{"volumes", ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
+		{"unspecified stays unspecified", ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
+		{"value outside the enum", ateletpb.SnapshotFidelity(99), ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
 	}
 	for _, tt := range tests {
-		if got := effectiveContentScope(tt.in); got != tt.expected {
-			t.Errorf("effectiveContentScope(%v) = %v, want %v", tt.in, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fidelityFromAtelet(tt.in); got != tt.want {
+				t.Errorf("fidelityFromAtelet(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
-// TestSandboxClassString pins the label values the scheduler and metrics
-// share with the CRD's lower-case enum.
-func TestSandboxClassString(t *testing.T) {
+func TestSnapshotReportFromAtelet(t *testing.T) {
+	committed := timestamppb.New(time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC))
+	uploaded := timestamppb.New(time.Date(2026, 10, 14, 12, 5, 0, 0, time.UTC))
 	tests := []struct {
-		in       ateapipb.SandboxClass
-		expected string
-	}{
-		{ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR, "gvisor"},
-		{ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM, "microvm"},
-		{ateapipb.SandboxClass_SANDBOX_CLASS_UNSPECIFIED, ""},
-	}
+		name string
+		in   *ateletpb.SnapshotReport
+		want *ateapi.SnapshotReport
+	}{{
+		name: "every field",
+		in: &ateletpb.SnapshotReport{
+			Snapshot: &ateletpb.Snapshot{
+				SnapshotUuid: "snap-2",
+				Generation:   2,
+				Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
+				Object:       &ateletpb.ObjectStorage{SnapshotUri: "gs://snapshots/snap-2"},
+			},
+			LocalCommitTime:     committed,
+			DurableCompleteTime: uploaded,
+		},
+		want: &ateapi.SnapshotReport{
+			Uuid:                "snap-2",
+			Generation:          2,
+			Fidelity:            ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
+			Object:              &ateapi.ObjectSnapshot{SnapshotUri: "gs://snapshots/snap-2"},
+			LocalCommitTime:     committed,
+			DurableCompleteTime: uploaded,
+		},
+	}, {
+		name: "a local snapshot has no object",
+		in: &ateletpb.SnapshotReport{
+			Snapshot:        &ateletpb.Snapshot{SnapshotUuid: "snap-3", Generation: 3, Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
+			LocalCommitTime: committed,
+		},
+		want: &ateapi.SnapshotReport{
+			Uuid:            "snap-3",
+			Generation:      3,
+			Fidelity:        ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			LocalCommitTime: committed,
+		},
+	}, {
+		name: "a report that names no snapshot converts to nil",
+		in:   &ateletpb.SnapshotReport{LocalCommitTime: committed},
+	}, {
+		name: "nil stays nil",
+	}}
 	for _, tt := range tests {
-		if got := sandboxClassString(tt.in); got != tt.expected {
-			t.Errorf("sandboxClassString(%v) = %q, want %q", tt.in, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if diff := cmp.Diff(tt.want, snapshotReportFromAtelet(tt.in), protocmp.Transform()); diff != "" {
+				t.Errorf("snapshotReportFromAtelet mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

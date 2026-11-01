@@ -29,13 +29,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateinterceptors"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/boomerutil"
-	bmetrics "github.com/agent-substrate/substrate/internal/benchmarking/boomer/metrics"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
-	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateinterceptors"
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/boomerutil"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/dynconfig"
+	bmetrics "go.ate.dev/substrate/internal/benchmarking/boomer/metrics"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -50,12 +52,23 @@ const (
 	userClass        = "GluttonUser"
 	templateName     = "glutton"
 	templateAtespace = "benchmark-workloads"
-	actorDomain      = "actors.resources.substrate.ate.dev"
 	pingPath         = "/ping"
 	writeRAMPath     = "/writeram"
 	readRAMPath      = "/readram"
+	useCPUPath       = "/usecpu"
 	memLoadKey       = "memload"
 	memReadAll       = "all"
+
+	// Consecutive ReplaceIfPersistent failures it takes to replace an actor.
+	// One blip is not evidence of a wedged actor; three in a row, each
+	// spaced by the wait window, is.
+	maxConsecutiveFailures = 3
+
+	// Per-wake ping loop: pings after the first are spaced by a random gap
+	// in [minPingGap, maxPingGap). The loop stops early once the live
+	// window (liveWait) elapses so we still suspend on schedule.
+	minPingGap = 200 * time.Millisecond
+	maxPingGap = 1 * time.Second
 )
 
 func init() {
@@ -63,6 +76,7 @@ func init() {
 		Name:       "glutton",
 		LocustFile: "glutton.py",
 		UserClass:  userClass,
+		Config:     gluttonCodec,
 		Init:       initPing,
 	})
 }
@@ -84,10 +98,20 @@ type taskRuntime struct {
 }
 
 // iterate is the task function boomer calls in a loop on each VU goroutine.
-// On first call from a given goroutine we lazily create the user's actor
-// (the analog of locust's per-user on_start); subsequent calls run a
-// resume/ping/suspend cycle.
+// On first call from a given goroutine we lazily create the user's actors
+// (the analog of locust's per-user on_start); subsequent calls advance the
+// VU's round-robin cursor by one and run a resume/ping/suspend cycle on
+// that actor.
 func (r *taskRuntime) iterate() {
+	// Every return path sleeps the wait window (--min/--max-wait-time). On
+	// the happy path that is the gap between suspend and the VU's next
+	// resume, as in the legacy Python test; on the error paths it keeps a
+	// failing startUser / resume / crashed actor from looping on boomer's
+	// zero-delay re-entry and hammering ate-api-server.
+	defer func() {
+		time.Sleep(r.dynamicWait())
+	}()
+
 	gid := boomerutil.GoroutineID()
 	val, loaded := r.users.Load(gid)
 	if !loaded {
@@ -101,96 +125,271 @@ func (r *taskRuntime) iterate() {
 	}
 	user := val.(*gluttonUser)
 
-	ctx := context.Background()
-	if !user.resume(ctx) {
+	actor := user.nextActor()
+	if actor == nil {
 		return
+	}
+
+	ctx := context.Background()
+
+	// resume()'s failure path replaces a crashed actor on the spot, so
+	// reaching here means the replacement's create failed last time. Retry
+	// it, or the VU runs a slot short for the rest of the run.
+	if actor.crashed {
+		user.replaceActor(ctx, actor)
+		return
+	}
+
+	// Going straight back to resume on a stranded actor would turn every
+	// retryable hibernate failure into a FailedPrecondition and cost the
+	// actor anyway. SuspendActor is re-entrant in either mode, so finish
+	// the hibernate and pick the cycle up next iteration.
+	if actor.hibernatePending {
+		if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
+			user.replaceActor(ctx, actor)
+		}
+		return
+	}
+
+	if !actor.actorRunning || dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode != dynconfig.LifecycleModeNone {
+		if err := actor.resume(ctx); err != nil {
+			if actor.noteFailure(err) {
+				user.replaceActor(ctx, actor)
+			}
+			return
+		}
 	}
 	// Fill before the first suspend so every snapshot from cycle one on
 	// carries the full working set; glutton keeps the allocations across
 	// suspend/resume, so this runs once per actor (retried if it fails).
-	user.ensureRAMFilled(ctx)
+	actor.ensureRAMFilled(ctx)
+	// Start the CPU load once per actor for the same reason: glutton's
+	// spinning goroutines survive suspend/resume with the rest of the process.
+	actor.ensureCPULoad(ctx)
 	// Walk the working set right after resume, before churn dirties it:
 	// under a demand-paged restore every touched page must be paged back
 	// in before the walk returns, so its latency measures the true cost
 	// of reaching the previous snapshot's memory.
-	user.readRAM(ctx)
+	actor.readRAM(ctx)
 	// Re-dirty part of the working set each cycle so repeated suspends
 	// snapshot an actor whose memory is changing, like a live application's.
 	// Rotate mode advances through the array cycle over cycle, so the dirty
 	// window moves instead of re-dirtying the same prefix.
-	user.churnRAM(ctx)
-	user.ping(ctx)
-	user.suspend(ctx)
-
-	time.Sleep(r.dynamicWait())
+	actor.churnRAM(ctx)
+	// Live window (--min/--max-live-time): ping, then hold the actor
+	// running until the window closes. The first ping runs immediately,
+	// then up to maxPings-1 more, each preceded by a random gap in
+	// [minPingGap, maxPingGap). The loop stops when either the ping cap or
+	// the deadline is reached; any leftover time is slept below so the
+	// actor stays live for the full window. With the default zero window
+	// the actor is hibernated right after the first ping.
+	deadline := time.Now().Add(r.liveWait())
+	maxPings := max(dynconfig.Get[gluttonKnobs](r.cfg.Dyn).MaxPingsPerWake, 1)
+	actor.ping(ctx)
+	for sent := 1; sent < maxPings; sent++ {
+		gap := minPingGap + time.Duration(rand.Float64()*float64(maxPingGap-minPingGap))
+		if time.Now().Add(gap).After(deadline) {
+			break
+		}
+		time.Sleep(gap)
+		actor.ping(ctx)
+	}
+	if remaining := time.Until(deadline); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
+		user.replaceActor(ctx, actor)
+	}
 }
 
 func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
-	u := &gluttonUser{
-		cfg:         r.cfg,
-		actorName:   "sb-" + uuid.NewString(),
-		firstResume: true,
+	n := r.cfg.ActorsPerUser
+	if n < 1 {
+		n = 1
 	}
-	u.hostHeader = u.actorName + "." + u.cfg.Atespace + "." + actorDomain
+	u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
 	bmetrics.UpdateUsers(userClass, 1)
-	if err := u.ensureAtespace(ctx); err != nil {
-		bmetrics.UpdateUsers(userClass, -1)
-		return nil, err
+	var lastCreateErr error
+	for i := 0; i < n; i++ {
+		a := &gluttonActor{
+			cfg:         r.cfg,
+			actorName:   "sb-" + uuid.NewString(),
+			firstResume: true,
+		}
+		// Ensuring the atespace is idempotent (swallows AlreadyExists), so
+		// doing it once per VU is enough — subsequent actors would just make
+		// the same round-trip return AlreadyExists.
+		if i == 0 {
+			if err := a.ensureAtespace(ctx); err != nil {
+				bmetrics.UpdateUsers(userClass, -1)
+				return nil, err
+			}
+		}
+		if err := a.create(ctx); err != nil {
+			lastCreateErr = err
+			slog.Warn("glutton create failed partway; using actors created so far",
+				slog.String("atespace", r.cfg.Atespace),
+				slog.Int("wanted", n),
+				slog.Int("got", len(u.actors)),
+				slog.String("err", err.Error()))
+			break
+		}
+		u.actors = append(u.actors, a)
 	}
-	if err := u.create(ctx); err != nil {
+	if len(u.actors) == 0 {
 		bmetrics.UpdateUsers(userClass, -1)
-		return nil, err
+		return nil, fmt.Errorf("no actors created: %w", lastCreateErr)
 	}
 	return u, nil
 }
 
-// shutdown suspends (if still running) and deletes every actor this worker
+// shutdown hibernates (if still running) and deletes every actor this worker
 // created. Boomer has no per-VU stop hook, so a mid-run user-count decrease
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
 	r.users.Range(func(_, val any) bool {
 		u := val.(*gluttonUser)
-		if u.actorRunning {
-			u.suspend(ctx)
+		for _, a := range u.actors {
+			if a.actorRunning {
+				if dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode == dynconfig.LifecycleModeSync {
+					_ = a.suspend(ctx)
+				} else {
+					_ = a.pause(ctx)
+				}
+			}
+			a.delete(ctx)
 		}
-		u.delete(ctx)
 		bmetrics.UpdateUsers(userClass, -1)
 		return true
 	})
 }
 
+// dynamicWait is the gap between suspending one actor and resuming the
+// VU's next one, drawn uniformly from [MinWait, MaxWait].
 func (r *taskRuntime) dynamicWait() time.Duration {
-	cfg := r.cfg.Dyn.Load()
-	if cfg.MaxWait <= cfg.MinWait {
-		return cfg.MinWait
-	}
-	jitter := cfg.MaxWait - cfg.MinWait
-	return cfg.MinWait + time.Duration(rand.Float64()*float64(jitter))
+	return dynconfig.Get[gluttonKnobs](r.cfg.Dyn).WaitTime.Draw()
 }
 
+// liveWait is how long an actor stays resumed between its first ping and
+// its suspend, drawn uniformly from [MinLive, MaxLive]. The default zero
+// window suspends right after the ping.
+func (r *taskRuntime) liveWait() time.Duration {
+	knobs := dynconfig.Get[gluttonKnobs](r.cfg.Dyn)
+	return dynconfig.Uniform(knobs.MinLive.Duration(), knobs.MaxLive.Duration())
+}
+
+// gluttonUser is one VU (boomer goroutine). It owns --actors-per-user actors
+// and hands them out round-robin, one per iterate() call.
 type gluttonUser struct {
+	actors  []*gluttonActor
+	nextIdx int
+}
+
+// nextActor returns the current actor and advances the round-robin cursor.
+// Returns nil only if the VU started with zero actors (startUser guarantees
+// at least one on success).
+func (u *gluttonUser) nextActor() *gluttonActor {
+	if len(u.actors) == 0 {
+		return nil
+	}
+	a := u.actors[u.nextIdx]
+	u.nextIdx = (u.nextIdx + 1) % len(u.actors)
+	return a
+}
+
+// replaceActor deletes a stuck/broken actor and replaces its slot in u.actors
+// with a freshly created actor so the VU maintains full concurrency without
+// repeatedly calling a stuck actor (e.g. left in ACTOR_STATE_SUSPENDING).
+func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
+	// A re-entry (the last call deleted the actor but failed to create its
+	// replacement) would book a NotFound failure on every iteration.
+	if !broken.deleted {
+		broken.delete(ctx)
+		broken.deleted = true
+	}
+	replacement := &gluttonActor{
+		cfg:         broken.cfg,
+		actorName:   "sb-" + uuid.NewString(),
+		firstResume: true,
+	}
+	if err := replacement.create(ctx); err != nil {
+		slog.Warn("glutton actor replacement create failed; will retry on next failure",
+			slog.String("old_actor", broken.actorName),
+			slog.String("err", err.Error()))
+		return
+	}
+	for i, a := range u.actors {
+		if a == broken {
+			u.actors[i] = replacement
+			return
+		}
+	}
+}
+
+// gluttonActor is one actor's lifetime state within a VU. Every per-iteration
+// call in iterate() targets exactly one of these.
+type gluttonActor struct {
 	cfg          *userclass.Config
 	actorName    string
-	hostHeader   string
 	firstResume  bool
 	actorRunning bool
 	ramFilled    bool
+	cpuLoaded    bool
+	// crashed is set the first time ResumeActor reports the actor as
+	// ACTOR_STATE_CRASHED (codes.Aborted with "crashed" in the message).
+	// ateapi never rehabilitates one, so iterate() replaces it.
+	crashed bool
+	// hibernatePending is set by a failed SuspendActor: the actor is
+	// stranded RUNNING or SUSPENDING, which resume has no edge out of.
+	hibernatePending bool
+	// deleted is set once replaceActor has issued this actor's DeleteActor,
+	// so a second pass does not re-send it.
+	deleted bool
+	// consecutiveFailures counts replaceIfPersistent failures since the last
+	// success. See noteFailure.
+	consecutiveFailures int
 }
 
-func (u *gluttonUser) ref() *ateapipb.ObjectRef {
-	return &ateapipb.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
+// noteFailure records a failed lifecycle RPC against the actor and reports
+// whether the VU should replace it.
+func (u *gluttonActor) noteFailure(err error) bool {
+	switch boomerutil.ClassifyLifecycleFailure(err) {
+	case boomerutil.ReplaceNow:
+		return true
+	case boomerutil.RetryLater:
+		return false
+	}
+	u.consecutiveFailures++
+	if u.consecutiveFailures < maxConsecutiveFailures {
+		return false
+	}
+	slog.Warn("glutton actor failed repeatedly; replacing it",
+		slog.String("actor", u.actorName),
+		slog.Int("consecutive_failures", u.consecutiveFailures),
+		slog.String("err", err.Error()))
+	return true
+}
+
+// noteSuccess clears the failure count: the actor just proved it can still
+// make progress, so the earlier failures were transient after all.
+func (u *gluttonActor) noteSuccess() {
+	u.consecutiveFailures = 0
+}
+
+func (u *gluttonActor) ref() *ateapi.ObjectRef {
+	return &ateapi.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
 }
 
 // ensureAtespace creates the configured atespace, swallowing AlreadyExists
 // so concurrent VUs racing the first creation all see it as a success. The
 // call goes through tracedCall so it shows up in stats/spans like every
 // other API call.
-func (u *gluttonUser) ensureAtespace(ctx context.Context) error {
+func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateAtespace", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
-			Atespace: &ateapipb.Atespace{
-				Metadata: &ateapipb.ResourceMetadata{
+		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapi.CreateAtespaceRequest{
+			Atespace: &ateapi.Atespace{
+				Metadata: &ateapi.ResourceMetadata{
 					Name: u.cfg.Atespace,
 				},
 			},
@@ -205,51 +404,105 @@ func (u *gluttonUser) ensureAtespace(ctx context.Context) error {
 	})
 }
 
-func (u *gluttonUser) create(ctx context.Context) error {
+func (u *gluttonActor) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
-			Actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
+		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapi.CreateActorRequest{
+			Actor: &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateAtespace, Name: templateName},
 			},
 		}, grpc.Trailer(tr))
 		return err
 	})
 }
 
-func (u *gluttonUser) resume(ctx context.Context) bool {
+func (u *gluttonActor) resume(ctx context.Context) error {
 	metricName := "ResumeActor"
 	if u.firstResume {
-		metricName = "ResumeActorColdStart"
+		metricName = "ResumeActorFirstResume"
 	}
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
-			Actor: u.ref(),
-			Boot:  u.firstResume,
-		}, grpc.Trailer(tr))
-		return err
+		// Retry Aborted "concurrent update conflict" transparently — it's a
+		// race, not a real failure, and the caller is expected to retry per
+		// the ateapi contract. Kept inside the tracedCall closure so the
+		// reported latency spans every attempt and the span carries the
+		// last attempt's server trailer, same as any other single-shot RPC.
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapi.ResumeActorRequest{
+				Actor: u.ref(),
+			}, grpc.Trailer(tr))
+			return err
+		})
 	})
 	if err != nil {
-		return false
+		// Mark a crashed actor so iterate() stops touching it, and surface a
+		// CrashCount tick so operators can see the crash total in the
+		// locust stats table.
+		if boomerutil.IsCrashed(err) {
+			u.crashed = true
+			bmetrics.RecordFailure("actor", "CrashCount", userClass, 0, "actor entered ACTOR_STATE_CRASHED")
+			slog.Warn("glutton actor crashed; will stop sending requests",
+				slog.String("actor", u.actorName),
+				slog.String("err", err.Error()))
+		}
+		return err
 	}
 	u.firstResume = false
 	u.actorRunning = true
-	return true
+	u.noteSuccess()
+	return nil
 }
 
-func (u *gluttonUser) suspend(ctx context.Context) {
-	_ = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor: u.ref(),
+// hibernate takes the actor off its worker by whichever operation the
+// lifecycle mode selects: an async SuspendActor keeps the snapshot on the
+// node, a sync one writes it to durable storage, and LifecycleModeNone
+// leaves the actor running on its worker.
+func (u *gluttonActor) hibernate(ctx context.Context) error {
+	switch dynconfig.Get[gluttonKnobs](u.cfg.Dyn).LifecycleMode {
+	case dynconfig.LifecycleModeNone:
+		return nil
+	case dynconfig.LifecycleModeSync:
+		return u.suspend(ctx)
+	default:
+		return u.pause(ctx)
+	}
+}
+
+func (u *gluttonActor) pause(ctx context.Context) error {
+	err := u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
 	u.actorRunning = false
+	u.hibernatePending = err != nil
+	if err == nil {
+		u.noteSuccess()
+	}
+	return err
 }
 
-func (u *gluttonUser) delete(ctx context.Context) {
+func (u *gluttonActor) suspend(ctx context.Context) error {
+	err := u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+		}, grpc.Trailer(tr))
+		return err
+	})
+	u.actorRunning = false
+	u.hibernatePending = err != nil
+	if err == nil {
+		u.noteSuccess()
+	}
+	return err
+}
+
+func (u *gluttonActor) delete(ctx context.Context) {
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
+		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapi.DeleteActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
 		return err
@@ -257,23 +510,23 @@ func (u *gluttonUser) delete(ctx context.Context) {
 }
 
 // tracedCall wraps a unary gRPC call with a span and Prometheus/locust
-// reporting. The reported latency comes from the server-side trailer
-// emitted by ateinterceptors.ServerUnaryInterceptor when present, falling
-// back to client-measured wall clock otherwise.
-func (u *gluttonUser) tracedCall(ctx context.Context, name string, do func(context.Context, *metadata.MD) error) error {
+// reporting. The reported latency is client wall clock, so it covers
+// retries inside do, queueing, and the network. The server-side elapsed
+// time from ateinterceptors.ServerUnaryInterceptor's trailer, when present,
+// goes on the span only: it measures the last attempt alone.
+func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(context.Context, *metadata.MD) error) error {
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
 
 	start := time.Now()
 	var tr metadata.MD
 	err := do(ctx, &tr)
-	clientLatency := time.Since(start)
+	latency := time.Since(start)
 
-	latency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, clientLatency)
-	if source == boomerutil.SourceServer {
-		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(latency)))
+	if serverLatency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, 0); source == boomerutil.SourceServer {
+		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(serverLatency)))
 	}
-	boomerutil.LogSampledTrace(span, name, latency, source, err)
+	boomerutil.LogSampledTrace(span, name, latency, boomerutil.SourceClient, err)
 	if err != nil {
 		bmetrics.RecordFailure("grpc", name, userClass, latency, err.Error())
 		return err
@@ -282,7 +535,7 @@ func (u *gluttonUser) tracedCall(ctx context.Context, name string, do func(conte
 	return nil
 }
 
-func (u *gluttonUser) ping(ctx context.Context) {
+func (u *gluttonActor) ping(ctx context.Context) {
 	ctx, span := u.cfg.Tracer.Start(ctx, "GluttonPing")
 	defer span.End()
 
@@ -298,8 +551,8 @@ func (u *gluttonUser) ping(ctx context.Context) {
 		bmetrics.RecordFailure("http", "GluttonPing", userClass, 0, err.Error())
 		return
 	}
-	httpReq.Host = u.hostHeader
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 
 	start := time.Now()
@@ -347,11 +600,11 @@ func (u *gluttonUser) ping(ctx context.Context) {
 // size. A failure leaves ramFilled unset so the next iteration retries.
 // The fill reports as its own GluttonFillRAM stats row so it never
 // pollutes ping or resume numbers.
-func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
+func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 	if u.ramFilled {
 		return
 	}
-	target := u.cfg.Dyn.Load().MemTarget
+	target := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemTarget
 	if target == "" {
 		u.ramFilled = true
 		return
@@ -372,6 +625,40 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, 0)
 }
 
+// ensureCPULoad starts cpu_cores goroutines in the actor, each burning
+// cpu_duty_cycle of one core, through the glutton UseCPU API. Like
+// ensureRAMFilled it runs once per actor: the goroutines live in the
+// glutton process, so they resume with it and the actor draws the load
+// whenever it is running. A failure leaves cpuLoaded unset so the next
+// iteration retries. Reports as its own GluttonUseCPU stats row.
+func (u *gluttonActor) ensureCPULoad(ctx context.Context) {
+	if u.cpuLoaded {
+		return
+	}
+	knobs := dynconfig.Get[gluttonKnobs](u.cfg.Dyn)
+	if knobs.CPUCores == 0 {
+		u.cpuLoaded = true
+		return
+	}
+
+	ctx, span := u.cfg.Tracer.Start(ctx, "GluttonUseCPU")
+	defer span.End()
+	start := time.Now()
+
+	err := u.postProto(ctx, useCPUPath, &gluttonpb.UseCPURequest{
+		NumCores:  int32(knobs.CPUCores),
+		DutyCycle: knobs.CPUDutyCycle,
+	}, &gluttonpb.UseCPUResponse{})
+	clientLatency := time.Since(start)
+	boomerutil.LogSampledTrace(span, "GluttonUseCPU", clientLatency, boomerutil.SourceClient, err)
+	if err != nil {
+		bmetrics.RecordFailure("http", "GluttonUseCPU", userClass, clientLatency, err.Error())
+		return
+	}
+	u.cpuLoaded = true
+	bmetrics.RecordSuccess("http", "GluttonUseCPU", userClass, clientLatency, 0)
+}
+
 // churnRAM re-randomizes mem_churn bytes of the working set in place
 // (WriteRAM rotate on the fill's key), so pages arrive dirty at every
 // suspend instead of only the first: a fill-once set is static, and any
@@ -381,8 +668,8 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 // cycles dirty a moving window rather than the same prefix. Runs once per
 // iteration, only after the fill has succeeded, and reports as its own
 // GluttonChurnRAM stats row.
-func (u *gluttonUser) churnRAM(ctx context.Context) {
-	churn := u.cfg.Dyn.Load().MemChurn
+func (u *gluttonActor) churnRAM(ctx context.Context) {
+	churn := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemChurn
 	if churn == "" || !u.ramFilled {
 		return
 	}
@@ -407,8 +694,8 @@ func (u *gluttonUser) churnRAM(ctx context.Context) {
 // row's latency is the demand-paging cost of the previous snapshot's
 // memory; on an eagerly-restored actor it degenerates to a fast in-memory
 // scan, so the two restore modes are directly comparable.
-func (u *gluttonUser) readRAM(ctx context.Context) {
-	read := u.cfg.Dyn.Load().MemRead
+func (u *gluttonActor) readRAM(ctx context.Context) {
+	read := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemRead
 	if read == "" || !u.ramFilled {
 		return
 	}
@@ -435,7 +722,7 @@ func (u *gluttonUser) readRAM(ctx context.Context) {
 // writeRAM POSTs one WriteRAM request to the actor through the router,
 // mirroring ping's wire format (protobuf over HTTP). size is a suffixed
 // string (e.g. "2Gi") passed through verbatim; glutton parses it.
-func (u *gluttonUser) writeRAM(ctx context.Context, key, size string, mode gluttonpb.WriteMode) error {
+func (u *gluttonActor) writeRAM(ctx context.Context, key, size string, mode gluttonpb.WriteMode) error {
 	err := u.postProto(ctx, writeRAMPath, &gluttonpb.WriteRAMRequest{
 		Key:       key,
 		Size:      size,
@@ -449,7 +736,7 @@ func (u *gluttonUser) writeRAM(ctx context.Context, key, size string, mode glutt
 
 // postProto POSTs one protobuf request to the actor through the router and
 // unmarshals the protobuf response into resp.
-func (u *gluttonUser) postProto(ctx context.Context, path string, req, resp proto.Message) error {
+func (u *gluttonActor) postProto(ctx context.Context, path string, req, resp proto.Message) error {
 	body, err := proto.Marshal(req)
 	if err != nil {
 		return err
@@ -458,8 +745,8 @@ func (u *gluttonUser) postProto(ctx context.Context, path string, req, resp prot
 	if err != nil {
 		return err
 	}
-	httpReq.Host = u.hostHeader
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 
 	httpResp, err := u.cfg.HTTPClient.Do(httpReq)

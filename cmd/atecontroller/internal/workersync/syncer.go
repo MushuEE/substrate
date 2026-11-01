@@ -23,25 +23,29 @@ import (
 	"maps"
 	"time"
 
-	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/installdefaults"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
-
-// syncerWorkerCount is the number of goroutines draining the work queue. The
-// queue never hands the same key to two workers concurrently, so per-key
-// ordering is preserved.
-const syncerWorkerCount = 2
 
 // workerPodLabel names the WorkerPool a worker pod belongs to. Its presence is
 // also what marks a pod as a worker pod at all, so it doubles as the selector
 // the pod informer is narrowed by.
 const workerPodLabel = "ate.dev/worker-pool"
+
+// workerPoolIndex maps a WorkerPool namespace/name to the worker Pods labeled
+// as members of that pool.
+const workerPoolIndex = "worker-pool"
 
 // workerKey identifies the pod incarnation a queued event concerns. namespace
 // and name locate the pod in the informer, which is indexed by namespace/name
@@ -69,8 +73,8 @@ func (k workerKey) workerName() string { return k.uid }
 
 // workerRef is the Worker this key identifies, in the form the API's
 // single-resource requests take. Workers are global-scoped, so no atespace.
-func (k workerKey) workerRef() *ateapipb.ObjectRef {
-	return &ateapipb.ObjectRef{Name: k.workerName()}
+func (k workerKey) workerRef() *ateapi.ObjectRef {
+	return &ateapi.ObjectRef{Name: k.workerName()}
 }
 
 // logAttrs identifies the Worker in a log line, along with the pod it is
@@ -88,21 +92,39 @@ func (k workerKey) logAttrs() []any {
 //
 // Informer event handlers only enqueue keys; worker goroutines reconcile each
 // key against the current informer cache state, requeuing with rate-limited
-// backoff on transient failures such as a lost version precondition.
+// backoff on transient failures such as a lost version precondition. The queue
+// never hands the same key to two workers concurrently, so per-key ordering is
+// preserved regardless of workerCount.
 type WorkerPoolSyncer struct {
-	client           ateapipb.ControlClient
-	workerInformer   cache.SharedIndexInformer
-	workerPoolLister listersv1alpha1.WorkerPoolLister
-	queue            workqueue.TypedRateLimitingInterface[workerKey]
+	client             ateapi.ControlClient
+	pods               corev1client.PodsGetter
+	apps               appsv1client.AppsV1Interface
+	workerInformer     cache.SharedIndexInformer
+	workerPoolInformer cache.SharedIndexInformer
+	queue              workqueue.TypedRateLimitingInterface[workerKey]
+	workerCount        int
+
+	// Exponential backoff schedule for retrying a failed page of the startup
+	// registered-worker scan. Per-syncer rather than package-level so a test
+	// can shrink it without writing state another test's syncer is reading.
+	listBackoff time.Duration
+	listCap     time.Duration
 }
 
-// NewWorkerPoolSyncer creates a new WorkerPoolSyncer.
-func NewWorkerPoolSyncer(client ateapipb.ControlClient, workerInformer cache.SharedIndexInformer, workerPoolLister listersv1alpha1.WorkerPoolLister) *WorkerPoolSyncer {
+// NewWorkerPoolSyncer creates a new WorkerPoolSyncer. pods is used to delete
+// worker pods that have reached a terminal phase or outlived their pool, and
+// apps to tell the latter from pods the garbage collector is still removing.
+func NewWorkerPoolSyncer(client ateapi.ControlClient, pods corev1client.PodsGetter, apps appsv1client.AppsV1Interface, workerInformer, workerPoolInformer cache.SharedIndexInformer, workerCount int) *WorkerPoolSyncer {
 	return &WorkerPoolSyncer{
-		client:           client,
-		workerInformer:   workerInformer,
-		workerPoolLister: workerPoolLister,
-		queue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[workerKey]()),
+		client:             client,
+		pods:               pods,
+		apps:               apps,
+		workerInformer:     workerInformer,
+		workerPoolInformer: workerPoolInformer,
+		queue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[workerKey]()),
+		workerCount:        workerCount,
+		listBackoff:        defaultListBackoff,
+		listCap:            defaultListCap,
 	}
 }
 
@@ -128,32 +150,31 @@ func (s *WorkerPoolSyncer) Start(ctx context.Context) {
 			s.enqueuePod(newPod)
 		},
 		DeleteFunc: func(obj interface{}) {
-			var pod *corev1.Pod
-			switch t := obj.(type) {
-			case *corev1.Pod:
-				pod = t
-			case cache.DeletedFinalStateUnknown:
-				var ok bool
-				pod, ok = t.Obj.(*corev1.Pod)
-				if !ok {
-					slog.ErrorContext(ctx, "Failed to cast DeletedFinalStateUnknown object to Pod")
-					return
-				}
-			default:
+			pod, ok := deletedObject[*corev1.Pod](obj)
+			if !ok {
 				slog.ErrorContext(ctx, "Unknown object type in delete handler", slog.Any("obj", obj))
 				return
 			}
 			s.enqueuePod(pod)
 		},
 	})
+	s.workerPoolInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    s.enqueueWorkerPool,
+		UpdateFunc: func(_, obj interface{}) { s.enqueueWorkerPool(obj) },
+		// Orphaned pods outlive their pool; reconcile them now, not at the
+		// next resync.
+		DeleteFunc: s.enqueueWorkerPool,
+	})
 
 	go func() {
 		defer s.queue.ShutDown()
-		if !cache.WaitForCacheSync(ctx.Done(), s.workerInformer.HasSynced) {
+		// The pool cache must be warm too: reconciling a pod against an empty
+		// one would read every pool as missing and deregister every Worker.
+		if !cache.WaitForCacheSync(ctx.Done(), s.workerInformer.HasSynced, s.workerPoolInformer.HasSynced) {
 			slog.ErrorContext(ctx, "Syncer: failed to sync informer cache")
 			return
 		}
-		for range syncerWorkerCount {
+		for range s.workerCount {
 			go wait.UntilWithContext(ctx, s.runWorker, time.Second)
 		}
 
@@ -167,6 +188,34 @@ func (s *WorkerPoolSyncer) Start(ctx context.Context) {
 
 		<-ctx.Done()
 	}()
+}
+
+// deletedObject returns the T that a delete event carries. An informer that
+// missed the delete itself delivers a cache.DeletedFinalStateUnknown holding the
+// last state it knew of, so that is unwrapped first.
+func deletedObject[T any](obj interface{}) (T, bool) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	t, ok := obj.(T)
+	return t, ok
+}
+
+// enqueueWorkerPool schedules every current pod in pool.
+func (s *WorkerPoolSyncer) enqueueWorkerPool(obj interface{}) {
+	pool, ok := deletedObject[*atev1.WorkerPool](obj)
+	if !ok {
+		slog.Error("Syncer: unexpected WorkerPool informer object", slog.Any("obj", obj))
+		return
+	}
+	pods, err := s.workerInformer.GetIndexer().ByIndex(workerPoolIndex, pool.Namespace+"/"+pool.Name)
+	if err != nil {
+		slog.Error("Syncer: listing pods for WorkerPool update", "workerPool", pool.Namespace+"/"+pool.Name, "err", err)
+		return
+	}
+	for _, obj := range pods {
+		s.enqueuePod(obj.(*corev1.Pod))
+	}
 }
 
 func (s *WorkerPoolSyncer) enqueuePod(pod *corev1.Pod) {
@@ -224,102 +273,121 @@ func (s *WorkerPoolSyncer) reconcile(ctx context.Context, key workerKey) error {
 		slog.InfoContext(ctx, "Syncer: deregistering worker (pod replaced)", key.logAttrs()...)
 		return s.reconcileDeadWorker(ctx, key)
 	}
-	// Checked before eligibility: draining works off the registered record by name
-	// and never reads the pod IP, while a Terminating pod can legitimately report
-	// no IP once its sandbox is torn down. Gating on the IP first would drop the
-	// transition and leave the worker schedulable for as long as the pod lingers.
 	if pod.DeletionTimestamp != nil {
 		// The pod has entered Terminating: mark the worker DRAINING so the
 		// scheduler stops routing new actors to it. We deliberately do NOT touch
-		// the bound actor here — inside the pod ateom has received SIGTERM and is
+		// the bound actor here — inside the pod worker has received SIGTERM and is
 		// gracefully shutting the actor down. Actor cleanup happens on the Pod
 		// Deleted event.
 		return s.markWorkerDraining(ctx, key)
 	}
-	if !isWorkerEligible(pod) {
-		// The pod has no IP or is not Ready yet; a later update event re-enqueues it.
-		return nil
+	// A terminal pod is never Ready again, so left alone its Worker would stay
+	// UNAVAILABLE, and the Actors bound to it registered, for as long as the pod
+	// object lingers. The API server deletes a terminal pod without a grace
+	// period.
+	if isPodTerminal(pod) {
+		return s.deleteWorkerPod(ctx, key, pod, "phase "+string(pod.Status.Phase))
 	}
 	return s.createOrUpdateWorker(ctx, key, pod)
 }
 
+// createOrUpdateWorker registers the pod's Worker, or brings the registered
+// one in line with the pod. A Worker is registered UNAVAILABLE and marked
+// available only while its pod is Ready. Its epochs, IPs, capacity and runtimes
+// are its worker process's to report, through WorkerService.
 func (s *WorkerPoolSyncer) createOrUpdateWorker(ctx context.Context, key workerKey, pod *corev1.Pod) error {
 	poolName := pod.Labels[workerPodLabel]
-	pool, err := s.workerPoolLister.WorkerPools(key.namespace).Get(poolName)
+	poolObject, exists, err := s.workerPoolInformer.GetIndexer().GetByKey(key.namespace + "/" + poolName)
 	if err != nil {
 		return fmt.Errorf("getting WorkerPool %s/%s: %w", key.namespace, poolName, err)
 	}
+	if !exists {
+		return s.reconcileMissingPool(ctx, key, pod, poolName)
+	}
+	pool, ok := poolObject.(*atev1.WorkerPool)
+	if !ok {
+		return fmt.Errorf("getting WorkerPool %s/%s: unexpected object type %T", key.namespace, poolName, poolObject)
+	}
 
-	w, err := s.client.GetWorker(ctx, &ateapipb.GetWorkerRequest{Worker: key.workerRef()})
+	available := isWorkerAvailable(pod)
+
+	w, err := s.client.GetWorker(ctx, &ateapi.GetWorkerRequest{Worker: key.workerRef()})
 	if status.Code(err) == codes.NotFound {
+		// node_name is required and immutable, so the pod is registered once it
+		// is scheduled; the update that binds it re-enqueues the pod.
+		if pod.Spec.NodeName == "" {
+			return nil
+		}
 		slog.InfoContext(ctx, "Syncer: registering worker", key.logAttrs()...)
-		worker := &ateapipb.Worker{
+		worker := &ateapi.Worker{
 			// Workers are global-scoped, so the name carries no atespace. See
 			// workerKey.workerName for where the name comes from.
-			Metadata:        &ateapipb.ResourceMetadata{Name: key.workerName()},
+			Metadata:        &ateapi.ResourceMetadata{Name: key.workerName()},
 			WorkerNamespace: pod.Namespace,
 			WorkerPool:      poolName,
 			WorkerPod:       pod.Name,
-			Ip:              pod.Status.PodIP,
 			WorkerPodUid:    string(pod.UID),
 			NodeName:        pod.Spec.NodeName,
-			SandboxClass:    string(pool.Spec.SandboxClass),
+			WorkerSpiffeId:  workerSPIFFEID(pod),
 			Labels:          pool.GetLabels(),
-			// Capacity is the Worker's to report, not the syncer's to infer
-			// from the pod: it is what the ateom can actually supply. Until
-			// that report lands, CreateWorker's reified ceiling holds the
-			// Worker to a single Actor.
 		}
-		// status is output-only: CreateWorker sets STATE_ACTIVE itself.
+		// status is output-only: CreateWorker registers the Worker UNAVAILABLE.
 		//
 		// ALREADY_EXISTS means we lost a create race; requeue and converge via
 		// the update path. INVALID_ARGUMENT is terminal — see
 		// processNextWorkItem.
-		_, err := s.client.CreateWorker(ctx, &ateapipb.CreateWorkerRequest{Worker: worker})
-		return err
-	}
-	if err != nil {
+		w, err = s.client.CreateWorker(ctx, &ateapi.CreateWorkerRequest{Worker: worker})
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
 		return fmt.Errorf("getting worker: %w", err)
 	}
 
-	// UpdateWorker replaces the whole resource, so the two mutable fields are
+	// Each write below returns the Worker at its new version, which the next
+	// one carries as its precondition. ABORTED requeues the key; the retry
+	// re-fetches the worker.
+	if !available && w.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_ACTIVE {
+		slog.InfoContext(ctx, "Syncer: marking worker unavailable (pod not Ready)", key.logAttrs()...)
+		marked, err := s.client.MarkWorkerUnavailable(ctx, &ateapi.MarkWorkerUnavailableRequest{Worker: key.workerRef()})
+		if err != nil {
+			return err
+		}
+		w = marked.GetWorker()
+	}
+
+	// UpdateWorker replaces the whole resource, so the mutable fields are
 	// edited onto the Worker as it was read and the rest is sent back unchanged
 	// — anything else altered here, including a field cleared by omission, is
 	// rejected as INVALID_ARGUMENT. Everything else on a Worker is immutable
 	// after create, so drift there cannot be repaired by an update; it takes a
 	// new pod, which arrives under a new key.
 	var changed bool
-	if w.GetSandboxClass() != string(pool.Spec.SandboxClass) {
-		slog.InfoContext(ctx, "Syncer: updating worker (SandboxClass changed)", key.logAttrs()...)
-		w.SandboxClass = string(pool.Spec.SandboxClass)
-		changed = true
-	}
 	if !maps.Equal(w.GetLabels(), pool.GetLabels()) {
 		slog.InfoContext(ctx, "Syncer: updating worker (labels changed)", key.logAttrs()...)
 		w.Labels = pool.GetLabels()
 		changed = true
 	}
-	if w.GetIp() != pod.Status.PodIP {
-		// TODO: I don't think this is possible, but handling this case so we can
-		// log it just in case we can reproduce it. It is logged rather than
-		// repaired because ip is immutable on a registered Worker: writing the
-		// pod's value back would be rejected rather than applied.
-		slog.WarnContext(ctx, "Syncer: registered worker IP disagrees with its pod",
-			append(key.logAttrs(), slog.String("registered", w.GetIp()), slog.String("pod_ip", pod.Status.PodIP))...)
-	}
-	if !changed {
-		return nil
+	if changed {
+		w, err = s.client.UpdateWorker(ctx, &ateapi.UpdateWorkerRequest{Worker: w})
+		if err != nil {
+			return err
+		}
 	}
 
-	// w carries the uid and version it was read at, which the API requires as the
-	// update's precondition. ABORTED requeues the key; the retry re-fetches the
-	// worker at its new version.
-	_, err = s.client.UpdateWorker(ctx, &ateapipb.UpdateWorkerRequest{Worker: w})
-	return err
+	// A DRAINING Worker is left alone: its pod is on its way out.
+	if available && w.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_UNAVAILABLE {
+		slog.InfoContext(ctx, "Syncer: marking worker available (pod Ready)", key.logAttrs()...)
+		_, err = s.client.MarkWorkerAvailable(ctx, &ateapi.MarkWorkerAvailableRequest{Worker: key.workerRef()})
+		return err
+	}
+	return nil
 }
 
-func isWorkerEligible(pod *corev1.Pod) bool {
-	if pod.Status.PodIP == "" {
+// isWorkerAvailable reports whether the pod is Ready with an IP, and so can
+// take Actors.
+func isWorkerAvailable(pod *corev1.Pod) bool {
+	if len(pod.Status.PodIPs) == 0 {
 		return false
 	}
 	for _, condition := range pod.Status.Conditions {
@@ -330,6 +398,118 @@ func isWorkerEligible(pod *corev1.Pod) bool {
 	return false
 }
 
+// isPodTerminal reports whether every container in the pod has stopped for
+// good: a terminal phase is never left, so the pod will not serve again.
+func isPodTerminal(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+// deleteWorkerPod gracefully deletes a worker pod; the Pod Deleted event then
+// deregisters the Worker through reconcileDeadWorker. The Worker is marked
+// DRAINING first so the scheduler stops routing to it even if the delete is
+// retried.
+//
+// The delete is preconditioned on the key's UID so it can never remove a
+// same-named replacement. A pod already gone, or replaced, is the state this
+// drives towards, so NotFound and Conflict are success.
+func (s *WorkerPoolSyncer) deleteWorkerPod(ctx context.Context, key workerKey, pod *corev1.Pod, reason string) error {
+	if err := s.markWorkerDraining(ctx, key); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "Syncer: deleting worker pod",
+		append(key.logAttrs(), slog.String("reason", reason))...)
+	uid := pod.UID
+	err := s.pods.Pods(key.namespace).Delete(ctx, key.name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid},
+	})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("deleting pod (%s): %w", reason, err)
+	}
+	return nil
+}
+
+// reconcileMissingPool handles a live pod whose WorkerPool is not in the cache.
+// The Worker is never deleted outright, which would crash its Actors. A pod
+// the garbage collector is still removing is left to it. An orphaned pod is
+// deleted gracefully; a replacement from its ReplicaSet has no Worker, so is
+// left alone.
+func (s *WorkerPoolSyncer) reconcileMissingPool(ctx context.Context, key workerKey, pod *corev1.Pod, poolName string) error {
+	_, err := s.client.GetWorker(ctx, &ateapi.GetWorkerRequest{Worker: key.workerRef()})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting worker: %w", err)
+	}
+	pending, err := s.poolCleanupPending(ctx, pod)
+	if err != nil {
+		return err
+	}
+	if pending {
+		slog.InfoContext(ctx, "Syncer: leaving worker to cascading delete (pool not found)",
+			append(key.logAttrs(), slog.String("workerPool", key.namespace+"/"+poolName))...)
+		return nil
+	}
+	return s.deleteWorkerPod(ctx, key, pod, "orphaned from deleted pool "+poolName)
+}
+
+// poolCleanupPending reports whether the garbage collector will still remove
+// pod. It walks the controller chain pod -> ReplicaSet -> Deployment ->
+// WorkerPool: a gone or deleting owner means collection is pending, a cut link
+// means the pod was orphaned.
+func (s *WorkerPoolSyncer) poolCleanupPending(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	var obj metav1.Object = pod
+	for _, kind := range []string{"ReplicaSet", "Deployment"} {
+		ref := metav1.GetControllerOf(obj)
+		if ref == nil || ref.Kind != kind {
+			return false, nil
+		}
+		owner, err := s.getOwner(ctx, pod.Namespace, ref)
+		if err != nil {
+			return false, fmt.Errorf("getting %s %s/%s: %w", ref.Kind, pod.Namespace, ref.Name, err)
+		}
+		if owner == nil || owner.GetDeletionTimestamp() != nil {
+			return true, nil
+		}
+		obj = owner
+	}
+	ref := metav1.GetControllerOf(obj)
+	return ref != nil && ref.Kind == "WorkerPool", nil
+}
+
+// getOwner reads the ReplicaSet or Deployment ref names, or nil if it is gone
+// or was replaced under the same name.
+func (s *WorkerPoolSyncer) getOwner(ctx context.Context, namespace string, ref *metav1.OwnerReference) (metav1.Object, error) {
+	var owner metav1.Object
+	var err error
+	switch ref.Kind {
+	case "ReplicaSet":
+		owner, err = s.apps.ReplicaSets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	case "Deployment":
+		owner, err = s.apps.Deployments(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	default:
+		return nil, fmt.Errorf("unsupported owner kind %q", ref.Kind)
+	}
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if owner.GetUID() != ref.UID {
+		return nil, nil
+	}
+	return owner, nil
+}
+
+// workerSPIFFEID returns the SPIFFE ID the podidentity signer issues to pod.
+func workerSPIFFEID(pod *corev1.Pod) string {
+	return installdefaults.SPIFFEID(pod.Namespace, pod.Spec.ServiceAccountName)
+}
+
 // markWorkerDraining transitions a worker to STATE_DRAINING so the scheduler
 // stops routing new actors to it while its pod is Terminating. DrainWorker is
 // idempotent, so a worker already draining costs nothing. If the worker is
@@ -338,7 +518,7 @@ func isWorkerEligible(pod *corev1.Pod) bool {
 // and retries against the updated record.
 func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey) error {
 	slog.InfoContext(ctx, "Syncer: marking worker draining (pod deleting)", key.logAttrs()...)
-	_, err := s.client.DrainWorker(ctx, &ateapipb.DrainWorkerRequest{Worker: key.workerRef()})
+	_, err := s.client.DrainWorker(ctx, &ateapi.DrainWorkerRequest{Worker: key.workerRef()})
 	if status.Code(err) == codes.NotFound {
 		return nil
 	}
@@ -354,19 +534,18 @@ func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey
 // NOT_FOUND is success. Idempotency lives here, at the caller, so re-driving a
 // reconcile is safe.
 func (s *WorkerPoolSyncer) reconcileDeadWorker(ctx context.Context, key workerKey) error {
-	_, err := s.client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: key.workerRef()})
+	_, err := s.client.DeleteWorker(ctx, &ateapi.DeleteWorkerRequest{Worker: key.workerRef()})
 	if status.Code(err) == codes.NotFound {
 		return nil
 	}
 	return err
 }
 
-// storedWorkerListBackoff and storedWorkerListCap are the exponential backoff
-// schedule for retrying a failed page of the startup registered-worker scan.
-// They are vars so tests can shrink them.
-var (
-	storedWorkerListBackoff = 500 * time.Millisecond
-	storedWorkerListCap     = 30 * time.Second
+// The default retry backoff schedule for a failed page of the startup
+// registered-worker scan.
+const (
+	defaultListBackoff = 500 * time.Millisecond
+	defaultListCap     = 30 * time.Second
 )
 
 // enqueueRegisteredWorkers enqueues a key for every worker record in the
@@ -413,9 +592,9 @@ func (s *WorkerPoolSyncer) enqueueRegisteredWorkers(ctx context.Context) {
 // resumes from the same position. A fresh backoff per page means only
 // consecutive failures of the same call accumulate delay; a page that succeeds
 // resets it.
-func (s *WorkerPoolSyncer) listWorkersPageWithRetry(ctx context.Context, pageToken string) (*ateapipb.ListWorkersResponse, error) {
+func (s *WorkerPoolSyncer) listWorkersPageWithRetry(ctx context.Context, pageToken string) (*ateapi.ListWorkersResponse, error) {
 	backoff := wait.Backoff{
-		Duration: storedWorkerListBackoff,
+		Duration: s.listBackoff,
 		Factor:   2.0,
 		Jitter:   0.1,
 		// Steps must be large enough for the ramp (Duration*Factor^n) to reach
@@ -423,10 +602,10 @@ func (s *WorkerPoolSyncer) listWorkersPageWithRetry(ctx context.Context, pageTok
 		// With Duration=500ms, Factor=2, the ramp hits Cap=30s at step 6
 		// (0.5,1,2,4,8,16,30,30...).
 		Steps: 6,
-		Cap:   storedWorkerListCap,
+		Cap:   s.listCap,
 	}
 	for {
-		page, err := s.client.ListWorkers(ctx, &ateapipb.ListWorkersRequest{PageSize: 1000, PageToken: pageToken})
+		page, err := s.client.ListWorkers(ctx, &ateapi.ListWorkersRequest{Options: &ateapi.ListOptions{PageSize: 1000, PageToken: pageToken}})
 		if err == nil {
 			return page, nil
 		}

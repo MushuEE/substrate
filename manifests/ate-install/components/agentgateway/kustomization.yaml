@@ -42,7 +42,7 @@ patches:
         path: /spec/template/spec/containers/0
         value:
           name: agentgateway
-          image: cr.agentgateway.dev/agentgateway:v1.5.0
+          image: cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
           args:
           - -f
           - /etc/agentgateway/config.yaml
@@ -99,6 +99,9 @@ patches:
         namespace: ate-system
       spec:
         template:
+          metadata:
+            annotations:
+              prometheus.io/port: "15020"
           spec:
             volumes:
             - name: envoy-config
@@ -115,10 +118,17 @@ patches:
         path: /spec/template/spec/containers/0
         value:
           name: agentgateway
-          image: cr.agentgateway.dev/agentgateway:v1.5.0
+          image: cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
           args:
           - -f
           - /etc/agentgateway/config.yaml
+          env:
+          - name: RUST_LOG
+            value: debug
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
           ports:
           - name: https
             containerPort: 8443
@@ -170,3 +180,49 @@ patches:
                   matchLabels:
                     podcert.ate.dev/canarying: live
                 path: trust-bundle.pem
+  # Agentgateway does not authenticate ingress clients yet, so it still serves
+  # the plaintext ports the Envoy router dropped.
+  - target:
+      version: v1
+      kind: Service
+      name: atenet-router
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: stats
+          port: 15020
+          targetPort: stats
+          protocol: TCP
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: http
+          port: 80
+          targetPort: 8080
+          protocol: TCP
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: connect
+          port: 8081
+          targetPort: 8081
+          protocol: TCP
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: atenet-router
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/ingress/0/ports/-
+        value:
+          protocol: TCP
+          port: http
+      - op: add
+        path: /spec/ingress/0/ports/-
+        value:
+          protocol: TCP
+          port: connect

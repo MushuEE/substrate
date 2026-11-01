@@ -19,11 +19,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/ingress"
+	"go.ate.dev/substrate/internal/credbundle"
 )
 
 type dataplaneHealthCheck struct {
@@ -32,15 +34,15 @@ type dataplaneHealthCheck struct {
 }
 
 // Both dataplanes resolve the worker address from ext_proc's dynamic
-// metadata (see ingress.OriginalDstMetadataKey) and leave :authority/Host
-// untouched, so atunnel always authorizes by the actor's own DNS name --
-// ingress.New needs no per-dataplane routing mode.
+// metadata (see ingress.OriginalDstMetadataKey). Actor identity is carried in
+// explicit headers, so ingress.New needs no per-dataplane routing mode.
 
 func (r atenetRouter) healthCheck() dataplaneHealthCheck {
 	switch r {
 	case atenetRouterEnvoy:
-		// localhost, not 127.0.0.1: the admin socket binds `::`, so the dial
-		// has to be able to fall through to the IPv6 loopback.
+		// Use `localhost` because we must try both IPv6 and IPv4.
+		//
+		// TODO: Shouldn't this work for the agentgateway case as well?
 		return dataplaneHealthCheck{url: "http://localhost:9901/ready", expectedBody: "LIVE"}
 	case atenetRouterAgentgateway:
 		return dataplaneHealthCheck{url: "http://127.0.0.1:15021/healthz/ready", expectedBody: "ready"}
@@ -62,9 +64,32 @@ func (s *RouterServer) startDataplane(ctx context.Context, g *errgroup.Group, pa
 }
 
 func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Group, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) error {
+	xdsSrv, err := s.newEnvoyXdsServer(ctx, parkCfg, traceRootSamplingPercent)
+	if err != nil {
+		return err
+	}
+
+	// Envoy receives all routing configuration from the local xDS server.
+	g.Go(func() error {
+		addr := xdsListenAddress(s.cfg.XdsPort)
+		slog.InfoContext(ctx, "Starting Envoy xDS Server", slog.String("address", addr))
+		lis, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("failed to listen on %s: %w", addr, err)
+		}
+		defer lis.Close()
+
+		return xdsSrv.Serve(ctx, lis)
+	})
+	return nil
+}
+
+// newEnvoyXdsServer applies the router configuration to a new xDS server and
+// builds its snapshot.
+func (s *RouterServer) newEnvoyXdsServer(ctx context.Context, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) (*XdsServer, error) {
 	xdsSrv := NewXdsServer(s.cfg.XdsPort)
-	xdsSrv.SetConfig(s.cfg.HttpPort, s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
-	xdsSrv.SetConnectPorts(s.cfg.ConnectPlainTextPort, s.cfg.ConnectTLSPort)
+	xdsSrv.SetConfig(s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
+	xdsSrv.SetConnectTLSPort(s.cfg.ConnectTLSPort)
 	setOtlpCollector(ctx, xdsSrv, s.cfg.OtlpCollectorAddress)
 	xdsSrv.SetTraceRootSamplingPercent(traceRootSamplingPercent)
 
@@ -77,25 +102,37 @@ func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Grou
 	}
 
 	xdsSrv.SetTlsConfig(s.cfg.HttpsPort, s.cfg.EnvoyCertPath)
-	xdsSrv.SetUpstreamTls(s.cfg.UpstreamCredentialBundlePath, s.cfg.UpstreamTrustBundlePath, s.cfg.UpstreamSpiffePrefix)
+	// Envoy is what reads the bundle, but it would only surface a bad one as
+	// a listener that never warms. Parse it here so the router fails startup
+	// instead.
+	if _, err := credbundle.ParsePool(s.cfg.IngressAuth.ClientCAFile); err != nil {
+		return nil, fmt.Errorf("loading --ingress-client-ca-file: %w", err)
+	}
+	xdsSrv.SetDownstreamClientAuth(s.cfg.IngressAuth.ClientCAFile, s.cfg.IngressAuth.AllowedSPIFFEIDs)
+	if len(s.cfg.IngressAuth.AllowedSPIFFEIDs) == 0 {
+		slog.InfoContext(ctx, "No --ingress-allowed-spiffe-ids, so the router serves no traffic")
+	} else {
+		slog.InfoContext(ctx, "TLS ingress listeners require client certificates",
+			slog.String("client_ca_file", s.cfg.IngressAuth.ClientCAFile),
+			slog.Any("allowed_spiffe_ids", s.cfg.IngressAuth.AllowedSPIFFEIDs))
+	}
+	xdsSrv.SetUpstreamTls(s.cfg.UpstreamCredentialBundlePath, s.cfg.UpstreamTrustBundlePath)
+	xdsSrv.SetUpstreamConnect(s.cfg.UpstreamConnect)
 
 	// The snapshot is a pure function of the configuration applied above, so it
 	// is built exactly once; an Envoy that connects later is served from the
 	// xDS cache.
 	if err := xdsSrv.UpdateSnapshot(); err != nil {
-		return fmt.Errorf("building the xDS snapshot: %w", err)
+		return nil, fmt.Errorf("building the xDS snapshot: %w", err)
 	}
+	return xdsSrv, nil
+}
 
-	// Envoy receives all routing configuration from the local xDS server.
-	g.Go(func() error {
-		slog.InfoContext(ctx, "Starting Envoy xDS Server", slog.Int("port", s.cfg.XdsPort))
-		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.XdsPort))
-		if err != nil {
-			return fmt.Errorf("failed to listen on port %d: %w", s.cfg.XdsPort, err)
-		}
-		defer lis.Close()
-
-		return xdsSrv.Serve(ctx, lis)
-	})
-	return nil
+// xdsListenAddress is where the router serves xDS to the Envoy in its own pod.
+// The xDS server is plaintext and unauthenticated, and its ADS and SDS streams
+// describe every listener, route, cluster and secret path in the dataplane, so
+// it binds loopback only: Envoy dials it at 127.0.0.1 from the same network
+// namespace, and nothing else in the cluster has any business reaching it.
+func xdsListenAddress(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 }

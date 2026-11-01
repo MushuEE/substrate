@@ -30,9 +30,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/substratex509"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/localca"
 )
 
 // The gateway's front door requires a client certificate signed by the
@@ -73,24 +72,24 @@ const (
 // the secret ateapi signs with.
 func actorIdentityCA(t *testing.T, ctx context.Context) *localca.CA {
 	t.Helper()
-	secret, err := e2e.GetClients().K8s.CoreV1().Secrets(egressNamespace).Get(ctx, actorIDCASecret, metav1.GetOptions{})
+	secret, err := e2e.GetClients().K8s.CoreV1().Secrets(e2e.SystemNamespace()).Get(ctx, actorIDCASecret, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("reading actor-identity CA pool secret %s/%s: %v", egressNamespace, actorIDCASecret, err)
+		t.Fatalf("reading actor-identity CA pool secret %s/%s: %v", e2e.SystemNamespace(), actorIDCASecret, err)
 	}
 	pool, err := localca.Unmarshal(secret.Data[actorIDCASecretKey])
 	if err != nil {
-		t.Fatalf("parsing actor-identity CA pool from %s/%s key %q: %v", egressNamespace, actorIDCASecret, actorIDCASecretKey, err)
+		t.Fatalf("parsing actor-identity CA pool from %s/%s key %q: %v", e2e.SystemNamespace(), actorIDCASecret, actorIDCASecretKey, err)
 	}
 	if len(pool.CAs) == 0 {
-		t.Fatalf("actor-identity CA pool %s/%s contains no CA", egressNamespace, actorIDCASecret)
+		t.Fatalf("actor-identity CA pool %s/%s contains no CA", e2e.SystemNamespace(), actorIDCASecret)
 	}
 	// CAs[0] is the one that signs: ateapi's MintCert makes the same choice.
 	return pool.CAs[0]
 }
 
-// mintActorCredential issues a client credential for identity, in the shape
+// mintActorCredential issues a client credential for an actor, in the shape
 // atunnel gets from ateapi.
-func mintActorCredential(t *testing.T, ca *localca.CA, identity *substratex509.ActorIdentity) []byte {
+func mintActorCredential(t *testing.T, ca *localca.CA, atespace, actorName string) []byte {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -102,7 +101,7 @@ func mintActorCredential(t *testing.T, ca *localca.CA, identity *substratex509.A
 		URIs: []*url.URL{{
 			Scheme: "spiffe",
 			Host:   "substrate-actor.local",
-			Path:   path.Join("atespace", identity.Atespace, "actor", identity.ActorName),
+			Path:   path.Join("worker-for-actor", atespace, actorName),
 		}},
 		NotBefore:             time.Now().Add(-5 * time.Minute),
 		NotAfter:              time.Now().Add(actorCertificateLifetime),
@@ -112,13 +111,10 @@ func mintActorCredential(t *testing.T, ca *localca.CA, identity *substratex509.A
 		IsCA:                  false,
 		Issuer:                pkix.Name{CommonName: "api.ate-system.svc.cluster.local"},
 	}
-	if err := substratex509.AddActorIdentityToCertificate(identity, template); err != nil {
-		t.Fatalf("adding the ActorIdentity extension for %s/%s: %v", identity.Atespace, identity.ActorName, err)
-	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, ca.RootCertificate, key.Public(), ca.SigningKey)
 	if err != nil {
-		t.Fatalf("signing the actor certificate for %s/%s: %v", identity.Atespace, identity.ActorName, err)
+		t.Fatalf("signing the actor certificate for %s/%s: %v", atespace, actorName, err)
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
@@ -152,10 +148,5 @@ func provisionProbeCredentials(t *testing.T, ctx context.Context, ns string) {
 
 	// The name is scoped to the probe's namespace so a stray record cannot
 	// collide with anything.
-	writeCredentialSecret(t, ctx, ns, unknownActorCredentialSecret, mintActorCredential(t, actorIdentityCA(t, ctx), &substratex509.ActorIdentity{
-		Atespace:  probeAtespace,
-		ActorName: "no-such-actor-" + ns,
-		ActorUid:  "00000000-0000-0000-0000-000000000000",
-		Purpose:   substratex509.ActorIdentityPurposeAtunnel,
-	}))
+	writeCredentialSecret(t, ctx, ns, unknownActorCredentialSecret, mintActorCredential(t, actorIdentityCA(t, ctx), probeAtespace, "no-such-actor-"+ns))
 }

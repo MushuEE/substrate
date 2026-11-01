@@ -24,8 +24,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateerrors"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/api/credprovider/v1"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/protoredact"
+	"go.ate.dev/substrate/internal/serverboot"
 	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -47,16 +51,34 @@ func TestStatusErrorInterceptor(t *testing.T) {
 			expectResponse: true,
 		},
 		{
-			name:       "StatusErrorInChain",
+			name:       "WrappedStatusBecomesInternal",
 			handlerErr: fmt.Errorf("outer error: %w", status.Error(codes.NotFound, "actor not found")),
-			wantCode:   codes.NotFound,
-			wantMsg:    "actor not found",
+			wantCode:   codes.Internal,
+			wantMsg:    "internal server error: outer error: rpc error: code = NotFound desc = actor not found",
 		},
 		{
 			name:       "RawErrorFallback",
 			handlerErr: errors.New("database connection failed"),
 			wantCode:   codes.Internal,
 			wantMsg:    "internal server error: database connection failed",
+		},
+		{
+			name:       "APIErrorInChain",
+			handlerErr: fmt.Errorf("workflow failed at step Load: %w", apierror.NotFound("actor not found")),
+			wantCode:   codes.NotFound,
+			wantMsg:    "actor not found",
+		},
+		{
+			name:       "APIErrorWinsOverStatusItWraps",
+			handlerErr: apierror.Internal("while calling atelet: %w", status.Error(codes.Unavailable, "atelet down")),
+			wantCode:   codes.Internal,
+			wantMsg:    "while calling atelet: rpc error: code = Unavailable desc = atelet down",
+		},
+		{
+			name:       "ContextErrorKeepsItsCode",
+			handlerErr: fmt.Errorf("while loading actor: %w", context.DeadlineExceeded),
+			wantCode:   codes.DeadlineExceeded,
+			wantMsg:    "while loading actor: context deadline exceeded",
 		},
 	}
 
@@ -98,6 +120,21 @@ func TestStatusErrorInterceptor(t *testing.T) {
 	}
 }
 
+// statusWithErrorInfo builds a status error carrying an AIP-193 ErrorInfo
+// detail, standing in for a structured error built by an upstream service.
+func statusWithErrorInfo(t *testing.T, code codes.Code, reason string, md map[string]string) error {
+	t.Helper()
+	st, err := status.New(code, "boom").WithDetails(&epb.ErrorInfo{
+		Domain:   "substrate.dev",
+		Reason:   reason,
+		Metadata: md,
+	})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	return st.Err()
+}
+
 // errorInfoOf returns the ErrorInfo detail carried by err, or nil if none.
 func errorInfoOf(t *testing.T, err error) *epb.ErrorInfo {
 	t.Helper()
@@ -113,30 +150,48 @@ func errorInfoOf(t *testing.T, err error) *epb.ErrorInfo {
 	return nil
 }
 
-// TestInternalServerUnaryInterceptorPreservesDetails verifies the interceptor
-// returns structured errors (from NewGRPCError) intact — preserving the code and
-// the ErrorInfo carrying the Reason — while collapsing plain errors to Internal
-// with no ErrorInfo detail.
-func TestInternalServerUnaryInterceptorPreservesDetails(t *testing.T) {
+func TestInternalServerUnaryInterceptorCodes(t *testing.T) {
 	tests := []struct {
-		name          string
-		handlerErr    error
-		wantCode      codes.Code
-		wantReason    string
-		wantErrorInfo bool
+		name       string
+		handlerErr error
+		wantCode   codes.Code
+		wantMsg    string
 	}{
 		{
-			name:          "structured error keeps code and reason",
-			handlerErr:    ateerrors.NewGRPCError(context.Background(), codes.DataLoss, ateerrors.ReasonFaileSaveSnapshot, ateerrors.ActorCrashedMetadata(), errors.New("boom")),
-			wantCode:      codes.DataLoss,
-			wantReason:    string(ateerrors.ReasonFaileSaveSnapshot),
-			wantErrorInfo: true,
+			name:       "apierror keeps its code",
+			handlerErr: apierror.FailedPrecondition("snapshot is corrupt"),
+			wantCode:   codes.FailedPrecondition,
+			wantMsg:    "snapshot is corrupt",
 		},
 		{
-			name:          "plain error collapses to Internal with no ErrorInfo",
-			handlerErr:    errors.New("database connection failed"),
-			wantCode:      codes.Internal,
-			wantErrorInfo: false,
+			name:       "wrapped apierror keeps its code",
+			handlerErr: fmt.Errorf("while restoring: %w", apierror.NotFound("actor not found")),
+			wantCode:   codes.NotFound,
+			wantMsg:    "actor not found",
+		},
+		{
+			name:       "upstream status becomes Internal without its details",
+			handlerErr: fmt.Errorf("while calling worker: %w", statusWithErrorInfo(t, codes.DataLoss, "FAILED_SAVE_SNAPSHOT", nil)),
+			wantCode:   codes.Internal,
+			wantMsg:    "while calling worker: rpc error: code = DataLoss desc = boom",
+		},
+		{
+			name:       "wrapped upstream status becomes Internal",
+			handlerErr: fmt.Errorf("while calling downstream: %w", status.Error(codes.Unavailable, "backend down")),
+			wantCode:   codes.Internal,
+			wantMsg:    "while calling downstream: rpc error: code = Unavailable desc = backend down",
+		},
+		{
+			name:       "wrapped context error keeps the context's code",
+			handlerErr: fmt.Errorf("gave up waiting for the actor's lock: %w", context.Canceled),
+			wantCode:   codes.Canceled,
+			wantMsg:    "gave up waiting for the actor's lock: context canceled",
+		},
+		{
+			name:       "wrapped plain error becomes Internal",
+			handlerErr: fmt.Errorf("while parsing manifest: %w", errors.New("bad json")),
+			wantCode:   codes.Internal,
+			wantMsg:    "while parsing manifest: bad json",
 		},
 	}
 
@@ -156,56 +211,13 @@ func TestInternalServerUnaryInterceptorPreservesDetails(t *testing.T) {
 			if st.Code() != tt.wantCode {
 				t.Errorf("code = %v, want %v", st.Code(), tt.wantCode)
 			}
-
-			info := errorInfoOf(t, err)
-			if !tt.wantErrorInfo {
-				if info != nil {
-					t.Errorf("ErrorInfo = %v, want none", info)
-				}
-				return
+			if st.Message() != tt.wantMsg {
+				t.Errorf("message = %q, want %q", st.Message(), tt.wantMsg)
 			}
-			if info == nil {
-				t.Fatal("status is missing the ErrorInfo detail")
-			}
-			if got := info.GetReason(); got != tt.wantReason {
-				t.Errorf("ErrorInfo.Reason = %q, want %q", got, tt.wantReason)
+			if info := errorInfoOf(t, err); info != nil {
+				t.Errorf("ErrorInfo = %v, want none", info)
 			}
 		})
-	}
-}
-
-// TestServerUnaryInterceptorPreservesDetails verifies the public interceptor
-// returns the handler's status intact: ErrorInfo details (reason and metadata)
-// must survive the public wire, even when the status is wrapped.
-func TestServerUnaryInterceptorPreservesDetails(t *testing.T) {
-	metadata := map[string]string{"want": "0.2.0", "have": "0.1.0"}
-	structuredErr := ateerrors.NewGRPCError(context.Background(), codes.FailedPrecondition, ateerrors.ReasonInvalidCheckpointResult, metadata, errors.New("refused"))
-
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, fmt.Errorf("outer error: %w", structuredErr)
-	}
-
-	_, err := ServerUnaryInterceptor(context.Background(), "request", &grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"}, handler)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	st, _ := status.FromError(err)
-	if st.Code() != codes.FailedPrecondition {
-		t.Errorf("code = %v, want %v", st.Code(), codes.FailedPrecondition)
-	}
-
-	info := errorInfoOf(t, err)
-	if info == nil {
-		t.Fatal("status is missing the ErrorInfo detail")
-	}
-	if got, want := info.GetReason(), string(ateerrors.ReasonInvalidCheckpointResult); got != want {
-		t.Errorf("ErrorInfo.Reason = %q, want %q", got, want)
-	}
-	for k, want := range metadata {
-		if got := info.GetMetadata()[k]; got != want {
-			t.Errorf("ErrorInfo.Metadata[%q] = %q, want %q", k, got, want)
-		}
 	}
 }
 
@@ -325,28 +337,38 @@ func TestMaxDeadlineUnaryInterceptor_ShorterDeadlineIsPreserved(t *testing.T) {
 	}
 }
 
-func TestServerUnaryInterceptorRedactsEnvFromProtoRequestLogs(t *testing.T) {
+// captureDefaultLog installs the handler stack the servers run with
+// (serverboot.InitLogger: contextlogging over the JSON handler), since the
+// interceptor relies on that handler for redaction.
+func captureDefaultLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
 	var log bytes.Buffer
 	origLogger := slog.Default()
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)
 	})
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, nil)))
+	serverboot.InitLoggerWithWriter(&log)
+	return &log
+}
+
+func TestServerUnaryInterceptorRequestLogMasksEnvValues(t *testing.T) {
+	log := captureDefaultLog(t)
 
 	req := &ateletpb.RunRequest{
 		Spec: &ateletpb.WorkloadSpec{
 			Containers: []*ateletpb.Container{
 				{
 					Name: "main",
-					Env: []*ateletpb.EnvEntry{
+					Env: []*ateletpb.EnvVar{
 						{Name: "API_KEY", Value: "sk-secret"},
+						{Name: "PLAIN", Value: "not-a-secret"},
 					},
 				},
 			},
 		},
 	}
 
-	_, err := ServerUnaryInterceptor(context.Background(), req, &grpc.UnaryServerInfo{FullMethod: "/atelet.AteomHerder/Run"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+	_, err := ServerUnaryInterceptor(context.Background(), req, &grpc.UnaryServerInfo{FullMethod: "/atelet.Atelet/Run"}, func(ctx context.Context, req interface{}) (interface{}, error) {
 		return &ateletpb.RunResponse{}, nil
 	})
 	if err != nil {
@@ -354,10 +376,114 @@ func TestServerUnaryInterceptorRedactsEnvFromProtoRequestLogs(t *testing.T) {
 	}
 
 	gotLog := log.String()
-	if strings.Contains(gotLog, "sk-secret") || strings.Contains(gotLog, "API_KEY") {
-		t.Fatalf("log contains env data: %s", gotLog)
+	for _, secret := range []string{"sk-secret", "not-a-secret"} {
+		if strings.Contains(gotLog, secret) {
+			t.Fatalf("log contains env value %q: %s", secret, gotLog)
+		}
 	}
-	if len(req.GetSpec().GetContainers()[0].GetEnv()) != 1 {
-		t.Fatalf("interceptor mutated original request")
+	// Names survive so the log still shows which variables were set.
+	for _, want := range []string{`"name":"API_KEY"`, `"name":"PLAIN"`, `"value":"` + protoredact.Placeholder + `"`} {
+		if !strings.Contains(gotLog, want) {
+			t.Fatalf("log missing %s: %s", want, gotLog)
+		}
+	}
+	if got := req.GetSpec().GetContainers()[0].GetEnv()[0].GetValue(); got != "sk-secret" {
+		t.Fatalf("interceptor mutated original request: env value = %q", got)
+	}
+}
+
+func TestServerUnaryInterceptorResponseLogMasksActorJWT(t *testing.T) {
+	log := captureDefaultLog(t)
+
+	const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhY3RvciJ9.c2lnbmF0dXJl"
+	resp := &ateapi.MintActorJwtResponse{ActorJwt: token}
+
+	got, err := ServerUnaryInterceptor(context.Background(), &ateapi.MintActorJwtRequest{}, &grpc.UnaryServerInfo{FullMethod: "/substrate.ateapi.v1.Control/MintActorJwt"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return resp, nil
+	})
+	if err != nil {
+		t.Fatalf("ServerUnaryInterceptor failed: %v", err)
+	}
+
+	gotLog := log.String()
+	if strings.Contains(gotLog, token) {
+		t.Fatalf("log contains the actor JWT: %s", gotLog)
+	}
+	if !strings.Contains(gotLog, `"actor_jwt":"`+protoredact.Placeholder+`"`) {
+		t.Fatalf("log does not show the redacted actor_jwt: %s", gotLog)
+	}
+	if got.(*ateapi.MintActorJwtResponse).GetActorJwt() != token {
+		t.Fatalf("interceptor mutated the response returned to the client")
+	}
+}
+
+func TestInternalServerUnaryInterceptorLogMasksBytesFields(t *testing.T) {
+	log := captureDefaultLog(t)
+
+	resp := &credprovider.FetchSecretResponse{OpaqueBytes: []byte("hunter2-hunter2")}
+	_, err := InternalServerUnaryInterceptor(context.Background(), &credprovider.FetchSecretRequest{Uri: "ate-secret://kubernetes.io/ns/name"}, &grpc.UnaryServerInfo{FullMethod: "/substrate.credprovider.v1.CredentialProvider/FetchSecret"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return resp, nil
+	})
+	if err != nil {
+		t.Fatalf("InternalServerUnaryInterceptor failed: %v", err)
+	}
+
+	gotLog := log.String()
+	// encoding/json renders []byte as base64; check both forms are absent.
+	for _, leak := range []string{"hunter2-hunter2", "aHVudGVyMi1odW50ZXIy"} {
+		if strings.Contains(gotLog, leak) {
+			t.Fatalf("log contains the fetched secret: %s", gotLog)
+		}
+	}
+	if !strings.Contains(gotLog, "ate-secret://kubernetes.io/ns/name") {
+		t.Fatalf("log lost the non-sensitive request: %s", gotLog)
+	}
+	if string(resp.GetOpaqueBytes()) != "hunter2-hunter2" {
+		t.Fatalf("interceptor mutated the response returned to the client")
+	}
+}
+
+func TestServerUnaryInterceptorLogsNilResponseOnHandlerError(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		resp   any
+	}{
+		{name: "nil", method: "/substrate.ateapi.v1.Control/MintActorJwt", resp: nil},
+		// The generated handlers return a typed nil on error; a List call must
+		// not log it as an elided response.
+		{name: "typed nil List response", method: "/substrate.ateapi.v1.Control/ListActors", resp: (*ateapi.ListActorsResponse)(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := captureDefaultLog(t)
+			_, err := ServerUnaryInterceptor(context.Background(), "request", &grpc.UnaryServerInfo{FullMethod: tt.method}, func(ctx context.Context, req interface{}) (interface{}, error) {
+				return tt.resp, apierror.PermissionDenied("no")
+			})
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("err = %v", err)
+			}
+			if !strings.Contains(log.String(), `"resp":null`) {
+				t.Errorf("nil response should log as null: %s", log.String())
+			}
+		})
+	}
+}
+
+func TestServerUnaryInterceptorElidesListResponses(t *testing.T) {
+	log := captureDefaultLog(t)
+
+	resp := &ateapi.ListActorsResponse{Actors: []*ateapi.Actor{{Metadata: &ateapi.ResourceMetadata{Name: "gym-0123456789ab"}}}}
+	got, err := ServerUnaryInterceptor(context.Background(), &ateapi.ListActorsRequest{Atespace: "nemo-gym"}, &grpc.UnaryServerInfo{FullMethod: "/substrate.ateapi.v1.Control/ListActors"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return resp, nil
+	})
+	if err != nil {
+		t.Fatalf("ServerUnaryInterceptor failed: %v", err)
+	}
+	if gotLog := log.String(); strings.Contains(gotLog, "gym-0123456789ab") || !strings.Contains(gotLog, "ListActors response elided") {
+		t.Fatalf("list response not elided from the log: %s", gotLog)
+	}
+	if len(got.(*ateapi.ListActorsResponse).GetActors()) != 1 {
+		t.Fatalf("interceptor mutated the response returned to the client")
 	}
 }

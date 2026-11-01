@@ -1,3 +1,13 @@
+---
+title: "Multi-Template WorkerPool"
+linkTitle: "Multi-Template WorkerPool"
+weight: 4
+estimated_time: "5 mins"
+card_icon: "fa-solid fa-layer-group"
+description: >
+  Share a single WorkerPool across multiple ActorTemplates and atespaces using label selectors.
+---
+
 # Multi-Template Demo
 
 This demo shows that **two different actor templates running two different binaries
@@ -9,21 +19,16 @@ or namespace.
 
 ## Prerequisites
 
-- A k8s cluster with Agent Substrate installed (`./hack/install-ate.sh --deploy-ate-system`).
-- `ko` installed for building images.
-- A GCS bucket for storing snapshots (configured via `BUCKET_NAME` env var).
+- A k8s cluster with Agent Substrate installed as in the [Quickstart](../../README.md#quickstart-development)
+  (with `ATE_INSTALL_KIND=true` exported in your shell) or [GKE Quickstart](../../README.md#gke-quickstart-development).
+- A snapshot location set at install (`SNAPSHOT_LOCATION`). The demo stores its snapshots there.
 
 ## How to Run on Agent Substrate
 
 ### 1. Build and Deploy
 
-> [!NOTE]
-> Do not manually edit the `demos/multi-template/*.yaml.tmpl` manifests. The
-> installation script automatically injects your `${BUCKET_NAME}` environment
-> variable during deployment.
-
 ```bash
-./hack/install-ate.sh --deploy-demo-multi-template
+go run ./cmd/ate-setup deploy demo multi-template
 ```
 
 This command will:
@@ -39,7 +44,7 @@ This command will:
 
 ### 2. Create one actor per template
 
-Each actor goes in its template's atespace — `--template-ref` names the template,
+Each actor goes in its template's atespace — `--template` names the template,
 resolved in the actor's atespace — and their DNS names embed that atespace:
 
 ```bash
@@ -47,29 +52,30 @@ resolved in the actor's atespace — and their DNS names embed that atespace:
 go install ./cmd/kubectl-ate
 
 # Create two actors from different templates, one per atespace.
-kubectl ate create actor c1 -a ate-demo-multi-template-counter --template-ref counter
-kubectl ate create actor f1 -a ate-demo-multi-template-fspersist --template-ref fspersist
+kubectl ate create actor c1 -a ate-demo-multi-template-counter --template counter
+kubectl ate create actor f1 -a ate-demo-multi-template-fspersist --template fspersist
 ```
 
-### 3. Port-forward the atenet router
+### 3. Proxy to the actors
 
-To interact with the router locally:
+Start a local proxy for each actor:
 
 ```bash
-kubectl port-forward -n ate-system svc/atenet-router 8000:80
+kubectl ate proxy actor c1 8000:80 -a ate-demo-multi-template-counter &
+kubectl ate proxy actor f1 8001:80 -a ate-demo-multi-template-fspersist &
 ```
 
 ## How to Use
 
-When you send an HTTP request through the router, Substrate automatically detects the session, activates (resumes) the actor onto an available worker pod, and proxies the traffic.
+When you send an HTTP request through the proxy, `atenet-router` automatically activates (resumes) the actor onto an available worker pod and routes the traffic:
 
 ```bash
 # counter binary
-curl -s -H "Host: c1.ate-demo-multi-template-counter.actors.resources.substrate.ate.dev" http://localhost:8000
-# -> hello from: <ip> | preserved memory count: 1
+curl -s http://localhost:8000
+# -> preserved memory count: 1
 
 # fspersist binary
-curl -s -H "Host: f1.ate-demo-multi-template-fspersist.actors.resources.substrate.ate.dev" http://localhost:8000
+curl -s http://localhost:8001
 # -> pod: <ip>
 #    --- history ---
 #    pod=<ip> | count=0 | time=<timestamp>
@@ -87,7 +93,7 @@ preserves that state across the snapshot/restore cycle:
 
 ```bash
 kubectl ate suspend actor f1 -a ate-demo-multi-template-fspersist
-curl -s -H "Host: f1.ate-demo-multi-template-fspersist.actors.resources.substrate.ate.dev" http://localhost:8000  # history persists; count keeps climbing
+curl -s http://localhost:8001  # history persists; count keeps climbing
 ```
 
 ## How to Uninstall
@@ -96,5 +102,5 @@ Remove the demo — this deletes the actors (suspending running ones first), the
 templates, both atespaces, and then the pool and its namespace:
 
 ```bash
-./hack/install-ate.sh --delete-demo-multi-template
+go run ./cmd/ate-setup delete demo multi-template
 ```

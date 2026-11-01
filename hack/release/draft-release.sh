@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Creates a DRAFT GitHub release for an existing tag, with notes generated
+# from .github/release.yml plus a committer list. A maintainer edits and
+# publishes the draft (see docs/dev/releasing.md).
+#
+#   hack/release/draft-release.sh [--dry-run] <tag>
+#
+# --dry-run prints the notes and creates nothing. <tag> need not exist: the
+# notes then run up to the local HEAD commit, which must already be in the
+# repository (pushed to a branch there). If a release for <tag>
+# already exists, the script prints the notes and leaves the release alone,
+# so rerunning it never overwrites edited notes.
+#
+# Needs git, jq, and an authenticated gh with write access to the repository
+# (the generate-notes API requires it even for --dry-run). GITHUB_REPOSITORY
+# selects the repository; it defaults to agent-substrate/substrate.
+
+set -o errexit -o nounset -o pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+UPSTREAM_REPO='agent-substrate/substrate'
+REPO="${GITHUB_REPOSITORY:-${UPSTREAM_REPO}}"
+SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
+SEMVER_PRE='^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$'
+# Where the upstream release workflow publishes images (KO_DOCKER_REPO in
+# .github/workflows/release.yaml).
+RELEASE_IMAGE_REPO='ghcr.io/agent-substrate/substrate'
+
+usage() {
+  echo "usage: $0 [--dry-run] <tag>" >&2
+  exit 2
+}
+
+errfile="$(mktemp)"
+trap 'rm -f "${errfile}"' EXIT
+
+# api <step> <gh api args...> prints the response. On failure it prints the
+# step and gh's error, and returns 1; gh's error stays in ${errfile}.
+api() {
+  local step="$1"
+  shift
+  if ! gh api "$@" 2>"${errfile}"; then
+    echo "error: ${step}: $(<"${errfile}")" >&2
+    return 1
+  fi
+}
+
+# exists <api-path> returns 0 if the resource exists and 1 if the API answers
+# 404, or 422 as the commits endpoint does for an unknown SHA. Any other
+# failure (gh not logged in, rate limit) stops the script with gh's error, so
+# it is not mistaken for "not found".
+exists() {
+  if gh api "$1" --silent 2>"${errfile}"; then
+    return 0
+  fi
+  if grep -qE 'HTTP (404|422)' "${errfile}"; then
+    return 1
+  fi
+  echo "error: checking $1: $(<"${errfile}")" >&2
+  exit 1
+}
+
+dry_run=false
+if [[ "${1:-}" == --dry-run ]]; then
+  dry_run=true
+  shift
+fi
+[[ $# -eq 1 ]] || usage
+tag="$1"
+
+prerelease=false
+if [[ "${tag}" =~ ${SEMVER_PRE} ]]; then
+  prerelease=true
+elif ! [[ "${tag}" =~ ${SEMVER} ]]; then
+  echo "error: ${tag} is not a vMAJOR.MINOR.PATCH[-PRERELEASE] tag" >&2
+  exit 1
+fi
+
+# target is the ref the notes run up to: the tag, or HEAD for a dry run of a
+# tag that does not exist yet.
+target="${tag}"
+if ! exists "repos/${REPO}/git/ref/tags/${tag}"; then
+  if [[ "${dry_run}" != true ]]; then
+    echo "error: tag ${tag} does not exist in ${REPO}; push it first," \
+      "or use --dry-run to preview the notes up to HEAD" >&2
+    exit 1
+  fi
+  target="$(git rev-parse remotes/origin/main)"
+  if ! exists "repos/${REPO}/commits/${target}"; then
+    echo "error: HEAD (${target}) is not in ${REPO}; push it to a branch there," \
+      "or set GITHUB_REPOSITORY to a repository that has it" >&2
+    exit 1
+  fi
+fi
+
+# The notes start at the newest final release below this tag's version. A
+# final release therefore diffs against the previous final release, not its
+# own release candidates, and every rc of a version shares one starting point.
+# Tags come from the API because a local clone may lack them (release tags
+# can sit on release-X.Y branches).
+base="${tag%%-*}"
+tags="$(api "listing tags" "repos/${REPO}/tags" --paginate --jq '.[].name')"
+# With no tags at all (a fork, for example), the notes would silently cover
+# the whole history. GitHub needs the previous tag in ${REPO} itself.
+if ! grep -qE "${SEMVER}" <<<"${tags}"; then
+  echo "error: ${REPO} has no vX.Y.Z tags, so there is no previous release" \
+    "to start the notes from. Push the release tags to it first" \
+    "(git push <remote> v0.1.0 v0.2.0 ...)" >&2
+  exit 1
+fi
+previous="$(
+  {
+    grep -E "${SEMVER}" <<<"${tags}" | grep -vxF "${base}" || true
+    echo "${base}"
+  } | sort -V | grep -B1 -xF "${base}" | grep -vxF "${base}" || true
+)"
+
+generate_args=(-f "tag_name=${tag}")
+if [[ "${target}" != "${tag}" ]]; then
+  generate_args+=(-f "target_commitish=${target}")
+fi
+if [[ -n "${previous}" ]]; then
+  generate_args+=(-f "previous_tag_name=${previous}")
+fi
+if ! notes="$(api "generating notes" "repos/${REPO}/releases/generate-notes" \
+  "${generate_args[@]}" --jq .body)"; then
+  if grep -q 'HTTP 404' "${errfile}"; then
+    echo "GitHub answers 404 here when the token cannot write to ${REPO}." \
+      "Generating notes needs write access, even for --dry-run." >&2
+  fi
+  exit 1
+fi
+
+# Only the upstream release workflow publishes images (see
+# .github/workflows/release.yaml), so only its notes say where they are.
+# docs/dev/releasing.md lists what they cover.
+if [[ "${REPO}" == "${UPSTREAM_REPO}" ]]; then
+  notes+=$'\n\n## Images\n\n'
+  notes+="Container images for this release are published as \`${RELEASE_IMAGE_REPO}/<image>:${tag}\`"
+  notes+=" for \`linux/amd64\` and \`linux/arm64\`. The images a release publishes are listed in"
+  notes+=" [Release images](https://github.com/${REPO}/blob/${tag}/docs/dev/releasing.md#release-images)."
+  notes+=$'\n\n## Install\n\n'
+  notes+="From a checkout of \`${tag}\`, with Go, install the release images into the current kubectl context."
+  notes+=" On GKE, the default \`--sandbox-classes=gvisor,microvm\` downloads microVM guest assets from GitHub and uploads them with \`gcloud\` to \`gs://<bucket>-assets\` (created with atelet read access by \`go run ./tools/setup-gcp create bucket\` and \`create iam\`)."
+  notes+=" Add \`--kind\` for a kind cluster, or \`--sandbox-classes=gvisor\` to skip microVM staging."
+  notes+=$'\n\n```sh\n'
+  notes+="git clone --depth 1 --branch ${tag} https://github.com/${REPO}.git"$'\n'
+  notes+=$'cd substrate\n'
+  notes+=$'go run ./cmd/ate-setup deploy ate-system \\\n'
+  notes+="  --image-repo ${RELEASE_IMAGE_REPO} --image-tag ${tag} \\"$'\n'
+  notes+=$'  --storage-bucket-name=<bucket> \\\n'
+  notes+=$'  --credential-provider=\'{"name":"k8s.io"}\' \\\n'
+  notes+=$'  --ingress-allowed-spiffe-ids=<SPIFFE IDs of your ingress clients>\n'
+  notes+='```'
+  notes+=$'\n\n'"See [Installing pre-built images](https://github.com/${REPO}/blob/${tag}/cmd/ate-setup/commands.md#installing-pre-built-images) for the flags."
+  # The workflow attaches these after creating the draft; see the
+  # "Attach kubectl-ate" step in .github/workflows/release.yaml.
+  notes+=$'\n\n## kubectl-ate\n\n'
+  notes+="\`kubectl-ate\` is attached for Linux and macOS on amd64 and arm64."
+  notes+=" Download the binary for your platform and its \`.sha256\` file, check it, and put it on your \`PATH\` as \`kubectl-ate\`:"
+  notes+=$'\n\n```sh\n'
+  notes+=$'shasum -a 256 -c kubectl-ate-linux-amd64.sha256\n'
+  notes+=$'install -m 0755 kubectl-ate-linux-amd64 ~/.local/bin/kubectl-ate\n'
+  notes+='```'
+fi
+
+# GitHub only lists first-time contributors; list everyone, as v0.1.0 did.
+# get-contributors.sh reads the range from the local clone, so both ends must
+# be present locally (the release workflow checks out full history).
+if [[ -n "${previous}" ]]; then
+  owner="${REPO%%/*}"
+  name="${REPO#*/}"
+  contributors="$(ORG="${owner}" REPO="${name}" \
+    "${ROOT}/hack/util/get-contributors.sh" "${previous}..${target}" | tail -n +2)"
+  if [[ -n "${contributors}" ]]; then
+    notes+=$'\n\n## Committers in this release\n\n'
+    notes+="${contributors}"
+  fi
+fi
+
+up_to=""
+if [[ "${target}" != "${tag}" ]]; then
+  up_to=", up to HEAD ${target}"
+fi
+echo "Release notes for ${tag} (previous release: ${previous:-none}${up_to}):"
+echo
+echo "${notes}"
+echo
+
+if [[ "${dry_run}" == true ]]; then
+  echo "Dry run: no release created."
+  exit 0
+fi
+if gh release view "${tag}" --repo "${REPO}" >/dev/null 2>&1; then
+  echo "A release for ${tag} already exists; left unchanged."
+  exit 0
+fi
+
+create_args=(--repo "${REPO}" --draft --verify-tag --title "${tag}" --notes-file -)
+if [[ "${prerelease}" == true ]]; then
+  create_args+=(--prerelease)
+fi
+gh release create "${tag}" "${create_args[@]}" <<<"${notes}"

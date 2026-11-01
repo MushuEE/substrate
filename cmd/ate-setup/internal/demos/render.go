@@ -1,0 +1,35 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package demos
+
+import (
+	"go.ate.dev/substrate/cmd/ate-setup/internal/render"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
+)
+
+// ExternalVolumePlaceholders are the optional external-volume hooks in the
+// counter templates. Every path except
+// `deploy demo counter --with-external-volume` drops them, which removes the
+// lines entirely.
+var ExternalVolumePlaceholders = []string{
+	"VALIDATE_EXISTING_FILE_PATH_ARG",
+	"EXTERNAL_VOLUME_MOUNTS",
+	"EXTERNAL_VOLUMES",
+}
+
+// Render expands a demo template with values.
+func Render(e *steps.Env, relPath string, values map[string]string, drop []string) ([]byte, error) {
+	return render.Template(e.Cfg.Path(relPath), values, drop)
+}

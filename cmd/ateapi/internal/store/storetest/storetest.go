@@ -29,12 +29,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/atepg"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/authz"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/atepg"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/dockerenv"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
@@ -43,6 +49,9 @@ var (
 	containerPG   *postgres.PostgresContainer
 	containerErr  error
 	databaseCount atomic.Uint64
+	// pools maps each *atepg.Persistence SetupPostgresPersistence returned to
+	// its pool, for fixtures the store API cannot write.
+	pools sync.Map
 )
 
 // SetupTestStore returns a real PostgreSQL-backed store with a database unique
@@ -74,13 +83,38 @@ func SetupPostgresPersistence(t *testing.T) *atepg.Persistence {
 		pool.Close()
 		t.Fatalf("creating PostgreSQL persistence: %v", err)
 	}
+	pools.Store(persistence, pool)
 	t.Cleanup(func() {
+		pools.Delete(persistence)
 		pool.Close()
 		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+databaseName); err != nil {
 			t.Errorf("dropping PostgreSQL test database: %v", err)
 		}
 	})
+	// The server always wires a PolicyManager, so test stores do too.
+	fgaServer, err := authz.NewOpenFGAServer(pool)
+	if err != nil {
+		t.Fatalf("creating OpenFGA server: %v", err)
+	}
+	t.Cleanup(fgaServer.Close)
+	_, policyManager, err := authz.New(ctx, pool, fgaServer, nil, DefaultSystemPrincipals())
+	if err != nil {
+		t.Fatalf("initializing OpenFGA authz: %v", err)
+	}
+	persistence.SetPolicyManager(policyManager)
 	return persistence
+}
+
+// DefaultSystemPrincipals returns valid SystemPrincipals for tests that
+// initialize authz.New without testing system component roles.
+func DefaultSystemPrincipals() authz.SystemPrincipals {
+	return authz.SystemPrincipals{
+		ControllerSPIFFEID:       installdefaults.ControllerSPIFFEID(installdefaults.SystemNamespace),
+		EgressGatewaySPIFFEIDs:   []string{installdefaults.EgressSPIFFEID(installdefaults.SystemNamespace)},
+		IngressRouterSPIFFEID:    installdefaults.RouterSPIFFEID(installdefaults.SystemNamespace),
+		AteletSPIFFEID:           installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace),
+		APIServerSidecarSPIFFEID: installdefaults.APIServerSPIFFEID(installdefaults.SystemNamespace),
+	}
 }
 
 // MustCreateAtespace creates name unless it already exists. PostgreSQL enforces
@@ -88,7 +122,7 @@ func SetupPostgresPersistence(t *testing.T) *atepg.Persistence {
 // this before seeding those resources.
 func MustCreateAtespace(t *testing.T, ctx context.Context, s store.Interface, name string) {
 	t.Helper()
-	_, err := s.CreateAtespace(ctx, &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}})
+	_, err := s.CreateAtespace(ctx, &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: name}})
 	if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 		t.Fatalf("creating test atespace %q: %v", name, err)
 	}
@@ -97,7 +131,7 @@ func MustCreateAtespace(t *testing.T, ctx context.Context, s store.Interface, na
 // MustCreateActor ensures actor's parent atespace exists, then creates actor.
 // Use the store method directly only in tests that exercise missing-parent
 // behavior.
-func MustCreateActor(t *testing.T, ctx context.Context, s store.Interface, actor *ateapipb.Actor) *ateapipb.Actor {
+func MustCreateActor(t *testing.T, ctx context.Context, s store.Interface, actor *ateapi.Actor) *ateapi.Actor {
 	t.Helper()
 	atespace := actor.GetMetadata().GetAtespace()
 	MustCreateAtespace(t, ctx, s, atespace)
@@ -108,16 +142,85 @@ func MustCreateActor(t *testing.T, ctx context.Context, s store.Interface, actor
 	return created
 }
 
-// MustCreateActorSnapshot ensures snapshot's parent atespace exists, then
-// creates snapshot. Use the store method directly only in tests that exercise
-// missing-parent behavior.
-func MustCreateActorSnapshot(t *testing.T, ctx context.Context, s store.Interface, snapshot *ateapipb.ActorSnapshot) *ateapipb.ActorSnapshot {
+// MustSeedAssignment books assignment on workerName as BindActorToWorker does,
+// stamping its metadata the same way, but without the Actor update
+// BindActorToWorker commits with it. Tests use it to seed an Actor already
+// placed, or a Worker's bookings with no Actor stored behind them. s must come
+// from SetupPostgresPersistence or SetupTestStore.
+func MustSeedAssignment(t *testing.T, ctx context.Context, s store.Interface, workerName string, assignment *ateapi.ActorAssignment) {
 	t.Helper()
-	atespace := snapshot.GetMetadata().GetAtespace()
-	MustCreateAtespace(t, ctx, s, atespace)
-	created, err := s.CreateActorSnapshot(ctx, snapshot)
+	persistence, _ := s.(*atepg.Persistence)
+	pool, ok := pools.Load(persistence)
+	if !ok {
+		t.Fatalf("seeding an assignment: store %T was not made by SetupPostgresPersistence", s)
+	}
+	now := timestamppb.Now()
+	assignment.Metadata = &ateapi.ResourceMetadata{
+		Name:       assignment.GetActorUid(),
+		Uid:        uuid.NewString(),
+		Version:    1,
+		CreateTime: now,
+		UpdateTime: now,
+	}
+	assignmentBytes, err := proto.Marshal(assignment)
 	if err != nil {
-		t.Fatalf("creating test actor snapshot %q/%q: %v", atespace, snapshot.GetMetadata().GetName(), err)
+		t.Fatalf("marshaling assignment: %v", err)
+	}
+	if _, err := pool.(*pgxpool.Pool).Exec(ctx, `INSERT INTO worker_assignments (actor_uid, worker_name, proto) VALUES ($1, $2, $3)`,
+		assignment.GetActorUid(), workerName, assignmentBytes); err != nil {
+		t.Fatalf("seeding assignment of actor %q on worker %q: %v", assignment.GetActorUid(), workerName, err)
+	}
+	worker, err := s.GetWorker(ctx, workerName)
+	if err != nil {
+		t.Fatalf("getting worker %q to book a seeded assignment: %v", workerName, err)
+	}
+	if _, err := s.UpdateWorker(ctx, workerName, store.PreconditionFrom(worker), func(w *ateapi.Worker) error {
+		if w.Status == nil {
+			w.Status = &ateapi.WorkerStatus{}
+		}
+		w.Status.Allocated = resources.AddToAllocated(w.Status.Allocated, assignment, +1)
+		return nil
+	}); err != nil {
+		t.Fatalf("booking a seeded assignment on worker %q: %v", workerName, err)
+	}
+}
+
+// WorkerHostingActor returns the name of the Worker holding an assignment for
+// actorUID, or "" when none does.
+func WorkerHostingActor(t *testing.T, ctx context.Context, s store.Interface, actorUID string) string {
+	t.Helper()
+	for workerToken := ""; ; {
+		workers, err := s.ListWorkers(ctx, store.ListOptions{PageToken: workerToken})
+		if err != nil {
+			t.Fatalf("listing workers: %v", err)
+		}
+		for _, worker := range workers.Items {
+			name := worker.GetMetadata().GetName()
+			if _, err := s.GetWorkerAssignment(ctx, name, actorUID); err == nil {
+				return name
+			} else if !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("getting the assignment of actor %q on worker %q: %v", actorUID, name, err)
+			}
+		}
+		if !workers.HasNextPage() {
+			return ""
+		}
+		workerToken = workers.NextPageToken
+	}
+}
+
+// MustCreateTag ensures tag's parent atespace exists, then stores
+// tag as given — ready or still pending, whichever state the test needs to
+// start from. Use the store method directly only in tests that exercise
+// missing-parent behavior.
+func MustCreateTag(t *testing.T, ctx context.Context, s store.Interface, tag *ateapi.Tag) *ateapi.Tag {
+	t.Helper()
+	atespace := tag.GetMetadata().GetAtespace()
+	name := tag.GetMetadata().GetName()
+	MustCreateAtespace(t, ctx, s, atespace)
+	created, err := s.CreateTag(ctx, tag)
+	if err != nil {
+		t.Fatalf("creating test tag %q/%q: %v", atespace, name, err)
 	}
 	return created
 }
@@ -183,6 +286,9 @@ func requireAdminPool(t *testing.T) *pgxpool.Pool {
 		containerErr = fmt.Errorf("pinging PostgreSQL testcontainer after retries: %w", pingErr)
 	})
 	if containerErr != nil {
+		if dockerenv.Required() {
+			t.Fatalf("PostgreSQL testcontainer unavailable and required (CI or REQUIRE_DOCKER is set): %v", containerErr)
+		}
 		t.Skipf("PostgreSQL testcontainer unavailable (requires Docker): %v", containerErr)
 	}
 	return adminPool

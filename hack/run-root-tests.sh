@@ -24,7 +24,7 @@ set -o errexit -o nounset -o pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "${ROOT}"
 
-MARKER="github.com/agent-substrate/substrate/internal/roottest"
+MARKER="go.ate.dev/substrate/internal/roottest"
 
 # Look for the marker in both in-package (TestImports) and external _test
 # package (XTestImports) test files.
@@ -42,10 +42,43 @@ echo "${PKGS}"
 
 # -count=1: the Go test cache does not key on euid, so without it a rerun as
 # root replays the unprivileged run's cached skips.
+# -timeout: declared here rather than inherited from go's 10m default, and
+# overridable for a slow machine.
+test_args=(-count=1 -timeout "${ROOT_TEST_TIMEOUT:-10m}" "$@")
+
+# ROOT_JUNIT_FILE opts into a machine-readable record of the run. Resolve the
+# binary as the invoking user: hack/run-tool.sh compiles on demand, and doing
+# that under sudo would leave root-owned entries in the user's build cache.
+# The runner is only ever a prefix — the privilege dispatch below is unchanged,
+# because a root-gated package run without root self-skips and reports success.
+# CI requires a JUnit file; see hack/run-e2e.sh for the same precondition.
+if [[ -z "${ROOT_JUNIT_FILE:-}" && "${CI:-}" == "true" ]]; then
+  echo "run-root-tests.sh: ROOT_JUNIT_FILE must be set when CI=true." >&2
+  echo "  Set it to a path unique to this run, e.g." >&2
+  echo "    ROOT_JUNIT_FILE=\"\${ARTIFACTS}/root.xml\"" >&2
+  echo "  CI verifies each run reported at least one test; a run that writes" >&2
+  echo "  no JUnit file cannot be verified." >&2
+  exit 1
+fi
+
+if [[ -n "${ROOT_JUNIT_FILE:-}" ]]; then
+  mkdir -p "$(dirname "${ROOT_JUNIT_FILE}")"
+  # Claim the path before running. Runs as the invoking user, before the sudo
+  # dispatch below, so the manifest is not left root-owned.
+  go -C "${ROOT}/tools/junittool" run . register "${ROOT_JUNIT_FILE}"
+  runner=("$("${ROOT}/hack/run-tool.sh" --print-bin-path gotestsum)"
+    --junitfile "${ROOT_JUNIT_FILE}"
+    --jsonfile "${ROOT_JUNIT_FILE%.xml}.json"
+    --format standard-verbose
+    --)
+else
+  runner=(go test)
+fi
+
 # shellcheck disable=SC2086 # intentional word splitting of the package list
 if [[ "$(id -u)" -eq 0 ]]; then
-  exec go test -count=1 "$@" ${PKGS}
+  exec "${runner[@]}" "${test_args[@]}" ${PKGS}
 fi
 # -E / env PATH: keep the invoking user's Go toolchain and module caches.
 # shellcheck disable=SC2086
-exec sudo -E env "PATH=${PATH}" go test -count=1 "$@" ${PKGS}
+exec sudo -E env "PATH=${PATH}" "${runner[@]}" "${test_args[@]}" ${PKGS}

@@ -21,15 +21,15 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/rendezvous"
+	"go.ate.dev/substrate/internal/clustertrustbundle"
+	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	certinformersv1beta1 "k8s.io/client-go/informers/certificates/v1beta1"
-	"k8s.io/client-go/kubernetes"
-	certlistersv1beta1 "k8s.io/client-go/listers/certificates/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
@@ -37,7 +37,7 @@ import (
 
 type SignerImpl interface {
 	SignerName() string
-	DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error)
+	DesiredClusterTrustBundles() ([]*certsv1.ClusterTrustBundle, error)
 	MakeCert(context.Context, *certsv1beta1.PodCertificateRequest) error
 }
 
@@ -49,9 +49,9 @@ type Hasher interface {
 type Controller struct {
 	clock clock.PassiveClock
 
-	kc          kubernetes.Interface
-	pcrInformer cache.SharedIndexInformer
-	pcrQueue    workqueue.TypedRateLimitingInterface[string]
+	trustBundles *clustertrustbundle.Client
+	pcrClient    *podcertificate.Client
+	pcrQueue     workqueue.TypedRateLimitingInterface[string]
 
 	hasher Hasher
 
@@ -59,22 +59,17 @@ type Controller struct {
 }
 
 // New creates a new Controller.
-func New(clock clock.PassiveClock, handler SignerImpl, kc kubernetes.Interface, hasher Hasher) *Controller {
-	pcrInformer := certinformersv1beta1.NewFilteredPodCertificateRequestInformer(kc, metav1.NamespaceAll, 24*time.Hour, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
-		func(opts *metav1.ListOptions) {
-		},
-	)
-
+func New(clock clock.PassiveClock, handler SignerImpl, hasher Hasher, pcrClient *podcertificate.Client, trustBundles *clustertrustbundle.Client) *Controller {
 	sc := &Controller{
-		clock:       clock,
-		kc:          kc,
-		pcrInformer: pcrInformer,
-		pcrQueue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		handler:     handler,
-		hasher:      hasher,
+		clock:        clock,
+		trustBundles: trustBundles,
+		pcrClient:    pcrClient,
+		pcrQueue:     workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		handler:      handler,
+		hasher:       hasher,
 	}
 
-	sc.pcrInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	sc.pcrClient.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(new any) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err != nil {
@@ -101,10 +96,11 @@ func New(clock clock.PassiveClock, handler SignerImpl, kc kubernetes.Interface, 
 	return sc
 }
 
+// Run waits for the shared informer to sync, then processes this signer's queue.
+// The caller must start the informer separately.
 func (c *Controller) Run(ctx context.Context, workers int) {
 	defer c.pcrQueue.ShutDown()
-	go c.pcrInformer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), c.pcrInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.pcrClient.Informer().HasSynced) {
 		return
 	}
 
@@ -139,7 +135,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		return true
 	}
 
-	pcr, err := certlistersv1beta1.NewPodCertificateRequestLister(c.pcrInformer.GetIndexer()).PodCertificateRequests(namespace).Get(name)
+	pcr, err := c.pcrClient.GetCached(namespace, name)
 	if k8serrors.IsNotFound(err) {
 		c.pcrQueue.Forget(key)
 		return true
@@ -153,7 +149,10 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 
 	err = c.handlePCR(ctx, pcr)
 	if errors.Is(err, rendezvous.ErrNotAssigned) {
-		c.pcrQueue.AddRateLimited(key)
+		// Not an error: don't consume the failure rate limiter or inflate
+		// this item's backoff. Assignments only change when a replica joins
+		// or its lease expires, so re-examine after the lease duration.
+		c.pcrQueue.AddAfter(key, rendezvous.LeaseDuration)
 		return true
 	}
 	if err != nil {
@@ -221,9 +220,9 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 	}
 
 	for _, wantCTB := range wantCTBs {
-		ctb, err := c.kc.CertificatesV1beta1().ClusterTrustBundles().Get(ctx, wantCTB.ObjectMeta.Name, metav1.GetOptions{})
+		ctb, err := c.trustBundles.Get(ctx, wantCTB.ObjectMeta.Name, metav1.GetOptions{})
 		if k8serrors.IsNotFound(err) {
-			_, err = c.kc.CertificatesV1beta1().ClusterTrustBundles().Create(ctx, wantCTB, metav1.CreateOptions{})
+			_, err = c.trustBundles.Create(ctx, wantCTB, metav1.CreateOptions{})
 			if err != nil {
 				slog.ErrorContext(ctx, "Error while creating ClusterTrustBundle",
 					slog.String("err", err.Error()),
@@ -244,13 +243,14 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 			slog.InfoContext(ctx, "ClusterTrustBundle already in correct state",
 				slog.String("key", wantCTB.ObjectMeta.Name),
 			)
+			continue
 		}
 
 		ctb = ctb.DeepCopy()
 		ctb.ObjectMeta.Labels = wantCTB.Labels
 		ctb.Spec.TrustBundle = wantCTB.Spec.TrustBundle
 
-		_, err = c.kc.CertificatesV1beta1().ClusterTrustBundles().Update(ctx, ctb, metav1.UpdateOptions{})
+		_, err = c.trustBundles.Update(ctx, ctb, metav1.UpdateOptions{})
 		if err != nil {
 			slog.ErrorContext(ctx, "Error while updating ClusterTrustBundle",
 				slog.String("err", err.Error()),

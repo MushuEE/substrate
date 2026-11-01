@@ -28,7 +28,7 @@ import requests
 
 from common import ateapi_pb2
 from common import ateapi_pb2_grpc
-from common.ateapi_channel import CA_FILE, SERVER_NAME, ateapi_channel
+from common.ateapi_channel import CA_FILE, CRED_BUNDLE, SERVER_NAME, ateapi_channel
 
 import spec as spec_mod
 
@@ -39,7 +39,7 @@ TOKEN_FILE = "/run/ateapi-token/token"
 # nh-<idx>.
 ATESPACE = "ingress-benchmark"
 
-# The glutton template's (atespace, name) identity; see
+# The glutton template reference; see
 # benchmarking/workloads/manifests/glutton-template.yaml.tmpl.
 TEMPLATE_ATESPACE = "benchmark-workloads"
 TEMPLATE_NAME = "glutton"
@@ -110,12 +110,13 @@ def _warm_actor(
 ) -> None:
     """Bring one created actor to serving, so the load ladder never
     measures a cold start: resume the actor, then poll POST /ping through
-    the router (addressed by the actor's Host header) until it answers
+    the router until it answers
     200 or the deadline expires. Resume errors are retried: ateapi
     returns FailedPrecondition/Unavailable until a worker frees up."""
     ref = ateapi_pb2.ObjectRef(atespace=atespace, name=name)
-    host = spec_mod.actor_host(name, atespace)
     session = requests.Session()
+    session.verify = CA_FILE
+    session.cert = CRED_BUNDLE
     last_err: str = "not attempted"
     while time.time() < deadline:
         try:
@@ -125,7 +126,9 @@ def _warm_actor(
         try:
             resp = session.post(
                 f"{router_url.rstrip('/')}/ping",
-                headers={"Host": host},
+                headers={
+                    "ate-target-actor": f"{atespace}/{name}",
+                },
                 data=b"",
                 timeout=10,
             )

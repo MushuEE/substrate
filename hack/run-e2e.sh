@@ -29,6 +29,10 @@ Usage: $0 [target-path] [go-test-flags] [-args [e2e-flags]]
 
 Runs End-to-End tests.
 
+The target cluster must be installed with --e2e-tuning (or
+ATE_INSTALL_E2E_TUNING=true) so atelet uses the shorter E2E snapshot delays
+instead of its 5m production default.
+
 The optional "target-path" must be the first argument and must start with
 "./internal/e2e" or "internal/e2e". It defaults to "./internal/e2e/suites/...".
 
@@ -46,11 +50,22 @@ Common E2E Flags (passed after -args):
   --kube-config    Path to kubeconfig file
   --kube-context   Kubernetes context to use
   --storage-class  StorageClass to use for external volume tests (default: csi-nfs-sc)
+  --preview        Preview gates the cluster was installed with ("ALL" for all)
 
 Common Go Test Flags (passed before -args):
   -run <regexp>    Run only tests matching regexp
   -v               Verbose output
   -count n         Run tests n times
+  -p n             Test package concurrency (default: \$E2E_PARALLELISM, or 4)
+  -parallel n      Parallel tests per package (default: \$E2E_TEST_PARALLELISM, or 8)
+  -timeout d       Per-binary timeout (default: \$E2E_TIMEOUT, or 30m)
+
+Passing -p, -parallel or -timeout explicitly overrides the default for that flag.
+
+Environment Variables:
+  E2E_PARALLELISM  Default for -p (default: 4)
+  E2E_TEST_PARALLELISM  Default for -parallel (default: 8)
+  E2E_TIMEOUT      Default for -timeout (default: 30m)
 
 See "go help testflag" for more Go test flags.
 EOF
@@ -81,6 +96,9 @@ fi
 go_test_args=()
 e2e_args=()
 found_args_sep=false
+has_p_flag=false
+has_parallel_flag=false
+has_timeout_flag=false
 
 for arg in "$@"; do
     if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
@@ -95,6 +113,12 @@ for arg in "$@"; do
     if [[ "$found_args_sep" == "true" ]]; then
         e2e_args+=("$arg")
     else
+        # Both spellings: go's flag package accepts -flag, --flag, and either with =value.
+        case "$arg" in
+            -p|-p=*|--p|--p=*) has_p_flag=true ;;
+            -parallel|-parallel=*|--parallel|--parallel=*) has_parallel_flag=true ;;
+            -timeout|-timeout=*|--timeout|--timeout=*) has_timeout_flag=true ;;
+        esac
         go_test_args+=("$arg")
     fi
 done
@@ -104,5 +128,71 @@ if [[ -n "${KUBECTL_CONTEXT:-}" ]]; then
     extra_e2e_args+=("--kube-context" "${KUBECTL_CONTEXT}")
 fi
 
-exec go test -v "$target_path" ${go_test_args[@]+"${go_test_args[@]}"} -args --e2e ${extra_e2e_args[@]+"${extra_e2e_args[@]}"} ${e2e_args[@]+"${e2e_args[@]}"}
+# Pin the bounds go test would otherwise infer from the machine.
+#
+# -p: the system default is GOMAXPROCS causing the suite concurrency to track the
+# runner's CPU count rather than what the cluster can absorb, in this case a single
+# node Kind cluster. Explicitly setting this to E2E_PARALLELISM (default 4) avoids
+# overshooting the cluster's capacity.
+#
+# -parallel: also defaults to GOMAXPROCS, but these tests mostly just wait on
+# the cluster.
+#
+# -timeout: Go's default, when no value is provided, is 10m. TemplateReadyTimeout
+# for the micro-VM class (internal/e2e/sandbox.go) is also 10 minutes. Any E2E
+# test that times out waiting for the template will actually be killed by the global
+# suite timeout instead, which skips t.Cleanup, potentially leaking resources.
+# Explicitly setting the E2E_TIMEOUT (default 30m) here avoids this suite-level and
+# test-level timeout conflict.
+default_go_test_args=()
+if [[ "${has_p_flag}" == "false" ]]; then
+    default_go_test_args+=("-p" "${E2E_PARALLELISM:-4}")
+fi
+if [[ "${has_parallel_flag}" == "false" ]]; then
+    default_go_test_args+=("-parallel" "${E2E_TEST_PARALLELISM:-8}")
+fi
+if [[ "${has_timeout_flag}" == "false" ]]; then
+    default_go_test_args+=("-timeout" "${E2E_TIMEOUT:-30m}")
+fi
+
+# Assembled once so the two execution paths below cannot drift apart.
+test_argv=("$target_path")
+test_argv+=(${default_go_test_args[@]+"${default_go_test_args[@]}"})
+test_argv+=(${go_test_args[@]+"${go_test_args[@]}"})
+test_argv+=(-args --e2e)
+test_argv+=(${extra_e2e_args[@]+"${extra_e2e_args[@]}"})
+test_argv+=(${e2e_args[@]+"${e2e_args[@]}"})
+
+# CI requires a JUnit file: it checks that every test run reported tests, and a
+# run without one cannot be checked. Optional locally, where this stays a plain
+# `go test`.
+if [[ -z "${E2E_JUNIT_FILE:-}" && "${CI:-}" == "true" ]]; then
+    echo "run-e2e.sh: E2E_JUNIT_FILE must be set when CI=true." >&2
+    echo "  Set it to a path unique to this run, e.g." >&2
+    echo "    E2E_JUNIT_FILE=\"\${ARTIFACTS}/e2e-gvisor.xml\"" >&2
+    echo "  CI verifies each run reported at least one test; a run that writes" >&2
+    echo "  no JUnit file cannot be verified." >&2
+    exit 1
+fi
+
+# E2E_JUNIT_FILE opts into a machine-readable record of the run: the XML for
+# report consumers, the JSON event stream for failure analysis. Unset, this is a
+# plain go test and gotestsum is never built, so a local run needs no toolchain
+# beyond go itself.
+# NOTE: -v is only for plain go test, with -json it replaces the
+# -test.v=test2json that marks t.Error output in the JSON
+if [[ -n "${E2E_JUNIT_FILE:-}" ]]; then
+    mkdir -p "$(dirname "${E2E_JUNIT_FILE}")"
+    # Claim the path before running, so a run killed part-way still owes a file
+    # that `junittool verify` will report as missing. junittool rejects a path
+    # another run already claimed, which would otherwise be overwritten.
+    go -C "${ROOT}/tools/junittool" run . register "${E2E_JUNIT_FILE}"
+    exec "${ROOT}/hack/run-tool.sh" gotestsum \
+        --junitfile "${E2E_JUNIT_FILE}" \
+        --jsonfile "${E2E_JUNIT_FILE%.xml}.json" \
+        --format standard-verbose \
+        -- "${test_argv[@]}"
+fi
+
+exec go test -v "${test_argv[@]}"
 

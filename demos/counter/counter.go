@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command counter is a simple server that will be used as a worker pod. It listens on ports 80
-// and returns a greeting with the IP of the pod where it is running.
+// Command counter is a simple HTTP server that increments counters in memory,
+// on a durable volume, and on the root filesystem. It listens on port 80 by
+// default, with optional listeners on --extra-port (HTTP) and --tcp-port (TCP
+// echo).
 package main
 
 import (
@@ -39,7 +41,7 @@ import (
 )
 
 var (
-	requestCount             uint64
+	requestCount             atomic.Uint64
 	ready                    atomic.Bool
 	fileMutex                sync.Mutex
 	sigtermSleepDurationSecs atomic.Int64
@@ -67,6 +69,7 @@ func main() {
 	sigtermSleepDurationSecs.Store(15)
 	fileCounterDirectory := pflag.String("file-counter-directory", "/home/counter", "Directory for file counter")
 	secondFileCounterDirectory := pflag.String("second-file-counter-directory", "", "Directory for a second file counter; empty disables it. Used to exercise an Actor with more than one durable volume")
+	rootfsCounterFile := pflag.String("rootfs-counter-file", "/rootfs-counter.txt", "File on the container's root filesystem holding a third counter, so a snapshot's handling of rootfs writes is observable: ROOTFS and MEMORY fidelities preserve it, VOLUMES resets it")
 	validateExistingFilePath := pflag.String("validate-existing-file-path", "", "Path to existing file to validate reading")
 	extraPort := pflag.Int("extra-port", 0, "Additional port to listen on, for exercising atenet-router's arbitrary-port ingress support; 0 disables it")
 	tcpPort := pflag.Int("tcp-port", 0, "Plain TCP echo port for exercising atunnel CONNECT ingress; 0 disables it")
@@ -89,8 +92,8 @@ func main() {
 	defaultMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		fileCounter := incrementFileCounter(filepath.Join(*fileCounterDirectory, "a.txt"))
-		memoryCounter := atomic.AddUint64(&requestCount, 1)
-		currentIP := getCurrentIP()
+		rootfsCounter := incrementFileCounter(*rootfsCounterFile)
+		memoryCounter := requestCount.Add(1)
 
 		fileContentStr := ""
 		if *validateExistingFilePath != "" {
@@ -112,13 +115,13 @@ func main() {
 			secondFileCounterStr = fmt.Sprintf(" | preserved second file counter: %d", secondFileCounter)
 		}
 
-		response := fmt.Sprintf("hello from: %s | preserved memory count: %d | preserved file counter: %d%s%s\n", currentIP, memoryCounter, fileCounter, secondFileCounterStr, fileContentStr)
+		response := fmt.Sprintf("preserved memory count: %d | preserved file counter: %d | preserved rootfs counter: %d%s%s\n", memoryCounter, fileCounter, rootfsCounter, secondFileCounterStr, fileContentStr)
 		slog.InfoContext(ctx, "Handled request", slog.String("response", response))
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(response))
 	})
-	// /readyz is the endpoint the ateom-gvisor readyz probe polls. It returns
+	// /readyz is the endpoint the ateworker-gvisor wakeup probe polls. It returns
 	// 200 only once initialization (the random-file write) has completed.
 	// After a checkpoint+restore the atomic flag is part of the snapshot, so
 	// the endpoint returns 200 immediately on resume.
@@ -137,14 +140,14 @@ func main() {
 			http.Error(w, "missing duration parameter", http.StatusBadRequest)
 			return
 		}
-		d, err := strconv.Atoi(durationStr)
+		d, err := strconv.ParseInt(durationStr, 10, 64)
 		if err != nil || d < 0 {
 			http.Error(w, "invalid duration parameter", http.StatusBadRequest)
 			return
 		}
-		sigtermSleepDurationSecs.Store(int64(d))
+		sigtermSleepDurationSecs.Store(d)
 		response := fmt.Sprintf("SIGTERM sleep duration set to %d seconds\n", d)
-		slog.InfoContext(r.Context(), "Updated SIGTERM sleep duration", slog.Int("duration_secs", d))
+		slog.InfoContext(r.Context(), "Updated SIGTERM sleep duration", slog.Int64("duration_secs", d))
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(response))
 	})
@@ -163,7 +166,7 @@ func main() {
 	if *extraPort > 0 {
 		extraMux := http.NewServeMux()
 		extraMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			response := fmt.Sprintf("hello from extra port %d on pod %s\n", *extraPort, getCurrentIP())
+			response := fmt.Sprintf("hello from extra port %d\n", *extraPort)
 			slog.InfoContext(r.Context(), "Handled extra-port request", slog.String("response", response))
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(response))
@@ -245,20 +248,4 @@ func hashRandomFile() string {
 
 	hash := sha256.Sum256(rfBytes)
 	return base64.RawStdEncoding.EncodeToString(hash[:])
-}
-
-func getCurrentIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		slog.Error("Error getting interface addresses", slog.Any("err", err))
-		return "x.x.x.x"
-	}
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP.String()
-			}
-		}
-	}
-	return "y.y.y.y"
 }

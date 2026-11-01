@@ -22,9 +22,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
 )
 
 const (
@@ -77,11 +76,8 @@ type snapshotOp struct {
 	templateNamespace string
 	templateName      string
 	kind              string
-	scope             string
+	fidelity          string
 	sandboxClass      string
-	// failedPhase is the step the operation died in, so error.type lands there
-	// and on the total rather than on the phases that had already succeeded.
-	failedPhase string
 }
 
 // attrs omits kind and sandbox class while they are unknown (a restore that
@@ -92,13 +88,13 @@ func (o snapshotOp) attrs() []attribute.KeyValue {
 	attrs = append(attrs,
 		ateattr.TemplateAtespaceKey.String(o.templateNamespace),
 		ateattr.TemplateNameKey.String(o.templateName),
-		ateattr.SnapshotScopeKey.String(o.scope),
+		ateattr.SnapshotFidelityKey.String(o.fidelity),
 	)
 	if o.kind != "" {
 		attrs = append(attrs, ateattr.SnapshotKindKey.String(o.kind))
 	}
 	if o.sandboxClass != "" {
-		attrs = append(attrs, ateattr.SandboxClassKey.String(ateattr.NormalizeSandboxClass(o.sandboxClass)))
+		attrs = append(attrs, ateattr.SandboxClassAttribute(o.sandboxClass))
 	}
 	return attrs
 }
@@ -109,56 +105,34 @@ type phase struct {
 	d    time.Duration
 }
 
-func (i *Instruments) recordRestore(ctx context.Context, op snapshotOp, err error, phases ...phase) {
+func (i *Instruments) recordRestore(ctx context.Context, op snapshotOp, phases ...phase) {
 	if i == nil || i.restoreDuration == nil {
 		return
 	}
-	recordPhases(ctx, i.restoreDuration, op, err, phases)
+	recordPhases(ctx, i.restoreDuration, op, phases)
 }
 
-func (i *Instruments) recordCheckpoint(ctx context.Context, op snapshotOp, err error, phases ...phase) {
+func (i *Instruments) recordCheckpoint(ctx context.Context, op snapshotOp, phases ...phase) {
 	if i == nil || i.checkpointDuration == nil {
 		return
 	}
-	recordPhases(ctx, i.checkpointDuration, op, err, phases)
+	recordPhases(ctx, i.checkpointDuration, op, phases)
 }
 
 // recordPhases skips zero-valued phases: those never started, because the
 // operation died before reaching them, and reporting them as instantaneous
 // would drag every percentile down.
-//
-// ate.failure.reason marks only the phase that failed and the total. It carries
-// substrate's taxonomy rather than a gRPC code, which would read Unknown for
-// almost every failure here: the interceptor maps these wrapped domain errors
-// to a status only after the handler returns.
-func recordPhases(ctx context.Context, h metric.Float64Histogram, op snapshotOp, err error, phases []phase) {
+func recordPhases(ctx context.Context, h metric.Float64Histogram, op snapshotOp, phases []phase) {
 	base := op.attrs()
 	for _, p := range phases {
 		if p.d == 0 {
 			continue
 		}
-		attrs := make([]attribute.KeyValue, 0, len(base)+3)
+		attrs := make([]attribute.KeyValue, 0, len(base)+1)
 		attrs = append(attrs, base...)
 		attrs = append(attrs, ateattr.SnapshotPhaseKey.String(p.name))
-		if err != nil && (p.name == ateattr.SnapshotPhaseTotal || p.name == op.failedPhase) {
-			attrs = append(attrs, ateattr.FailureAttributes(ateattr.FailureReason(err))...)
-		}
 		h.Record(ctx, p.d.Seconds(), metric.WithAttributes(attrs...))
 	}
-}
-
-// groupFailedPhase attributes a failed restore errgroup to the leg that
-// produced err. errgroup cancels the shared context on the first failure, so
-// the other leg aborts as collateral and would otherwise claim the phase; Wait
-// returns that first error verbatim, so identity separates the two.
-func groupFailedPhase(err, downloadErr, prepErr error, prepPhase string) string {
-	switch err {
-	case downloadErr:
-		return ateattr.SnapshotPhaseDownload
-	case prepErr:
-		return prepPhase
-	}
-	return ""
 }
 
 // isCollateral reports whether legErr is only fallout from the other leg
@@ -178,35 +152,26 @@ func assetsAfterCollateral(prepFailedPhase string, assets time.Duration) time.Du
 	return assets
 }
 
-// restoreSnapshotKind classifies which snapshot a restore reads. A local
-// restore is evident from the wire; golden and latest both arrive as an external
-// URI prefix, so they are told apart by the identity the manifest records for
-// the actor that wrote the snapshot. An empty result means the manifest has not
-// been read yet, so the kind is not knowable.
-func restoreSnapshotKind(req *ateletpb.RestoreRequest, rec *sandboxAssetsRecord) string {
-	if req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL {
+// restoreSnapshotKind classifies which snapshot a restore reads: local when it
+// is served from the node-local copy, and otherwise latest. An empty result
+// means the manifest has not been read yet, so the
+// kind is not knowable.
+func restoreSnapshotKind(directLocal bool, rec *sandboxAssetsRecord) string {
+	if directLocal {
 		return ateattr.SnapshotKindLocal
 	}
 	if rec == nil {
 		return ""
 	}
-	// Manifests written before the identity fields existed carry no atespace and
-	// fall through to latest, which is the common case for them anyway.
-	if rec.Atespace == resources.GoldenActorAtespace {
-		return ateattr.SnapshotKindGolden
-	}
 	return ateattr.SnapshotKindLatest
 }
 
-// checkpointSnapshotKind classifies which snapshot a checkpoint writes: a pause
-// writes the node-local one, a suspend the actor's durable latest, and a commit
-// by an actor in the golden atespace the template's golden image.
+// checkpointSnapshotKind classifies which snapshot a checkpoint writes: a
+// deferred-upload checkpoint (async suspend) writes the node-local one, and an
+// immediate-upload checkpoint (sync suspend) writes a durable latest snapshot.
 func checkpointSnapshotKind(req *ateletpb.CheckpointRequest) string {
-	if req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL {
+	if req.GetUploadConfig().GetMode() == ateletpb.UploadMode_UPLOAD_MODE_DEFERRED {
 		return ateattr.SnapshotKindLocal
-	}
-	if req.GetAtespace() == resources.GoldenActorAtespace {
-		return ateattr.SnapshotKindGolden
 	}
 	return ateattr.SnapshotKindLatest
 }

@@ -15,8 +15,25 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+
+	"go.ate.dev/substrate/internal/testcert"
 )
 
 // The capabilities e2e assertions are only as trustworthy as this decoder and
@@ -76,6 +93,289 @@ func TestDecodeCapMask(t *testing.T) {
 	}
 }
 
+func TestParseFetchHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  []string
+		want    http.Header
+		wantErr bool
+	}{{
+		name:   "no parameters",
+		params: nil,
+		want:   http.Header{},
+	}, {
+		name:   "name and value",
+		params: []string{"Authorization:Bearer x"},
+		want:   http.Header{"Authorization": {"Bearer x"}},
+	}, {
+		// Only the first colon separates; the value keeps the rest verbatim.
+		name:   "value containing a colon",
+		params: []string{"X-Test:a:b"},
+		want:   http.Header{"X-Test": {"a:b"}},
+	}, {
+		name:   "repeated name keeps every value",
+		params: []string{"x-test:1", "X-Test:2"},
+		want:   http.Header{"X-Test": {"1", "2"}},
+	}, {
+		name:    "no colon",
+		params:  []string{"no-colon"},
+		wantErr: true,
+	}, {
+		name:    "empty name",
+		params:  []string{":empty-name"},
+		wantErr: true,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseFetchHeaders(tt.params)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseFetchHeaders(%q) = %v, want an error", tt.params, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFetchHeaders(%q) failed: %v", tt.params, err)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("parseFetchHeaders(%q) mismatch (-want +got):\n%s", tt.params, diff)
+			}
+		})
+	}
+}
+
+// doFetch drives the fetch handler at an origin URL and decodes its JSON
+// reply. roots=system keeps the handler off the projected trust bundle,
+// which does not exist outside a cluster.
+func doFetch(t *testing.T, origin string, headerParams ...string) map[string]string {
+	t.Helper()
+	query := url.Values{"url": {origin}, "roots": {"system"}}
+	for _, h := range headerParams {
+		query.Add("header", h)
+	}
+	return doFetchQuery(t, query)
+}
+
+// doFetchQuery drives the fetch handler with the given query parameters.
+func doFetchQuery(t *testing.T, query url.Values) map[string]string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/fetch?"+query.Encode(), nil)
+	rec := httptest.NewRecorder()
+	fetch(rec, req)
+	resp := map[string]string{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding fetch response %q: %v", rec.Body.String(), err)
+	}
+	return resp
+}
+
+// The suites' credential-injection assertions live in the response body an
+// origin echoes back, so fetch must return it — along with the request
+// headers set from ?header= parameters, which is how a suite pre-seeds a
+// header the gateway should overwrite.
+func TestFetchReturnsBodyAndSetsHeaders(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("auth=" + r.Header.Get("Authorization")))
+	}))
+	defer origin.Close()
+
+	resp := doFetch(t, origin.URL, "Authorization:Bearer seeded")
+	if resp["error"] != "" {
+		t.Fatalf("fetch failed: %s", resp["error"])
+	}
+	if resp["status"] != "200" {
+		t.Errorf("status = %q, want 200", resp["status"])
+	}
+	if resp["body"] != "auth=Bearer seeded" {
+		t.Errorf("body = %q, want %q", resp["body"], "auth=Bearer seeded")
+	}
+}
+
+// A followed cross-scheme redirect would silently hop between the gateway's
+// cleartext and TLS legs, so fetch must report the first response instead.
+func TestFetchDoesNotFollowRedirects(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/target" {
+			t.Error("fetch followed the redirect")
+		}
+		http.Redirect(w, r, "/target", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	resp := doFetch(t, origin.URL)
+	if resp["error"] != "" {
+		t.Fatalf("fetch failed: %s", resp["error"])
+	}
+	if resp["status"] != "302" {
+		t.Errorf("status = %q, want 302", resp["status"])
+	}
+}
+
+// A malformed ?header= fails the fetch before anything is sent.
+func TestFetchRejectsMalformedHeader(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("fetch sent the request despite a malformed header parameter")
+	}))
+	defer origin.Close()
+
+	resp := doFetch(t, origin.URL, "no-colon")
+	if !strings.Contains(resp["error"], "not <name>:<value>") {
+		t.Errorf("error = %q, want the malformed-header error", resp["error"])
+	}
+	if resp["status"] != "" {
+		t.Errorf("status = %q, want none", resp["status"])
+	}
+}
+
+// ?dial= moves only the connection: the URL's host still names the origin in
+// the Host header (and the SNI, for https), which is what lets a suite send a
+// ClientHello for an allowed name to an address that reaches nothing.
+func TestFetchDialsTheGivenAddress(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("host=" + r.Host))
+	}))
+	defer origin.Close()
+
+	resp := doFetchQuery(t, url.Values{
+		"url":   {"http://origin.invalid/"},
+		"roots": {"system"},
+		"dial":  {origin.Listener.Addr().String()},
+	})
+	if resp["error"] != "" {
+		t.Fatalf("fetch failed: %s", resp["error"])
+	}
+	if resp["status"] != "200" {
+		t.Errorf("status = %q, want 200", resp["status"])
+	}
+	if resp["body"] != "host=origin.invalid" {
+		t.Errorf("body = %q, want %q", resp["body"], "host=origin.invalid")
+	}
+}
+
+// A ?dial= without a port fails the fetch before anything is sent.
+func TestFetchRejectsMalformedDial(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("fetch sent the request despite a malformed dial parameter")
+	}))
+	defer origin.Close()
+
+	resp := doFetchQuery(t, url.Values{
+		"url":   {origin.URL},
+		"roots": {"system"},
+		"dial":  {"127.0.0.1"},
+	})
+	if !strings.Contains(resp["error"], "dial parameter") {
+		t.Errorf("error = %q, want the malformed-dial error", resp["error"])
+	}
+	if resp["status"] != "" {
+		t.Errorf("status = %q, want none", resp["status"])
+	}
+}
+
+// roots=pem trusts exactly the certificates in ca, which is how a suite
+// verifies an origin's own certificate rather than one the gateway minted.
+func TestFetchTrustsOnlyTheGivenCA(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer origin.Close()
+	originCA := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: origin.Certificate().Raw}))
+	unrelatedCA := string(testcert.NewServerTLS(t, net.ParseIP("127.0.0.1")).RootCA)
+
+	for _, tc := range []struct {
+		name   string
+		ca     string
+		wantOK bool
+	}{
+		{"origin's CA", originCA, true},
+		{"origin's CA among others", unrelatedCA + originCA, true},
+		{"unrelated CA", unrelatedCA, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doFetchQuery(t, url.Values{"url": {origin.URL}, "roots": {"pem"}, "ca": {tc.ca}})
+			if tc.wantOK {
+				if resp["error"] != "" || resp["status"] != "200" {
+					t.Errorf("fetch = status %q, error %q; want 200", resp["status"], resp["error"])
+				}
+				if resp["tls_handshake"] != "complete" {
+					t.Errorf("TLS handshake = %q, want complete", resp["tls_handshake"])
+				}
+				return
+			}
+			if resp["tls_handshake"] != "failed" {
+				t.Errorf("TLS handshake = %q, want failed", resp["tls_handshake"])
+			}
+			if !strings.Contains(resp["error"], "certificate") {
+				t.Errorf("error = %q, want a certificate verification failure", resp["error"])
+			}
+		})
+	}
+}
+
+func TestFetchReportsClientHelloClosure(t *testing.T) {
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("denied TLS reached HTTP")
+	}))
+	origin.TLS = &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			if err := hello.Conn.Close(); err != nil {
+				t.Errorf("closing denied TLS connection: %v", err)
+			}
+			return nil, errors.New("TLS destination denied")
+		},
+	}
+	origin.StartTLS()
+	defer origin.Close()
+
+	resp := doFetch(t, origin.URL)
+	if resp["tls_handshake"] != "closed" || resp["status"] != "" || resp["error"] == "" {
+		t.Fatalf("fetch = %v, want connection closed during TLS with no HTTP response", resp)
+	}
+}
+
+// roots=pem and ca come together, and ca must hold a certificate; anything
+// else fails before the request is sent.
+func TestFetchRejectsMismatchedCA(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("fetch sent the request despite a bad ca parameter")
+	}))
+	defer origin.Close()
+
+	for _, tc := range []struct {
+		name    string
+		query   url.Values
+		wantErr string
+	}{
+		{"roots=pem without ca", url.Values{"roots": {"pem"}}, "ca parameter"},
+		{"ca without roots=pem", url.Values{"roots": {"system"}, "ca": {"x"}}, "ca parameter"},
+		{"ca without a certificate", url.Values{"roots": {"pem"}, "ca": {"not a certificate"}}, "no certificates parsed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.query.Set("url", origin.URL)
+			resp := doFetchQuery(t, tc.query)
+			if !strings.Contains(resp["error"], tc.wantErr) {
+				t.Errorf("error = %q, want one mentioning %q", resp["error"], tc.wantErr)
+			}
+			if resp["status"] != "" {
+				t.Errorf("status = %q, want none", resp["status"])
+			}
+		})
+	}
+}
+
+func TestFetchTruncatesBody(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxFetchBody+1)))
+	}))
+	defer origin.Close()
+
+	resp := doFetch(t, origin.URL)
+	if got := len(resp["body"]); got != maxFetchBody {
+		t.Errorf("len(body) = %d, want %d", got, maxFetchBody)
+	}
+}
+
 func TestDecodeCapMaskInvalid(t *testing.T) {
 	if _, err := decodeCapMask("nothex"); err == nil {
 		t.Error("decodeCapMask(\"nothex\") succeeded, want an error")
@@ -94,5 +394,169 @@ func TestCapabilityNamesTable(t *testing.T) {
 		if name == "" {
 			t.Errorf("capabilityNames[%d] is empty", i)
 		}
+	}
+}
+
+// writeServerTrustBundle writes the TLS test server's certificate as the only
+// anchor of a trust bundle and returns its path.
+func writeServerTrustBundle(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trust-bundle.pem")
+	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(path, block, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The actor's EgressPolicy exists before it resumes, so the boot fetch makes
+// one request and reports its failure.
+func TestBootFetch(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		wantErr string
+	}{
+		{name: "origin answers 200", status: http.StatusOK},
+		{name: "origin denies", status: http.StatusForbidden, wantErr: "status 403"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(tt.status)
+			}))
+			defer origin.Close()
+
+			err := bootFetch(t.Context(), origin.URL, writeServerTrustBundle(t, origin))
+			if tt.wantErr == "" && err != nil {
+				t.Fatalf("bootFetch() error = %v, want nil", err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("bootFetch() error = %v, want %q", err, tt.wantErr)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Errorf("origin saw %d requests, want 1", got)
+			}
+		})
+	}
+}
+
+// A restored actor resumes past the boot fetch with its own identity, so its
+// wakeup probe fails until that identity has fetched.
+func TestRestoreFetchGatesHealthzOnIdentity(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	identity := filepath.Join(t.TempDir(), "actor-id")
+	writeIdentity := func(id string) {
+		t.Helper()
+		if err := os.WriteFile(identity, []byte(id), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := &restoreFetch{url: origin.URL, identityFile: identity, trustBundle: writeServerTrustBundle(t, origin), fetched: "golden"}
+	healthz := func() int {
+		rec := httptest.NewRecorder()
+		f.healthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		return rec.Code
+	}
+
+	writeIdentity("golden")
+	if got := healthz(); got != http.StatusOK {
+		t.Fatalf("healthz as the actor that booted = %d, want 200", got)
+	}
+	writeIdentity("restored")
+	if got := healthz(); got != http.StatusServiceUnavailable {
+		t.Fatalf("healthz as a restored actor before it fetched = %d, want 503", got)
+	}
+	f.fetch("restored")
+	if got := healthz(); got != http.StatusOK {
+		t.Fatalf("healthz as a restored actor after it fetched = %d, want 200", got)
+	}
+}
+
+// A failed restore fetch leaves healthz at 503, and the next wakeup probe
+// starts another fetch.
+func TestRestoreFetchRetriesOnNextProbe(t *testing.T) {
+	var deny atomic.Bool
+	deny.Store(true)
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if deny.Load() {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	identity := filepath.Join(t.TempDir(), "actor-id")
+	if err := os.WriteFile(identity, []byte("restored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := &restoreFetch{url: origin.URL, identityFile: identity, trustBundle: writeServerTrustBundle(t, origin), fetched: "golden"}
+	healthz := func() int {
+		rec := httptest.NewRecorder()
+		f.healthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		return rec.Code
+	}
+
+	f.fetch("restored")
+	if got := healthz(); got != http.StatusServiceUnavailable {
+		t.Fatalf("healthz after a failed fetch = %d, want 503", got)
+	}
+	deny.Store(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for healthz() != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatal("healthz did not answer 200 after the origin allowed the fetch")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func doStat(t *testing.T, path string) statResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/stat?"+url.Values{"path": {path}}.Encode(), nil)
+	rec := httptest.NewRecorder()
+	stat(rec, req)
+	var resp statResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding /stat response %q: %v", rec.Body.String(), err)
+	}
+	return resp
+}
+
+// The imagefs e2e suite asserts on /stat's owner and mode, so this pins both
+// against files whose owner and mode the test sets itself.
+func TestStatReportsOwnerAndMode(t *testing.T) {
+	dir := t.TempDir()
+	priv := filepath.Join(dir, "private")
+	if err := os.Mkdir(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Mkdir's mode is clipped by the umask; set it exactly.
+	if err := os.Chmod(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("private", link); err != nil {
+		t.Fatal(err)
+	}
+
+	got := doStat(t, priv)
+	want := statResponse{Path: priv, UID: uint32(os.Getuid()), GID: got.GID, Mode: "drwx------"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("/stat %s mismatch (-want +got):\n%s", priv, diff)
+	}
+
+	// The symlink itself, not its target.
+	if got := doStat(t, link); !strings.HasPrefix(got.Mode, "L") || got.Error != "" {
+		t.Errorf("/stat %s = %+v, want the symlink's own mode", link, got)
+	}
+
+	if got := doStat(t, filepath.Join(dir, "missing")); got.Error == "" {
+		t.Errorf("/stat of a missing path reported no error: %+v", got)
 	}
 }

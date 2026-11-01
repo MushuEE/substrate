@@ -1,3 +1,7 @@
+---
+docsite: false
+---
+
 # Code Style Guide
 
 Go conventions for this repository — written for humans and coding agents
@@ -39,6 +43,11 @@ far from its cause.
 - Table-driven tests with `t.Run` subtests are the default shape.
 - Prefer a real test implementation when one exists: the PostgreSQL test fixture for the store, `envtest` for
   the Kubernetes API. Release resources with `t.Cleanup`.
+- A test that skips on a missing precondition must fail on it in CI instead —
+  a skipped test and a passing one are the same exit code. Resolve strictness
+  through a named predicate (`dockerenv.Required()`), and prove the strict
+  branch red before merging. See
+  [CI fail-closed preconditions](dev/best-practices/ci-fail-closed.md).
 
 ## TODOs
 

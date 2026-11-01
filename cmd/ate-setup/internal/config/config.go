@@ -19,16 +19,23 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
-	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/pkg/postgressetup"
 )
 
 // Enumerated values for the install-shaping flags.
@@ -38,20 +45,36 @@ const (
 
 	SandboxClassGvisor  = "gvisor"
 	SandboxClassMicrovm = "microvm"
+
+	// Cluster size profiles. size0 is the shipped footprint; size10 assumes a
+	// dedicated node for PostgreSQL and raises the store, its client pool, and
+	// the podcertificate controller's API rate limits to match.
+	ClusterSizeSize0  = "size0"
+	ClusterSizeSize10 = "size10"
 )
 
 // DefaultRolloutTimeout is the default wait timeout for workload rollouts.
 const DefaultRolloutTimeout = 60 * time.Second
 
-// DefaultPostgresConnectionString mirrors default_postgres_connection_string in
-// the shell installer: the apiserver reaches PostgreSQL over mTLS using the
-// podcertificate controller's projected servicedns trust bundle and its own
-// podidentity credential bundle.
-const DefaultPostgresConnectionString = "postgresql://postgres@postgres.ate-system.svc:5432/atepg?sslmode=verify-full&sslrootcert=/run/servicedns.podcert.ate.dev/trust-bundle.pem&sslcert=/run/podidentity.podcert.ate.dev/credential-bundle.pem&sslkey=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+// Size10PostgresPoolParams is appended to the bundled read/write connection on
+// size10 clusters. pgxpool defaults MaxConns to max(4, runtime.NumCPU()), which
+// under-uses the size10 server's raised max_connections; pinning the pool makes
+// the client side open the sockets the server is provisioned for.
+const Size10PostgresPoolParams = "&pool_max_conns=64&pool_min_conns=4"
 
-// DefaultPostgresSchema mirrors the shell installer's default for
-// ATE_API_POSTGRES_SCHEMA, the PostgreSQL schema holding the Substrate tables.
-const DefaultPostgresSchema = "public"
+const (
+	DefaultPostgresSchema        = postgressetup.Schema
+	DefaultPostgresReadWriteRole = postgressetup.ReadWriteRole
+	DefaultPostgresOwnerRole     = postgressetup.OwnerRole
+)
+
+// Cloud SQL Auth Proxy IP types, the values ATE_API_POSTGRES_CLOUDSQL_IP_TYPE
+// accepts.
+const (
+	CloudSQLIPTypePrivate = "private"
+	CloudSQLIPTypePublic  = "public"
+	CloudSQLIPTypePSC     = "psc"
+)
 
 // devEnvFile is the optional per-developer environment script at the repo root.
 const devEnvFile = ".ate-dev-env.sh"
@@ -66,14 +89,20 @@ type Config struct {
 	// Kind selects the local Kind install profile (ATE_INSTALL_KIND).
 	Kind bool
 
+	// Namespace is the namespace the control plane is installed into, from
+	// ATE_NAMESPACE. It defaults to the canonical installdefaults.SystemNamespace,
+	// so an install that does not set it is unaffected. The checked-in manifests
+	// under manifests/ate-install/ name that namespace literally, so the
+	// manifest-applying steps refuse any other value; see Env.RequireCanonicalNamespace.
+	Namespace string
+
 	// Kubeconfig and Context select the target cluster. Empty Context means
 	// "use the current context" (the KUBECTL_CONTEXT convention).
 	//
-	// Kubeconfig falls back to $KUBECONFIG rather than staying empty. The
-	// client-go loading rules consult that variable on their own, so leaving
-	// it out here would point ate-setup at one cluster while the shell scripts
-	// it delegates to, which are handed this value through ScriptEnv, used
-	// another.
+	// Kubeconfig is a single file, handed to client-go as its explicit path. It
+	// falls back to $KUBECONFIG rather than staying empty so that ate-setup and
+	// the shell scripts it delegates to agree on the cluster — but only when
+	// that variable names one file. See loadKubeconfig.
 	Kubeconfig string
 	Context    string
 
@@ -83,13 +112,54 @@ type Config struct {
 	ClusterName     string
 	ClusterLocation string
 
-	// BucketName is the snapshot bucket demos are templated with.
+	// ExpectedJWTIssuer is the service account token issuer ate-api-server
+	// trusts (EXPECTED_JWT_ISSUER). It overrides both the GKE derivation from
+	// the coordinates above and OpenID discovery, for clusters whose issuer
+	// follows neither form.
+	ExpectedJWTIssuer string
+
+	// APIAuthzBootstrapOwners is the comma-separated principal list granted
+	// owner on global:root (ATE_API_AUTHZ_BOOTSTRAP_OWNERS).
+	APIAuthzBootstrapOwners string
+
+	// EgressGatewayExtraSPIFFEIDs hold ate-api-server's egress_gateway role
+	// next to atenet-egress (ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS).
+	EgressGatewayExtraSPIFFEIDs []string
+
+	// ActorJWTAlgorithm is the signing algorithm of the key in a new actor JWT
+	// pool (ACTOR_JWT_ALGORITHM): ES256 or RS256.
+	ActorJWTAlgorithm string
+
+	// ActorJWTIssuer is the iss claim of actor JWTs (ACTOR_JWT_ISSUER). It
+	// defaults to the in-cluster URL of the install's ate-idp-server Service.
+	ActorJWTIssuer string
+
+	// BucketName is the object-storage bucket (BUCKET_NAME) used for staging
+	// microVM assets and passed to benchmark scripts. The kind profile also
+	// derives SnapshotLocation from it.
 	BucketName string
+
+	// SnapshotLocation is ate-api-server's --snapshot-location
+	// (SNAPSHOT_LOCATION): the cluster-wide object-storage URI actor snapshots
+	// are stored under. Required unless the PerTemplateSnapshotLocation
+	// preview gate is enabled, which also lets a
+	// template's snapshotConfig.storageLocation override it. The demos and
+	// benchmarks, and so e2e runs, need it even with the gate, since they do
+	// not set storageLocation.
+	SnapshotLocation string
+
+	// TransferGSAName is the name of the Google service account snapshot
+	// transfers run as on GCS, in ProjectID (SNAPSHOT_TRANSFER_GSA_NAME).
+	// Only the in-tree GCS backend uses it. See TransferServiceAccount.
+	TransferGSAName string
 
 	// KODockerRepo is where ko pushes images (KO_DOCKER_REPO).
 	KODockerRepo string
 	// KODefaultPlatforms constrains ko's build platforms.
 	KODefaultPlatforms string
+	// DockerBuildFlags are extra docker buildx build flags for the images ko
+	// cannot build (DOCKER_BUILD_FLAGS, whitespace-separated).
+	DockerBuildFlags []string
 
 	// Images selects where container images come from. Its zero value builds
 	// them from source with ko, which is what a developer install does.
@@ -97,12 +167,34 @@ type Config struct {
 
 	// Router selects the atenet router dataplane.
 	Router string
-	// PostgresConnectionString is the apiserver's store connection string.
-	// Empty means use DefaultPostgresConnectionString.
-	PostgresConnectionString string
+	// The read/write and owner connections can use different login identities.
+	// With one configured connection, both pools use it. Both empty selects
+	// bundled PostgreSQL.
+	PostgresReadWriteConnectionString string
+	PostgresOwnerConnectionString     string
+	PostgresReadWriteRole             string
+	PostgresOwnerRole                 string
+	// These distinguish an explicit role override from the default when
+	// adopting an existing Cloud SQL installation.
+	PostgresReadWriteRoleSet bool
+	PostgresOwnerRoleSet     bool
 	// PostgresSchema is the PostgreSQL schema for the Substrate tables
 	// (ATE_API_POSTGRES_SCHEMA). Empty means DefaultPostgresSchema.
 	PostgresSchema string
+	// PostgresPoolMaxConns sizes the apiserver's read/write pool
+	// (ATE_API_POSTGRES_POOL_MAX_CONNS). Empty leaves the DSN or pgxpool default.
+	PostgresPoolMaxConns string
+	// PostgresServerCAFile is a local PEM file holding the server CA of an
+	// external PostgreSQL (ATE_API_POSTGRES_SERVER_CA_FILE). Its contents are
+	// published as the postgres-server-ca Secret, which ate-api-server mounts
+	// at /run/postgres-server-ca/server-ca.pem for sslmode=verify-ca DSNs.
+	PostgresServerCAFile string
+	// PostgresStorageClass is the StorageClass of the bundled PostgreSQL volume
+	// (ATE_API_POSTGRES_STORAGE_CLASS). Empty leaves the cluster default.
+	PostgresStorageClass string
+	// CloudSQL points the apiserver at a Cloud SQL instance through the Auth
+	// Proxy sidecar instead of a directly reachable PostgreSQL.
+	CloudSQL CloudSQLConfig
 
 	// RolloutTimeout is the timeout duration for rollout status checks.
 	RolloutTimeout time.Duration
@@ -113,11 +205,42 @@ type Config struct {
 	// PodcertWorkersPerSigner overrides WORKERS_PER_SIGNER on podcertificate-controller.
 	PodcertWorkersPerSigner int
 
-	// ExperimentalUseSDSMint enables per-SNI dynamic cert minting on atenet-egress.
-	ExperimentalUseSDSMint bool
+	// EnvoyConcurrency overrides --concurrency on the envoy container in atenet-egress.
+	EnvoyConcurrency int
+
+	// ClusterSize is the footprint profile (ATE_INSTALL_CLUSTER_SIZE): size0
+	// or size10.
+	ClusterSize string
+
+	// CordonSystemInfraComponents keeps the system infra components, such as
+	// ate-api-server, atenet-router, atenet-egress and postgres, off the
+	// worker nodes (ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS). It assumes a
+	// small shared pool labeled and tainted
+	// ate.dev/workloadType=ate-system-infra:NoSchedule, and a one-node pool
+	// labeled and tainted ate.dev/workloadType=ate-postgres:NoSchedule for
+	// postgres alone.
+	CordonSystemInfraComponents bool
+
+	// FakeDataPlane installs fake-atelet in place of atelet and
+	// fake-workersync in place of ate-controller
+	// (ATE_INSTALL_FAKE_DATA_PLANE), for control-plane benchmarks.
+	FakeDataPlane bool
+
+	// E2ETuning layers the e2e test kustomize component over control plane and
+	// data plane applies (ATE_INSTALL_E2E_TUNING).
+	E2ETuning bool
+
+	// IngressAllowedSPIFFEIDs are the SPIFFE IDs the ingress router lets
+	// reach actors over its TLS listeners (ATE_INGRESS_ALLOWED_SPIFFE_IDS).
+	// Empty means no client may reach actors through the router.
+	IngressAllowedSPIFFEIDs []string
 
 	// AdditionalEgressExtprocService is the optional NS/SVC:PORT external processor filter.
 	AdditionalEgressExtprocService string
+
+	// CredentialProviderJSON is the --credential-provider value; see
+	// CredentialProviders for its schema.
+	CredentialProviderJSON string
 
 	// AnthropicAPIKey is required only by the claude-code-multiplex demo.
 	AnthropicAPIKey string
@@ -125,199 +248,157 @@ type Config struct {
 	// OtlpEndpoint is where the control plane ships telemetry
 	// (ATE_OTLP_ENDPOINT). Benchmark actors are pointed at it too.
 	OtlpEndpoint string
+
+	// PreviewGates is the --preview value (ATE_PREVIEW) every substrate
+	// component is deployed with: gate names, or "ALL" for all of them.
+	PreviewGates []string
+
+	// APILogLevel is the ate-api-server log level: debug, info, warn, or
+	// error. Empty means none was asked for, which keeps the level an
+	// existing install already has.
+	APILogLevel string
+
 	// BenchmarkActorMemory is the memory limit for benchmark actors
 	// (BENCHMARK_ACTOR_MEMORY). Empty leaves the workload default in place.
 	BenchmarkActorMemory string
+
+	// kubeconfigEnv is what ScriptEnv exports as $KUBECONFIG. Unlike Kubeconfig
+	// it may be a PATH-style list of files, which kubectl understands and
+	// client-go's explicit path does not.
+	kubeconfigEnv string
 
 	// shellEnv is the process environment layered over .ate-dev-env.sh. It is
 	// kept so that the shell scripts ate-setup still shells out to see the same
 	// variables the shell installer would have exported to them.
 	shellEnv map[string]string
+
+	// resolved is every setting with the channel that supplied it. Commands
+	// read their own scoped settings from it; Config itself carries only the
+	// settings the installer resolves for every command.
+	resolved *Resolved
 }
 
-// Options carries the raw flag values the root command collects, before
-// defaulting and validation.
-type Options struct {
-	Kind                           bool
-	Kubeconfig                     string
-	Context                        string
-	Router                         string
-	RolloutTimeout                 string
-	PodcertWorkersPerSigner        int
-	ExperimentalUseSDSMint         bool
-	AdditionalEgressExtprocService string
-
-	// Image source selection.
-	ImageRepo string
-	ImageTag  string
-
-	// NoDevEnv skips sourcing .ate-dev-env.sh even when it exists.
-	NoDevEnv bool
+// Resolved returns every setting and its origin. Command-scoped settings are
+// not fields on Config: a command reads its own by key.
+//
+// A Config built directly rather than by Load has resolved nothing, which is
+// what tests do. Reporting declared defaults keeps every lookup working
+// instead of panicking on a nil map.
+func (c *Config) Resolved() *Resolved {
+	if c.resolved == nil {
+		c.resolved = defaultsOnly()
+	}
+	return c.resolved
 }
 
-// Load resolves the effective configuration. Precedence, lowest to highest:
-// .ate-dev-env.sh, the process environment, then flags.
-func Load(opts Options) (*Config, error) {
-	root, err := RepoRoot()
-	if err != nil {
-		return nil, err
+// TransferServiceAccount is the email of the snapshot transfer service
+// account, built from TransferGSAName and ProjectID as tools/setup-gcp builds
+// it. It is empty when either is.
+func (c *Config) TransferServiceAccount() string {
+	if c.TransferGSAName == "" || c.ProjectID == "" {
+		return ""
 	}
-
-	env := environ()
-
-	// Sourcing is skipped for Kind installs the same way the shell kind installer
-	// exports NO_DEV_ENV: the GKE-shaped variables in a developer's file would
-	// otherwise point a local install at a cloud project.
-	if !opts.NoDevEnv && !opts.Kind && os.Getenv("NO_DEV_ENV") == "" {
-		path := filepath.Join(root, devEnvFile)
-		if _, statErr := os.Stat(path); statErr == nil {
-			sourced, srcErr := sourceShellEnv(path, root)
-			if srcErr != nil {
-				return nil, fmt.Errorf("while sourcing %s: %w", devEnvFile, srcErr)
-			}
-			// The process environment still wins: an explicitly exported
-			// variable is a deliberate override of the file.
-			for k, v := range sourced {
-				if _, ok := env[k]; !ok {
-					env[k] = v
-				}
-			}
-		}
-	}
-
-	timeoutStr := firstNonEmpty(opts.RolloutTimeout, env["ATE_INSTALL_ROLLOUT_TIMEOUT"])
-	rolloutTimeout := DefaultRolloutTimeout
-	if timeoutStr != "" {
-		d, err := time.ParseDuration(timeoutStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid --rollout-timeout %q (must be a duration like 60s, 5m): %w", timeoutStr, err)
-		}
-		rolloutTimeout = d
-	}
-
-	podcertWorkers := opts.PodcertWorkersPerSigner
-	if podcertWorkers == 0 && env["ATE_INSTALL_PODCERT_WORKERS_PER_SIGNER"] != "" {
-		val := env["ATE_INSTALL_PODCERT_WORKERS_PER_SIGNER"]
-		w, err := strconv.Atoi(val)
-		if err != nil || w < 1 {
-			return nil, fmt.Errorf("--podcert-workers-per-signer must be a positive integer, got %q", val)
-		}
-		podcertWorkers = w
-	}
-
-	sdsmint := opts.ExperimentalUseSDSMint || env["ATE_EXPERIMENTAL_USE_SDSMINT"] == "true"
-	extproc := firstNonEmpty(opts.AdditionalEgressExtprocService, env["ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE"])
-
-	cfg := &Config{
-		Root:                           root,
-		Kind:                           opts.Kind,
-		Kubeconfig:                     firstNonEmpty(opts.Kubeconfig, env["KUBECONFIG"]),
-		Context:                        firstNonEmpty(opts.Context, env["KUBECTL_CONTEXT"]),
-		ProjectID:                      env["PROJECT_ID"],
-		ClusterName:                    env["CLUSTER_NAME"],
-		ClusterLocation:                env["CLUSTER_LOCATION"],
-		BucketName:                     env["BUCKET_NAME"],
-		KODockerRepo:                   env["KO_DOCKER_REPO"],
-		KODefaultPlatforms:             env["KO_DEFAULTPLATFORMS"],
-		Images:                         loadImageSource(opts, env),
-		PostgresConnectionString:       env["ATE_API_POSTGRES_CONNECTION_STRING"],
-		PostgresSchema:                 env["ATE_API_POSTGRES_SCHEMA"],
-		RolloutTimeout:                 rolloutTimeout,
-		rolloutTimeoutSet:              timeoutStr != "",
-		PodcertWorkersPerSigner:        podcertWorkers,
-		ExperimentalUseSDSMint:         sdsmint,
-		AdditionalEgressExtprocService: extproc,
-		AnthropicAPIKey:                env["ANTHROPIC_API_KEY"],
-		OtlpEndpoint:                   env["ATE_OTLP_ENDPOINT"],
-		BenchmarkActorMemory:           env["BENCHMARK_ACTOR_MEMORY"],
-		shellEnv:                       env,
-	}
-
-	if opts.Kind {
-		applyKindDefaults(cfg)
-	}
-
-	cfg.Router = firstNonEmpty(opts.Router, env["ATE_ATENET_ROUTER"], RouterEnvoy)
-
-	if err := validate(cfg); err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	return c.TransferGSAName + "@" + c.ProjectID + ".iam.gserviceaccount.com"
 }
 
-// loadImageSource resolves where images come from.
-func loadImageSource(opts Options, env map[string]string) images.Source {
-	return images.Source{
-		Repo: strings.TrimSuffix(firstNonEmpty(opts.ImageRepo, env["ATE_IMAGE_REPO"]), "/"),
-		Tag:  firstNonEmpty(opts.ImageTag, env["ATE_IMAGE_TAG"]),
+// RequireTransferServiceAccount fails when the install would deploy
+// ate-api-server on GCS without a transfer service account. Its credential
+// exchange impersonates the account and refuses to start without one.
+// ate-setup installs GCS everywhere but kind, which uses S3.
+func (c *Config) RequireTransferServiceAccount() error {
+	if c.Kind {
+		return nil
 	}
-}
-
-func applyKindDefaults(cfg *Config) {
-	cfg.ProjectID = ""
-	cfg.ClusterLocation = ""
-	kindClusterName := firstNonEmpty(cfg.shellEnv["KIND_CLUSTER_NAME"], "kind")
-	cfg.Context = firstNonEmpty(cfg.Context, "kind-"+kindClusterName)
-	cfg.KODockerRepo = firstNonEmpty(cfg.KODockerRepo, "localhost:5001")
-	cfg.KODefaultPlatforms = "linux/" + runtime.GOARCH
-	cfg.BucketName = "ate-snapshots"
-}
-
-func validate(cfg *Config) error {
-	if err := cfg.Images.Validate(); err != nil {
-		return err
+	if c.TransferGSAName == "" {
+		return c.Resolved().Require("storage.transferGSAName")
 	}
-	switch cfg.Router {
-	case RouterEnvoy, RouterAgentgateway:
-	default:
-		return fmt.Errorf("atenet router must be %s or %s, got %q", RouterEnvoy, RouterAgentgateway, cfg.Router)
-	}
-	if cfg.PodcertWorkersPerSigner < 0 {
-		return fmt.Errorf("--podcert-workers-per-signer must be a positive integer, got %d", cfg.PodcertWorkersPerSigner)
-	}
-	if cfg.AdditionalEgressExtprocService != "" {
-		if err := validateExtprocService(cfg.AdditionalEgressExtprocService); err != nil {
-			return err
-		}
-		if !cfg.ExperimentalUseSDSMint {
-			return fmt.Errorf("--experimental-additional-egress-extproc-service requires --experimental-use-sdsmint")
-		}
-		if cfg.Router != RouterEnvoy {
-			return fmt.Errorf("--experimental-additional-egress-extproc-service requires --atenet-router=envoy")
-		}
+	if c.ProjectID == "" {
+		return c.Resolved().Require("gcp.projectID")
 	}
 	return nil
 }
 
-func validateExtprocService(spec string) error {
+// SetResolved attaches resolved settings to a Config built directly. Load
+// does this itself; the callers here are tests and the demo test harness.
+func (c *Config) SetResolved(r *Resolved) { c.resolved = r }
+
+// defaultsOnly is every setting on its declared default. Computed on first use
+// rather than at init: settings register from command packages, whose init
+// runs after this one.
+func defaultsOnly() *Resolved {
+	r, err := Resolve(nil, ResolveOptions{})
+	if err != nil {
+		// Unreachable: TestRegistryDefaultsParse covers every declared default.
+		panic("config: declared defaults do not parse: " + err.Error())
+	}
+	return r
+}
+
+// CloudSQLConfig is the operator's Cloud SQL intent, as expressed by the
+// ATE_API_POSTGRES_CLOUDSQL_* variables.
+//
+// Every field is empty-means-unspecified except Instance, which is three-way:
+// a non-empty instance selects Cloud SQL, an explicitly empty one removes it,
+// and an unset one (InstanceSet false) adopts whatever the target cluster
+// already records. Without that distinction a redeploy from a shell that
+// simply never exported the variable would tear the proxy sidecar out from
+// under a working installation.
+type CloudSQLConfig struct {
+	// Instance is the instance connection name, PROJECT:REGION:INSTANCE.
+	Instance string
+	// InstanceSet records whether ATE_API_POSTGRES_CLOUDSQL_INSTANCE was
+	// present in the environment at all, empty value included.
+	InstanceSet bool
+
+	// GSA is the Google service account the proxy authenticates as, and whose
+	// email (minus the .gserviceaccount.com suffix) is the IAM database user.
+	GSA string
+	// IAMAuth enables automatic IAM database authentication ("true" or
+	// "false"). Empty defaults to enabled.
+	IAMAuth string
+	// IPType selects which instance address the proxy dials: one of the
+	// CloudSQLIPType constants. Empty defaults to private.
+	IPType string
+}
+
+// extprocServiceForm and extprocServicePort describe the accepted value, for
+// the two ways it can be wrong.
+const (
+	extprocServiceForm = "<namespace>/<service>:<port>"
+	extprocServicePort = extprocServiceForm + ", with a port of 1-65535"
+)
+
+// validateExtprocService checks the service reference. It takes the resolved
+// value rather than the bare string so the error names the channel that
+// supplied it: the setting reaches a flag, an environment variable and a
+// configuration file, and naming only the flag sends a reader who used one of
+// the other two to the wrong place.
+func validateExtprocService(v Value) error {
+	spec := v.Raw
 	parts := strings.Split(spec, "/")
 	if len(parts) != 2 {
-		return fmt.Errorf("--experimental-additional-egress-extproc-service must be <namespace>/<service>:<port>, got %q", spec)
+		return &InvalidError{Value: v, Want: extprocServiceForm}
 	}
 	namespace := parts[0]
 	svcPort := strings.Split(parts[1], ":")
 	if len(svcPort) != 2 {
-		return fmt.Errorf("--experimental-additional-egress-extproc-service must be <namespace>/<service>:<port>, got %q", spec)
+		return &InvalidError{Value: v, Want: extprocServiceForm}
 	}
 	service := svcPort[0]
 	portStr := svcPort[1]
 	if namespace == "" || service == "" {
-		return fmt.Errorf("--experimental-additional-egress-extproc-service must be <namespace>/<service>:<port>, got %q", spec)
+		return &InvalidError{Value: v, Want: extprocServiceForm}
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("--experimental-additional-egress-extproc-service port must be 1-65535, got %q", portStr)
+		return &InvalidError{Value: v, Want: extprocServicePort}
 	}
 	return nil
 }
 
-// PostgresConnString returns the configured connection string, falling back to
-// the in-cluster default.
-func (c *Config) PostgresConnString() string {
-	if c.PostgresConnectionString != "" {
-		return c.PostgresConnectionString
-	}
-	return DefaultPostgresConnectionString
+// Size10 reports whether the size10 footprint profile is selected.
+func (c *Config) Size10() bool {
+	return c.ClusterSize == ClusterSizeSize10
 }
 
 // PostgresSchemaName returns the configured schema, falling back to the
@@ -357,10 +438,9 @@ func (c *Config) Path(parts ...string) string {
 	return filepath.Join(append([]string{c.Root}, parts...)...)
 }
 
-// kindUnsetVars are the GKE-specific variables the shell kind installer unset
-// before delegating, so that a developer who had already sourced
-// .ate-dev-env.sh into their shell did not end up pointing a local install at a
-// cloud project.
+// kindUnsetVars are the GKE-specific variables a Kind install drops, so that a
+// developer who has already sourced .ate-dev-env.sh into their shell does not
+// point a local install at a cloud project.
 var kindUnsetVars = []string{
 	"GCE_REGION", "CLUSTER_LOCATION", "NETWORK", "SUBNETWORK",
 	"MEMORYSTORE_INSTANCE", "PROJECT_ID",
@@ -391,13 +471,15 @@ func (c *Config) ScriptEnv() []string {
 	// and the kind profile.
 	for name, value := range map[string]string{
 		"KUBECTL_CONTEXT":     c.Context,
-		"KUBECONFIG":          c.Kubeconfig,
+		"KUBECONFIG":          c.kubeconfigEnv,
 		"BUCKET_NAME":         c.BucketName,
+		"SNAPSHOT_LOCATION":   c.SnapshotLocation,
 		"KO_DOCKER_REPO":      c.KODockerRepo,
 		"KO_DEFAULTPLATFORMS": c.KODefaultPlatforms,
 		"PROJECT_ID":          c.ProjectID,
 		"CLUSTER_NAME":        c.ClusterName,
 		"CLUSTER_LOCATION":    c.ClusterLocation,
+		"ATE_OTLP_ENDPOINT":   c.OtlpEndpoint,
 	} {
 		if value == "" {
 			// An empty value means "not configured". Leaving the variable set
@@ -415,11 +497,44 @@ func (c *Config) ScriptEnv() []string {
 	if c.PodcertWorkersPerSigner > 0 {
 		merged["ATE_INSTALL_PODCERT_WORKERS_PER_SIGNER"] = strconv.Itoa(c.PodcertWorkersPerSigner)
 	}
-	if c.ExperimentalUseSDSMint {
-		merged["ATE_EXPERIMENTAL_USE_SDSMINT"] = "true"
+	if c.EnvoyConcurrency > 0 {
+		merged["E2E_ATE_ENVOY_CONCURRENCY"] = strconv.Itoa(c.EnvoyConcurrency)
+	}
+	// Resolved values again, so a flag overrides whatever the environment
+	// carried rather than layering under it.
+	delete(merged, "ATE_INSTALL_CLUSTER_SIZE")
+	if c.ClusterSize != "" && c.ClusterSize != ClusterSizeSize0 {
+		merged["ATE_INSTALL_CLUSTER_SIZE"] = c.ClusterSize
+	}
+	delete(merged, "ATE_PREVIEW")
+	if len(c.PreviewGates) > 0 {
+		merged["ATE_PREVIEW"] = strings.Join(c.PreviewGates, ",")
+	}
+	delete(merged, "ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS")
+	if c.CordonSystemInfraComponents {
+		merged["ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS"] = "true"
+	}
+	delete(merged, "ATE_INSTALL_FAKE_DATA_PLANE")
+	if c.FakeDataPlane {
+		merged["ATE_INSTALL_FAKE_DATA_PLANE"] = "true"
+	}
+	delete(merged, "ATE_INSTALL_E2E_TUNING")
+	if c.E2ETuning {
+		merged["ATE_INSTALL_E2E_TUNING"] = "true"
+	}
+	delete(merged, "ATE_INGRESS_ALLOWED_SPIFFE_IDS")
+	if len(c.IngressAllowedSPIFFEIDs) > 0 {
+		merged["ATE_INGRESS_ALLOWED_SPIFFE_IDS"] = strings.Join(c.IngressAllowedSPIFFEIDs, ",")
+	}
+	delete(merged, "ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS")
+	if len(c.EgressGatewayExtraSPIFFEIDs) > 0 {
+		merged["ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS"] = strings.Join(c.EgressGatewayExtraSPIFFEIDs, ",")
 	}
 	if c.AdditionalEgressExtprocService != "" {
 		merged["ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE"] = c.AdditionalEgressExtprocService
+	}
+	if c.CredentialProviderJSON != "" {
+		merged["ATE_CREDENTIAL_PROVIDER"] = c.CredentialProviderJSON
 	}
 
 	env := make([]string, 0, len(merged))
@@ -452,11 +567,162 @@ func environ() map[string]string {
 	return env
 }
 
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
+// The bundled Kubernetes Secrets provider, which the installer deploys with a
+// NetworkPolicy that admits only the egress gateway. Its default address is
+// the Service in
+// manifests/egress-credential-injection/k8s-credential-provider.yaml.
+const (
+	K8sCredentialProviderName    = "k8s.io"
+	K8sCredentialProviderAddress = "k8s-credential-provider." + installdefaults.SystemNamespace + ".svc:50051"
+)
+
+// credentialProviderKey is the setting the provider JSON arrives on.
+const credentialProviderKey = "atenet.egress.credentialProvider"
+
+// credentialProviderUsage lists the accepted --credential-provider values.
+const credentialProviderUsage = `{"name":"k8s.io"} for the bundled Kubernetes Secrets provider, ` +
+	`{"enabled":false} to turn egress credential injection off, ` +
+	`or {"name":"<provider>","address":"<host>:<port>"} for a provider you deploy; ` +
+	`a JSON array of provider objects selects several`
+
+// credentialProviderSpec is the schema of the --credential-provider JSON.
+type credentialProviderSpec struct {
+	// Enabled defaults to true when absent.
+	Enabled *bool  `json:"enabled"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
+
+// CredentialProvider is the credential provider the egress gateway is pointed
+// at. The zero value means injection is off.
+type CredentialProvider struct {
+	// Name is the host of the ate-secret:// credential URIs the provider
+	// serves, e.g. k8s.io.
+	Name string
+	// Address is the host:port the gateway dials the provider at.
+	Address string
+}
+
+// Enabled reports whether the gateway is given a provider.
+func (p CredentialProvider) Enabled() bool { return p.Name != "" }
+
+// Kubernetes reports whether the provider is the bundled one.
+func (p CredentialProvider) Kubernetes() bool { return p.Name == K8sCredentialProviderName }
+
+// HasKubernetesProvider reports whether providers include the bundled one.
+func HasKubernetesProvider(providers []CredentialProvider) bool {
+	return slices.ContainsFunc(providers, CredentialProvider.Kubernetes)
+}
+
+// ServerName is the SAN the gateway expects on the provider's serving
+// certificate: the address without its port.
+func (p CredentialProvider) ServerName() string {
+	if i := strings.LastIndex(p.Address, ":"); i >= 0 {
+		return p.Address[:i]
 	}
-	return ""
+	return p.Address
+}
+
+// credentialProvider parses a --credential-provider JSON object that either
+// turns injection off with enabled false or names a provider and its address.
+// Only the bundled provider has a default address.
+func credentialProvider(raw string) (CredentialProvider, error) {
+	invalid := func(format string, args ...any) (CredentialProvider, error) {
+		return CredentialProvider{}, fmt.Errorf("invalid --credential-provider '%s': %s", raw, fmt.Sprintf(format, args...))
+	}
+
+	var spec credentialProviderSpec
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&spec); err != nil {
+		return invalid("%v; want %s", err, credentialProviderUsage)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return invalid("want a single JSON object")
+	}
+
+	if spec.Enabled != nil && !*spec.Enabled {
+		if spec.Name != "" || spec.Address != "" {
+			return invalid("enabled false takes no name or address")
+		}
+		return CredentialProvider{}, nil
+	}
+	if spec.Name == "" {
+		return invalid("name is required; want %s", credentialProviderUsage)
+	}
+	// The name is the host of the credential URIs the provider serves.
+	if errs := validation.IsDNS1123Subdomain(spec.Name); len(errs) > 0 {
+		return invalid("name %q is not a valid DNS name: %s", spec.Name, strings.Join(errs, "; "))
+	}
+	if spec.Address == "" {
+		if spec.Name != K8sCredentialProviderName {
+			return invalid("a provider you deploy needs an address as host:port")
+		}
+		spec.Address = K8sCredentialProviderAddress
+	} else if host, port, err := net.SplitHostPort(spec.Address); err != nil || host == "" || port == "" {
+		return invalid("address must be host:port, got %q", spec.Address)
+	}
+	return CredentialProvider{Name: spec.Name, Address: spec.Address}, nil
+}
+
+// CredentialProviders parses --credential-provider, which is one of:
+//
+//	{"name":"k8s.io"}                                       one provider
+//	[{"name":"k8s.io"},{"name":"<name>","address":"<addr>"}]  several providers
+//	{"enabled":false}                                       none: injection off
+//
+// credentialProvider checks each provider object. A missing value is reported
+// here rather than in validate because only the deploys that render the egress
+// gateway need it.
+func (c *Config) CredentialProviders() ([]CredentialProvider, error) {
+	raw := c.CredentialProviderJSON
+	if raw == "" {
+		return nil, fmt.Errorf("a credential provider is required; set one of %s: %s",
+			channelsFor(credentialProviderKey), credentialProviderUsage)
+	}
+	invalid := func(format string, args ...any) ([]CredentialProvider, error) {
+		return nil, fmt.Errorf("invalid --credential-provider '%s': %s", raw, fmt.Sprintf(format, args...))
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return invalid("%v; want %s", err, credentialProviderUsage)
+	}
+	var elems []any
+	switch v := value.(type) {
+	case map[string]any:
+		p, err := credentialProvider(raw)
+		if err != nil || !p.Enabled() {
+			return nil, err
+		}
+		return []CredentialProvider{p}, nil
+	case []any:
+		elems = v
+	default:
+		return invalid("want a JSON object or an array of them: %s", credentialProviderUsage)
+	}
+	if len(elems) == 0 {
+		return invalid(`the array names no provider; {"enabled":false} turns injection off`)
+	}
+	var providers []CredentialProvider
+	for _, elem := range elems {
+		if _, ok := elem.(map[string]any); !ok {
+			return invalid("array entries must be JSON objects; want %s", credentialProviderUsage)
+		}
+		obj, err := json.Marshal(elem)
+		if err != nil {
+			return invalid("%v", err)
+		}
+		p, err := credentialProvider(string(obj))
+		if err != nil {
+			return nil, err
+		}
+		if !p.Enabled() {
+			return invalid("enabled false is not allowed in an array")
+		}
+		if slices.ContainsFunc(providers, func(q CredentialProvider) bool { return q.Name == p.Name }) {
+			return invalid("provider name %q repeats", p.Name)
+		}
+		providers = append(providers, p)
+	}
+	return providers, nil
 }

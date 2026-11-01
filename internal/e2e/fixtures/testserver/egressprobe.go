@@ -28,8 +28,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/agent-substrate/substrate/internal/atunnel"
-	"github.com/agent-substrate/substrate/internal/credbundle"
+	"go.ate.dev/substrate/internal/atunnel/egress"
+	"go.ate.dev/substrate/internal/credbundle"
 )
 
 // tunnelDestination is the CONNECT authority. atunnel takes this from
@@ -58,8 +58,9 @@ const (
 	// stageTunnel is any other failure opening the tunnel: DNS, TCP, a
 	// truncated response.
 	stageTunnel = "tunnel"
-	// stageInnerHandshake is the tunneled TLS handshake -- the one sdsmint
-	// serves. A failure here is the minter's, not the front door's.
+	// stageInnerHandshake is the tunneled TLS handshake -- the one the gateway
+	// answers with a minted leaf. A failure here is the minter's, not the
+	// front door's.
 	stageInnerHandshake = "inner_handshake"
 )
 
@@ -93,8 +94,8 @@ type handshakeResult struct {
 }
 
 // handshake opens a tunnel through the gateway and completes an inner TLS
-// handshake for the requested SNI, which is what makes Envoy ask sdsmint for a
-// secret under that name.
+// handshake for the requested SNI, which is what makes the gateway mint a leaf
+// under that name.
 func handshake(w http.ResponseWriter, r *http.Request, cfg probeConfig) {
 	sni := r.URL.Query().Get("sni")
 	if sni == "" {
@@ -121,7 +122,7 @@ func handshake(w http.ResponseWriter, r *http.Request, cfg probeConfig) {
 	if err != nil {
 		result.Stage = stage
 		result.Error = err.Error()
-		var rejected *atunnel.ConnectRejectedError
+		var rejected *egress.ConnectRejectedError
 		if errors.As(err, &rejected) {
 			result.ConnectStatus = rejected.StatusCode
 		}
@@ -144,7 +145,7 @@ func encodeChain(chain []*x509.Certificate) string {
 // chain it was served. On failure it also returns the stage that failed, since
 // which hop said no is the assertion most callers are actually making.
 func fetchChain(ctx context.Context, sni, credentialBundle string, cfg probeConfig) ([]*x509.Certificate, string, error) {
-	client, err := atunnel.NewClient(atunnel.ClientConfig{
+	client, err := egress.NewClient(egress.ClientConfig{
 		GatewayAddress:       cfg.gatewayAddress,
 		ServerName:           serverName(cfg.gatewayAddress),
 		GetClientCertificate: credbundle.ClientLoader(credentialBundle),
@@ -182,9 +183,9 @@ func fetchChain(ctx context.Context, sni, credentialBundle string, cfg probeConf
 // typed errors rather than its messages, so the mapping survives a reworded
 // error.
 func dialStage(err error) string {
-	var rejected *atunnel.ConnectRejectedError
+	var rejected *egress.ConnectRejectedError
 	switch {
-	case errors.Is(err, atunnel.ErrGatewayHandshake):
+	case errors.Is(err, egress.ErrGatewayHandshake):
 		return stageGatewayTLS
 	case errors.As(err, &rejected):
 		return stageConnect

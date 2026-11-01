@@ -14,30 +14,31 @@
 
 // Package imagecache implements the node-local OCI image cache: a
 // content-addressed pool of unpacked image layers shared by every actor on
-// the node, plus the per-bundle overlay spec that tells the ateom runtimes
+// the node, plus the per-bundle overlay spec that tells the worker runtimes
 // how to compose an actor rootfs from cached layers.
 //
-// The work is split along the existing atelet/ateom privilege boundary:
+// The work is split along the existing atelet/worker privilege boundary:
 //
-//   - atelet (plain root, all capabilities dropped) pulls layers and unpacks
-//     them into the pool (Store.EnsureImage), and writes a rootfs-overlay.json
-//     next to each bundle's config.json (WriteSpec). Whiteout entries are
-//     recorded in per-layer metadata rather than materialized, because
-//     overlayfs whiteouts are char devices (CAP_MKNOD) with trusted.* xattrs
-//     for opaque dirs (CAP_SYS_ADMIN).
-//   - ateom (privileged; it already owns every mount on the node) finalizes
-//     layers — materializing the recorded whiteout state, once per layer —
-//     and mounts the overlay rootfs (SetupBundleRootfs) just before
+//   - atelet (root with the capabilities manifests/ate-install/atelet.yaml
+//     grants it) pulls layers and unpacks them into the pool with the
+//     owners their tars record (Store.EnsureImage), and writes a
+//     rootfs-overlay.json into each bundle (WriteSpec). Whiteout entries
+//     are recorded in per-layer metadata rather than materialized, because
+//     opaque directories need trusted.* xattrs (CAP_SYS_ADMIN). The 0:0 char
+//     devices used as whiteouts have a separate kernel permission check and
+//     can be created without CAP_MKNOD since Linux 5.8.
+//   - worker finalizes layers, materializing the recorded whiteout state once per
+//     layer, and mounts the overlay rootfs (SetupBundleRootfs) just before
 //     `runsc create` / staging the micro-VM virtio-fs lower.
 //
 // On-disk layout under the cache root (a directory on the BasePath hostPath,
-// so the same absolute paths resolve in atelet and every ateom pod):
+// so the same absolute paths resolve in atelet and every worker pod):
 //
 //	version                          layout version marker
 //	layers/sha256/<diffid-hex>/
 //	    fs/                          the unpacked layer tree (overlay lowerdir)
 //	    whiteouts.json               whiteout state recorded at unpack time
-//	    finalized                    marker written by FinalizeLayer (ateom)
+//	    finalized                    marker written by FinalizeLayer (worker)
 //	manifests/sha256/<digest-hex>.json
 //	                                 image config + ordered diffID list
 //
@@ -51,11 +52,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,11 +72,14 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
 const (
-	layoutVersion   = "1"
+	// Version 1 layers may not have been hashed against their diffID, and
+	// version 2 layers are root-owned without setuid, setgid or sticky bits,
+	// so both pools are refused.
+	layoutVersion   = "3"
 	versionFileName = "version"
 
 	layerFSDirName           = "fs"
@@ -146,10 +152,9 @@ var (
 
 // sharedRegistries are the well-known communal registries whose rate limits
 // are shared across all anonymous clients. Everything not listed here is
-// assumed dedicated: fleet-scale pulls realistically hit either the pause
-// image (registry.k8s.io) or the customer's own registry, and enumerating
-// the small stable set of communal hosts beats guessing at every private
-// registry vendor.
+// assumed dedicated: fleet-scale pulls realistically hit the customer's own
+// registry, and enumerating the small stable set of communal hosts beats
+// guessing at every private registry vendor.
 var sharedRegistries = map[string]bool{
 	"registry.k8s.io": true,
 	// Pulls only ever present index.docker.io here: name.ParseReference
@@ -181,9 +186,8 @@ func retryBackoffFor(registry string) remote.Backoff {
 type Store struct {
 	root string
 
-	// authenticator, when set, is attached to pulls from registries that use
-	// GCP credentials (gcr.io / pkg.dev). See remoteOpts.
-	authenticator authn.Authenticator
+	// keychain, when set, supplies credentials for pulls. See withCredentials.
+	keychain authn.Keychain
 
 	localhostRegistryReplacement string
 
@@ -197,7 +201,7 @@ type Store struct {
 
 	// minAge vetoes eviction of any layer or image record younger than this,
 	// covering the window between a pull (or cache-hit stat) and the bundle
-	// spec write / ateom mount that roots it.
+	// spec write / worker mount that roots it.
 	minAge time.Duration
 
 	// pullTimeout bounds each pull. Pulls run detached from the contexts of
@@ -224,15 +228,29 @@ type Store struct {
 	// (removeStaleRecord), so a hit's last-use touch and eviction's final
 	// re-check can never interleave. Uncontended except during a pass.
 	hitMu sync.RWMutex
+
+	// pins counts the in-flight pulls using each layer, by diffID hex;
+	// retireLayer never retires a pinned layer. Held only across a pin, an
+	// unpin, or a retirement's stat and rename. Entries are deleted at
+	// zero, so the map holds only layers pulls are using right now.
+	pinMu sync.Mutex
+	pins  map[string]int
 }
 
 // Option configures a Store.
 type Option func(*Store)
 
-// WithAuthenticator attaches an authenticator used for gcr.io / pkg.dev
-// registries. A nil authenticator is ignored.
-func WithAuthenticator(a authn.Authenticator) Option {
-	return func(s *Store) { s.authenticator = a }
+// CandidateKeychain returns several credentials to try in order.
+type CandidateKeychain interface {
+	authn.Keychain
+	Candidates(ctx context.Context, target authn.Resource) ([]authn.Authenticator, error)
+}
+
+// WithKeychain attaches a keychain consulted for every pull, whatever the
+// registry — the keychain itself decides which registries it has credentials
+// for. A nil keychain is ignored.
+func WithKeychain(k authn.Keychain) Option {
+	return func(s *Store) { s.keychain = k }
 }
 
 // WithLocalhostRegistryReplacement rewrites localhost/loopback registry refs
@@ -248,7 +266,7 @@ func WithPlatform(p v1.Platform) Option {
 }
 
 // WithActorsDir points the eviction root-set scan at the node's actors
-// directory (the per-actor state dirs under ateompath.BasePath). Each
+// directory (the per-actor state dirs under nodepath.BasePath). Each
 // <actorsDir>/<actorUID>/bundles/<container>/rootfs-overlay.json roots its
 // image and layers against eviction. Empty disables the scan.
 func WithActorsDir(dir string) Option {
@@ -298,7 +316,7 @@ type imageRecord struct {
 // startup recovery: verifying the layout version and sweeping temp dirs left
 // by unpacks that were in flight when a previous atelet died.
 func New(root string, opts ...Option) (*Store, error) {
-	s := &Store{root: root, minAge: defaultMinAge, pullTimeout: defaultPullTimeout}
+	s := &Store{root: root, minAge: defaultMinAge, pullTimeout: defaultPullTimeout, pins: map[string]int{}}
 	for _, o := range opts {
 		o(s)
 	}
@@ -323,7 +341,7 @@ func New(root string, opts ...Option) (*Store, error) {
 		if got := strings.TrimSpace(string(b)); got != layoutVersion {
 			// Fail loudly instead of silently mixing layouts; an operator can
 			// delete the cache dir to rebuild it (it holds no unique state).
-			return nil, fmt.Errorf("image cache at %q has layout version %q, this atelet supports %q", root, got, layoutVersion)
+			return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q, so delete it once no actor runs on this node", root, got, layoutVersion)
 		}
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.WriteFile(versionPath, []byte(layoutVersion+"\n"), 0o600); err != nil {
@@ -331,6 +349,10 @@ func New(root string, opts ...Option) (*Store, error) {
 		}
 	default:
 		return nil, fmt.Errorf("while reading image cache version marker: %w", err)
+	}
+
+	if os.Geteuid() != 0 {
+		slog.Warn("Image cache is not running as root: unpacked layers belong to this user instead of the owners the image records", slog.String("root", root))
 	}
 
 	if err := s.sweepTempDirs(); err != nil {
@@ -435,7 +457,11 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (_ *Image, err erro
 	} else {
 		// Tag ref: one small HEAD request pins it to an immutable manifest
 		// digest, which is the only safe cache key for mutable tags.
-		desc, headErr := remote.Head(parsedRef, s.remoteOpts(ctx, parsedRef)...)
+		var desc *v1.Descriptor
+		headErr := s.withCredentials(ctx, parsedRef, func(opts []remote.Option) (err error) {
+			desc, err = remote.Head(parsedRef, opts...)
+			return err
+		})
 		if headErr != nil {
 			err = fmt.Errorf("while resolving tag %q to a digest: %w", ref, headErr)
 			return nil, err
@@ -484,7 +510,7 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (_ *Image, err erro
 // with respect to eviction's record removal (removeStaleRecord holds
 // hitMu exclusive). Refreshing the mtime also renews the min-age veto, so
 // an image in active use cannot age into eviction between this stat and
-// the ateom's mount.
+// the worker's mount.
 func (s *Store) cachedImageHit(digest v1.Hash) (*Image, error) {
 	s.hitMu.RLock()
 	defer s.hitMu.RUnlock()
@@ -536,16 +562,29 @@ func (s *Store) cachedImage(digest v1.Hash) (*Image, error) {
 // so an interrupted pull's record is just resumable progress.
 func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Hash) (*Image, error) {
 	// Re-check under the flight lock: a racing EnsureImage may have completed
-	// the pull between our cache miss and winning the singleflight slot.
-	if img, err := s.cachedImage(digest); err != nil {
+	// the pull between our cache miss and winning the singleflight slot. As
+	// a hit, so the record is touched and its layers are kept past min-age.
+	if img, err := s.cachedImageHit(digest); err != nil {
 		return nil, err
 	} else if img != nil {
 		return img, nil
 	}
 
+	// Retry the whole pull per credential: the config and layer blobs are
+	// fetched after the manifest, and finished layers are reused.
+	var out *Image
+	err := s.withCredentials(ctx, parsedRef, func(opts []remote.Option) (err error) {
+		out, err = s.pullWith(ctx, parsedRef, digest, opts)
+		return err
+	})
+	return out, err
+}
+
+// pullWith is pull with the given remote options.
+func (s *Store) pullWith(ctx context.Context, parsedRef name.Reference, digest v1.Hash, opts []remote.Option) (*Image, error) {
 	tStart := time.Now()
 	digestRef := parsedRef.Context().Digest(digest.String())
-	img, err := remote.Image(digestRef, s.remoteOpts(ctx, parsedRef)...)
+	img, err := remote.Image(digestRef, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("in remote.Image: %w", err)
 	}
@@ -564,9 +603,15 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 		return nil, fmt.Errorf("image %s config lists %d diffIDs but manifest has %d layers", digest, len(cfgFile.RootFS.DiffIDs), len(layers))
 	}
 	diffIDs := make([]string, len(layers))
+	hexes := make([]string, len(layers))
 	for i, d := range cfgFile.RootFS.DiffIDs {
 		diffIDs[i] = d.String()
+		hexes[i] = d.Hex
 	}
+	// Pinned until this pull returns: eviction never retires a pinned
+	// layer, so nothing this pull has unpacked or reused can be taken out
+	// from under it, whatever happens to its record meanwhile.
+	defer s.pinLayers(hexes)()
 
 	// The full diffID list is known from the config before any unpack; make
 	// every layer of this pull referenced before it can exist.
@@ -591,24 +636,25 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	g.SetLimit(layerPullConcurrency)
 	for i, layer := range layers {
 		g.Go(func() error {
-			diffID, err := layer.DiffID()
-			if err != nil {
-				return fmt.Errorf("while reading layer diffID: %w", err)
-			}
-			if diffID.String() != diffIDs[i] {
-				// The record must reference exactly what lands on disk.
-				return fmt.Errorf("layer %d diffID %s does not match config rootfs diffID %s", i, diffID, diffIDs[i])
-			}
+			// This is the config's claim. Unpack hashes the content to check
+			// it, since a remote layer's DiffID() would just repeat the config.
+			diffID := cfgFile.RootFS.DiffIDs[i]
 			dir, err := s.ensureLayer(gctx, diffID, layer)
 			if err != nil {
+				if errors.Is(err, errDiffIDMismatch) {
+					slog.WarnContext(gctx, "Image layer does not match its claimed diffID",
+						slog.String("ref", parsedRef.String()), slog.String("digest", digest.String()),
+						slog.String("diffid", diffID.String()), slog.Any("err", err))
+				}
 				return fmt.Errorf("while unpacking layer %s: %w", diffID, err)
 			}
 			layerDirs[i] = dir
 			// Each completed layer refreshes the record's mtime: a pull
-			// making progress stays fresh indefinitely; a wedged one ages
-			// into ordinary LRU eviction. The twin is not touched — the
-			// primary keeps the layers referenced, and the final rewrite
-			// recreates the twin if it ages out mid-pull.
+			// making progress stays fresh indefinitely. A wedged one can
+			// become a candidate, but its pins veto retiring any layer only
+			// it references, and the veto restores the record. The twin is
+			// not touched — the final rewrite recreates it if it ages out
+			// mid-pull.
 			s.touchRecord(digest)
 			return nil
 		})
@@ -618,8 +664,8 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	}
 
 	// Rewrite the record: eviction may legitimately remove it mid-pull
-	// (no progress for min-age reads as wedged), and success must never
-	// leave the just-unpacked layers unreferenced.
+	// (no progress for min-age reads as wedged), and the pins that kept
+	// the layers meanwhile lapse when this pull returns.
 	if err := s.writeRecord(digest, rec); err != nil {
 		return nil, fmt.Errorf("while rewriting image record after unpack: %w", err)
 	}
@@ -648,16 +694,53 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	return &Image{Digest: digest, Config: cfgFile.Config, LayerDirs: layerDirs}, nil
 }
 
+// pinLayers marks the layers as in use by an in-flight pull and returns the
+// matching unpin. Taken by each pull for all of its layers before any
+// ensureLayer call, outside the layer flight, so a pull that joins another
+// pull's flight is protected by its own pin once the leader's lapses.
+func (s *Store) pinLayers(hexes []string) (unpin func()) {
+	s.pinMu.Lock()
+	for _, hex := range hexes {
+		s.pins[hex]++
+	}
+	s.pinMu.Unlock()
+	return func() {
+		s.pinMu.Lock()
+		defer s.pinMu.Unlock()
+		for _, hex := range hexes {
+			if s.pins[hex]--; s.pins[hex] == 0 {
+				delete(s.pins, hex)
+			}
+		}
+	}
+}
+
+// pinned reports whether an in-flight pull holds the layer. A snapshot:
+// retirement checks under pinMu instead.
+func (s *Store) pinned(hex string) bool {
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	return s.pins[hex] > 0
+}
+
 // ensureLayer makes the unpacked tree for diffID present in the pool,
-// collapsing concurrent requests for the same layer across images.
+// collapsing concurrent requests for the same layer blob across images.
+//
+// The caller must hold a pin on the layer (see pinLayers) from before this
+// call until it no longer relies on the returned dir. The pin, not the
+// flight, is what keeps eviction from retiring the layer meanwhile.
 func (s *Store) ensureLayer(ctx context.Context, diffID v1.Hash, layer v1.Layer) (string, error) {
 	dir := s.layerDir(diffID)
-	_, err, _ := s.layerSF.Do(layerFlightKey(diffID.Hex), func() (any, error) {
+	// From the manifest: no network I/O.
+	blobDigest, err := layer.Digest()
+	if err != nil {
+		return "", fmt.Errorf("while reading layer blob digest: %w", err)
+	}
+	_, err, _ = s.layerSF.Do(layerFlightKey(diffID, blobDigest), func() (any, error) {
 		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err == nil {
-			// Refresh the dir mtime inside the flight: retireLayer re-checks
-			// the mtime in this same flight, so a layer reused here can
-			// never be renamed away between this stat and the image record
-			// that will re-reference it.
+			// Refresh the dir mtime so eviction's LRU order sees the reuse.
+			// The pull's pin, not this stamp, is what keeps the layer from
+			// being retired before the image record re-references it.
 			now := time.Now()
 			if err := os.Chtimes(dir, now, now); err != nil {
 				slog.WarnContext(ctx, "Failed to refresh layer mtime on reuse", slog.String("diffid", diffID.String()), slog.Any("err", err))
@@ -670,6 +753,14 @@ func (s *Store) ensureLayer(ctx context.Context, diffID v1.Hash, layer v1.Layer)
 		return "", err
 	}
 	return dir, nil
+}
+
+// layerFlightKey keys ensureLayer's flight by blob digest as well as
+// diffID. A caller that joins a flight gets the leader's result, so an
+// image that lies about a common layer's diffID leads its own flight and
+// fails only its own pull.
+func layerFlightKey(diffID, blobDigest v1.Hash) string {
+	return diffID.String() + "@" + blobDigest.String()
 }
 
 // unpackLayerToPool streams the layer (download → decompress → untar) into a
@@ -694,43 +785,42 @@ func (s *Store) unpackLayerToPool(ctx context.Context, diffID v1.Hash, layer v1.
 		return fmt.Errorf("while creating layer fs dir: %w", err)
 	}
 
-	rc, err := layer.Uncompressed()
-	if err != nil {
-		return fmt.Errorf("while opening layer stream: %w", err)
-	}
-	defer rc.Close()
-
 	root, err := os.OpenRoot(fsDir)
 	if err != nil {
 		return fmt.Errorf("while opening layer fs dir as os.Root: %w", err)
 	}
 	defer root.Close()
 
-	// The uncompressed tar stream is the recorded size: an optimistic
+	var layerMetadata *whiteoutSet
+	// The tar bytes untar read are the recorded size: an optimistic
 	// estimate (tar framing vs. block rounding), cheap to capture here.
-	cr := &countingReader{r: rc}
-	wh, err := unpackLayer(ctx, cr, root)
+	size, err := readVerifiedLayer(layer, diffID, func(r io.Reader) (err error) {
+		layerMetadata, err = unpackLayer(ctx, r, root)
+		return err
+	})
 	if err != nil {
+		// Returning before the rename discards the unpacked tree, so
+		// unverified content never enters the pool.
 		return err
 	}
 	// Non-fatal: a missing size file is recovered by layerSize's backfill,
 	// so a metadata write must not discard a successful unpack.
-	if err := os.WriteFile(filepath.Join(tmp, layerSizeFileName), []byte(strconv.FormatInt(cr.n, 10)+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, layerSizeFileName), []byte(strconv.FormatInt(size, 10)+"\n"), 0o600); err != nil {
 		slog.WarnContext(ctx, "Failed to record layer size; will backfill lazily",
 			slog.String("diffid", diffID.String()), slog.Any("err", err))
 	}
 
-	whBytes, err := json.Marshal(wh)
+	layerMetadataJSON, err := json.Marshal(layerMetadata)
 	if err != nil {
 		return fmt.Errorf("while encoding layer whiteouts: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(tmp, layerWhiteoutsFileName), whBytes, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, layerWhiteoutsFileName), layerMetadataJSON, 0o600); err != nil {
 		return fmt.Errorf("while writing layer whiteouts: %w", err)
 	}
 
 	if err := os.Rename(tmp, s.layerDir(diffID)); err != nil {
-		// A concurrent unpack (another process sharing the pool) may have won;
-		// its layer is as good as ours.
+		// A concurrent unpack (another flight for this diffID, or another
+		// process sharing the pool) may have won; its layer is as good as ours.
 		if _, statErr := os.Stat(filepath.Join(s.layerDir(diffID), layerFSDirName)); statErr == nil {
 			return nil
 		}
@@ -782,15 +872,48 @@ func (s *Store) remoteOpts(ctx context.Context, parsedRef name.Reference) []remo
 		remote.WithPlatform(platform),
 		remote.WithRetryBackoff(retryBackoffFor(registry)),
 	}
-	if s.authenticator != nil && registryUsesGCPAuth(registry) {
-		opts = append(opts, remote.WithAuth(s.authenticator))
-	}
 	return opts
 }
 
-func registryUsesGCPAuth(registry string) bool {
-	return registry == "gcr.io" || strings.HasSuffix(registry, ".gcr.io") ||
-		registry == "pkg.dev" || strings.HasSuffix(registry, ".pkg.dev")
+// withCredentials calls fetch with each credential until one succeeds, or
+// once anonymously if there are none.
+func (s *Store) withCredentials(ctx context.Context, parsedRef name.Reference, fetch func([]remote.Option) error) error {
+	opts := s.remoteOpts(ctx, parsedRef)
+	auths, err := s.credentials(ctx, parsedRef.Context())
+	if err != nil {
+		return fmt.Errorf("while resolving pull credentials: %w", err)
+	}
+	if len(auths) == 0 {
+		return fetch(opts)
+	}
+	var errs []error
+	for _, auth := range auths {
+		err := fetch(append(slices.Clip(opts), remote.WithAuth(auth)))
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
+		// Another credential cannot change the image's content.
+		if ctx.Err() != nil || errors.Is(err, errDiffIDMismatch) {
+			break
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Store) credentials(ctx context.Context, repo name.Repository) ([]authn.Authenticator, error) {
+	switch kc := s.keychain.(type) {
+	case nil:
+		return nil, nil
+	case CandidateKeychain:
+		return kc.Candidates(ctx, repo)
+	default:
+		auth, err := authn.Resolve(ctx, kc, repo)
+		if err != nil {
+			return nil, err
+		}
+		return []authn.Authenticator{auth}, nil
+	}
 }
 
 // parseRef applies the localhost-registry rewrite (kind local registries) and

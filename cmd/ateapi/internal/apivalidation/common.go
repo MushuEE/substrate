@@ -1,0 +1,125 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package apivalidation
+
+import (
+	"context"
+	"fmt"
+	"net/netip"
+
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+// ateDeepEqual is the deep-equal function declarative validation's generated
+// code calls by name; it delegates to resources.DeepEqual.
+func ateDeepEqual[T any](a, b T) bool {
+	return resources.DeepEqual(a, b)
+}
+
+// validateSingletonName requires the name of a singleton subresource to be
+// resources.SingletonName. An empty name is left to the required tag.
+func validateSingletonName(fldPath *field.Path, name string) field.ErrorList {
+	if name == "" || name == resources.SingletonName {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(fldPath, name, fmt.Sprintf("must be %q", resources.SingletonName)).WithOrigin("custom=default")}
+}
+
+// MakeCreateOp returns an operation.Operation for a create operation. If ctx
+// has opted-out of preview features, the returned operation will have all
+// preview gates disabled (see preview.Header).
+func MakeCreateOp(ctx context.Context) operation.Operation {
+	return operation.Operation{Type: operation.Create, Options: optionsFor(ctx)}
+}
+
+// MakeUpdateOp returns an operation.Operation for an update operation. If ctx
+// has opted-out of preview features, the returned operation will have all
+// preview gates disabled (see preview.Header).
+func MakeUpdateOp(ctx context.Context) operation.Operation {
+	return operation.Operation{Type: operation.Update, Options: optionsFor(ctx)}
+}
+
+// optionsFor returns the preview gates enabled for ctx.
+// The returned map MUST NOT be modified.
+func optionsFor(ctx context.Context) map[string]bool {
+	if preview.IsOptedOut(ctx) {
+		return preview.DisabledMap()
+	}
+	return preview.AsMap()
+}
+
+// ValidateCustom_ResourceMetadata checks the server-stamped timestamps: each,
+// when set, must be a valid google.protobuf.Timestamp, and update_time must
+// not precede create_time. Both fields are scrubbed from input, so a
+// violation here is a server stamping bug surfaced by the final-object
+// validation pass, not a client error.
+func ValidateCustom_ResourceMetadata(_ context.Context, _ operation.Operation, fldPath *field.Path, obj, _ *ateapi.ResourceMetadata) field.ErrorList {
+	var errs field.ErrorList
+	createTimeValid := false
+	if ct := obj.GetCreateTime(); ct != nil {
+		if err := ct.CheckValid(); err != nil {
+			errs = append(errs, field.Invalid(fldPath.Child("create_time"), ct.String(), err.Error()))
+		} else {
+			createTimeValid = true
+		}
+	}
+	if ut := obj.GetUpdateTime(); ut != nil {
+		if err := ut.CheckValid(); err != nil {
+			errs = append(errs, field.Invalid(fldPath.Child("update_time"), ut.String(), err.Error()))
+		} else if createTimeValid && ut.AsTime().Before(obj.GetCreateTime().AsTime()) {
+			errs = append(errs, field.Invalid(fldPath.Child("update_time"), ut.String(), "must not precede create_time"))
+		}
+	}
+	return errs
+}
+
+// validateDualStackIPs checks that each entry is a valid, canonical IP and
+// that the list holds at most one IPv4 and one IPv6 address, matching the
+// Kubernetes rule for pod IPs. Presence and length are enforced by tags.
+func validateDualStackIPs(fldPath *field.Path, ips []string) field.ErrorList {
+	var errs field.ErrorList
+	var seen4, seen6 bool
+	for i, ip := range ips {
+		idxPath := fldPath.Index(i)
+		if ipErrs := validation.IsValidIP(idxPath, ip); len(ipErrs) > 0 {
+			errs = append(errs, ipErrs...)
+			continue
+		}
+		seen := &seen6
+		if netip.MustParseAddr(ip).Is4() {
+			seen = &seen4
+		}
+		if *seen {
+			errs = append(errs, field.Invalid(idxPath, ip, "must not contain more than one address per IP family"))
+		}
+		*seen = true
+	}
+	return errs
+}
+
+// validateSPIFFEID checks that id is a SPIFFE ID. Presence and length are
+// enforced by tags.
+func validateSPIFFEID(fldPath *field.Path, id string) field.ErrorList {
+	if _, err := spiffeid.FromString(id); err != nil {
+		return field.ErrorList{field.Invalid(fldPath, id, err.Error())}
+	}
+	return nil
+}

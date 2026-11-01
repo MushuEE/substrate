@@ -19,12 +19,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/hardware"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -64,7 +65,7 @@ func recordActorCrash(ctx context.Context, attrs []attribute.KeyValue) {
 // used to seed zero-valued series). Worker counts are spatially summable (over
 // states = pool size, over pools = fleet), which is the UpDownCounter contract; a
 // gauge would be wrong for a value meant to be summed.
-func RegisterWorkerCount(meter metric.Meter, workers func() ([]*ateapipb.Worker, error), listPools func(labels.Selector) ([]*atev1alpha1.WorkerPool, error)) error {
+func RegisterWorkerCount(meter metric.Meter, workers func() ([]*ateapi.Worker, error), listPools func(labels.Selector) ([]*atev1.WorkerPool, error)) error {
 	counter, err := meter.Int64ObservableUpDownCounter(
 		workerpoolWorkersMetric,
 		metric.WithUnit("{worker}"),
@@ -82,27 +83,28 @@ func RegisterWorkerCount(meter metric.Meter, workers func() ([]*ateapipb.Worker,
 		}
 		type key struct{ namespace, pool, state, class string }
 		tally := make(map[key]int64)
-		// Seed both states at 0 for every known pool so a saturated or empty pool
+		// Seed every state at 0 for every known pool so a saturated or empty pool
 		// reports 0, not an absent series that breaks idle==0 alerts. A failed
 		// list just means no seeding this cycle, not a broken observation.
 		if pools, err := listPools(labels.Everything()); err == nil {
 			for _, p := range pools {
-				class := string(p.Spec.SandboxClass)
+				class := string(p.Spec.DefaultSandboxClass())
 				if class == "" {
-					class = string(atev1alpha1.SandboxClassGvisor)
+					class = string(atev1.SandboxClassGvisor)
 				}
-				tally[key{p.Namespace, p.Name, ateattr.WorkerStateIdle, class}] = 0
-				tally[key{p.Namespace, p.Name, ateattr.WorkerStateAssigned, class}] = 0
+				for _, state := range workerStates {
+					tally[key{p.Namespace, p.Name, state, class}] = 0
+				}
 			}
 		}
 		for _, w := range ws {
-			// Occupancy comes from the allocation total rather than the
-			// assignment list, which a listed worker does not carry.
-			state := ateattr.WorkerStateIdle
-			if w.GetStatus().GetAllocated().GetActors() > 0 {
-				state = ateattr.WorkerStateAssigned
-			}
-			tally[key{w.GetWorkerNamespace(), w.GetWorkerPool(), state, w.GetSandboxClass()}]++
+			state := workerState(w)
+			// A Worker has no sandbox class until its worker registers with
+			// WorkerService. Report it as unknown, not as the pool's class: the
+			// scheduler puts no actor on a worker that offers no class, thus
+			// the pool's series must not count it as free capacity.
+			class := ateattr.NormalizeSandboxClass(hardware.SandboxClass(w.GetStatus()))
+			tally[key{w.GetWorkerNamespace(), w.GetWorkerPool(), state, class}]++
 		}
 		for k, n := range tally {
 			o.ObserveInt64(counter, n, metric.WithAttributes(
@@ -118,6 +120,30 @@ func RegisterWorkerCount(meter metric.Meter, workers func() ([]*ateapipb.Worker,
 		return fmt.Errorf("register %s callback: %w", workerpoolWorkersMetric, err)
 	}
 	return nil
+}
+
+var workerStates = []string{
+	ateattr.WorkerStateIdle,
+	ateattr.WorkerStatePartial,
+	ateattr.WorkerStateAtCapacity,
+	ateattr.WorkerStateUnschedulable,
+}
+
+// workerState counts actor slots only. A capacity not yet reported is
+// unschedulable, not full.
+func workerState(w *ateapi.Worker) string {
+	capacity := w.GetStatus().GetCapacity().GetActors()
+	if w.GetStatus().GetState() != ateapi.WorkerState_WORKER_STATE_ACTIVE || capacity <= 0 {
+		return ateattr.WorkerStateUnschedulable
+	}
+	switch allocated := w.GetStatus().GetAllocated().GetActors(); {
+	case allocated <= 0:
+		return ateattr.WorkerStateIdle
+	case allocated < capacity:
+		return ateattr.WorkerStatePartial
+	default:
+		return ateattr.WorkerStateAtCapacity
+	}
 }
 
 // Instruments holds ateapi's actor-lifecycle and scheduler duration histograms.
@@ -136,7 +162,7 @@ func NewInstruments(meter metric.Meter) (*Instruments, error) {
 	lifecycleOpDuration, err := meter.Float64Histogram(
 		lifecycleOpDurationMetric,
 		metric.WithUnit("s"),
-		metric.WithDescription("Duration of an actor lifecycle operation (create, resume, suspend, pause, delete) handled by ateapi."),
+		metric.WithDescription("Duration of an actor lifecycle operation (create, resume, suspend, delete, revert) handled by ateapi."),
 		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1, 2.5, 5, 10, 30),
 	)
 	if err != nil {
@@ -160,7 +186,7 @@ func NewInstruments(meter metric.Meter) (*Instruments, error) {
 }
 
 // recordLifecycleOp records op's duration. A non-nil err is classified onto
-// error.type via its gRPC status code; error.type's absence marks success, so
+// error.type as the code the caller gets; error.type's absence marks success, so
 // there is no parallel failure counter. extraAttrs carries the per-operation
 // dimensions (template, pool, class, snapshot kind).
 func (i *Instruments) recordLifecycleOp(ctx context.Context, op string, start time.Time, err error, extraAttrs ...attribute.KeyValue) {
@@ -171,44 +197,53 @@ func (i *Instruments) recordLifecycleOp(ctx context.Context, op string, start ti
 	attrs = append(attrs, ateattr.ActorOperationNameKey.String(op))
 	attrs = append(attrs, extraAttrs...)
 	if err != nil {
-		attrs = append(attrs, ateattr.ErrorTypeKey.String(status.Code(err).String()))
+		attrs = append(attrs, ateattr.ErrorTypeKey.String(apierror.Code(err).String()))
 	}
 	i.lifecycleOpDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attrs...))
 }
 
-// lifecycleOpAttrs builds the resume/suspend/pause dimensions from workflow
-// state. Nil-safe, and omits the pool, snapshot-kind and snapshot-scope labels
-// until they are known so a failure before the assign/restore steps never emits
-// an empty-string series. snapshotKind is empty for suspend/pause, which do not
-// restore; snapshotScope applies to all three and is what separates a restore
-// combined with the template's golden state from a plain one of the same kind.
+// lifecycleOpAttrs builds the resume/suspend/revert dimensions from
+// workflow state. Nil-safe, and omits the template, pool, sandbox-class,
+// snapshot-kind and snapshot-fidelity labels until they are known so a failure
+// before the load/assign/restore steps never emits an empty-string series.
+// snapshotKind is empty for suspend, which does not restore; snapshotScope
+// applies to resume and suspend and separates a full restore from a data-only
+// one of the same kind.
 // The pool keys are set together or not at all; see ateattr.WorkerPoolAttributes.
-func lifecycleOpAttrs(actor *ateapipb.Actor, template *ateapipb.ActorTemplate, snapshotKind, snapshotScope string) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		ateattr.TemplateNameKey.String(actor.GetActorTemplate().GetName()),
-		ateattr.TemplateAtespaceKey.String(actor.GetActorTemplate().GetAtespace()),
+func lifecycleOpAttrs(actor *ateapi.Actor, snapshotKind, snapshotScope string) []attribute.KeyValue {
+	var attrs []attribute.KeyValue
+	if actor != nil {
+		attrs = append(attrs,
+			ateattr.TemplateNameKey.String(actor.GetActorTemplate().GetName()),
+			ateattr.TemplateAtespaceKey.String(actor.GetActorTemplate().GetAtespace()),
+		)
 	}
 	ass := actor.GetStatus().GetWorkerAssignment()
 	attrs = append(attrs, ateattr.WorkerPoolAttributes(ass.GetWorkerNamespace(), ass.GetWorkerPool())...)
-	if template != nil {
-		attrs = append(attrs, ateattr.SandboxClassKey.String(sandboxClassString(template.GetSandboxConfig().GetSandboxClass())))
+	class := ass.GetSandboxRuntime().GetSandboxClass()
+	if class == "" {
+		class = snapshotAtLatestGeneration(actor.GetStatus()).GetSandboxRuntime().GetSandboxClass()
+	}
+	if class != "" {
+		attrs = append(attrs, ateattr.SandboxClassAttribute(class))
 	}
 	if snapshotKind != "" {
 		attrs = append(attrs, ateattr.SnapshotKindKey.String(snapshotKind))
 	}
 	if snapshotScope != "" {
-		attrs = append(attrs, ateattr.SnapshotScopeKey.String(snapshotScope))
+		attrs = append(attrs, ateattr.SnapshotFidelityKey.String(snapshotScope))
 	}
 	return attrs
 }
 
 // recordSchedulerAssignment records one assignment attempt. pool is set only
 // when a worker was assigned and error.type only for the Error outcome, so
-// no_free_worker (a capacity signal, not a failure) carries neither. class is
-// set on every outcome it is known for, so no_free_worker names the capacity
+// no_capacity (a capacity signal, not a failure) carries neither. class is
+// set on every outcome it is known for, so no_capacity names the capacity
 // that ran out and stays comparable with assigned.
 // The pool keys are set together or not at all; see ateattr.WorkerPoolAttributes.
-func (i *Instruments) recordSchedulerAssignment(ctx context.Context, start time.Time, outcome, poolNamespace, pool, class string, err error) {
+// elapsed is the time that the attempt took.
+func (i *Instruments) recordSchedulerAssignment(ctx context.Context, elapsed time.Duration, outcome, poolNamespace, pool, class string, err error) {
 	if i == nil || i.schedulerAssignmentDuration == nil {
 		return
 	}
@@ -216,10 +251,10 @@ func (i *Instruments) recordSchedulerAssignment(ctx context.Context, start time.
 	attrs = append(attrs, ateattr.SchedulerOutcomeKey.String(outcome))
 	attrs = append(attrs, ateattr.WorkerPoolAttributes(poolNamespace, pool)...)
 	if class != "" {
-		attrs = append(attrs, ateattr.SandboxClassKey.String(class))
+		attrs = append(attrs, ateattr.SandboxClassAttribute(class))
 	}
 	if outcome == ateattr.SchedulerOutcomeError && err != nil {
-		attrs = append(attrs, ateattr.ErrorTypeKey.String(status.Code(err).String()))
+		attrs = append(attrs, ateattr.ErrorTypeKey.String(apierror.Code(err).String()))
 	}
-	i.schedulerAssignmentDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attrs...))
+	i.schedulerAssignmentDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(attrs...))
 }

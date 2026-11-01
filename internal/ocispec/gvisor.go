@@ -15,55 +15,53 @@
 package ocispec
 
 import (
-	"slices"
+	"path/filepath"
 
-	"github.com/agent-substrate/substrate/internal/sizing"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
-// PauseContainer is the name of the sandbox root container.
-const PauseContainer = "pause"
-
-// resolvConf is the host resolver config bound into the sandbox.
-const resolvConf = "/etc/resolv.conf"
+// SandboxID is the runsc ID of the sandbox. runsc creates it with
+// -no-root-container, so it has no process and no rootfs. The underscore
+// keeps it outside the k8s-short-name an ActorTemplate container
+// name is drawn from, so no actor container can collide with it.
+const SandboxID = "_sandbox"
 
 // GVisorOptions describes the gVisor-specific context of one actor container.
 type GVisorOptions struct {
 	ActorUID      string
+	ActorDirs     *ateworkerpb.ActorDirs
 	ContainerName string
-	// DurableVolumes are declared on the sandbox (pause) spec only.
+	// DurableVolumes are declared on the sandbox spec only.
 	DurableVolumes []string
 	// Size sizes the container's cgroup leaf. Only gVisor applies it; a micro-VM
 	// container's limits come from its own declared resources (see sizing).
 	Size sizing.SandboxSize
 }
 
-// ShapeGVisor adds runsc CRI annotations, durable-dir mount hints, host
-// resolv.conf, and per-container cgroups to the spec. It is idempotent.
+// GVisorCgroupLeaf names an actor container's cgroup relative to the pod scope.
+func GVisorCgroupLeaf(actorUID, containerName string) string {
+	return actorUID + "-" + containerName
+}
+
+// ShapeGVisor adds runsc CRI annotations, durable-dir mount hints, and
+// per-container cgroups to the spec. It is idempotent.
 func ShapeGVisor(spec *specs.Spec, o GVisorOptions) {
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
 	spec.Annotations["io.kubernetes.cri.container-name"] = o.ContainerName
-	if o.ContainerName == PauseContainer {
+	if o.ContainerName == SandboxID {
 		spec.Annotations["io.kubernetes.cri.container-type"] = "sandbox"
+		for _, v := range o.DurableVolumes {
+			spec.Annotations["dev.gvisor.spec.mount."+v+".type"] = "tmpfs"
+			spec.Annotations["dev.gvisor.spec.mount."+v+".share"] = "container"
+			spec.Annotations["dev.gvisor.spec.mount."+v+".source"] = filepath.Join(o.ActorDirs.GetDurableDirVolumeMountsDir(), v)
+		}
 	} else {
 		spec.Annotations["io.kubernetes.cri.container-type"] = "container"
-		spec.Annotations["io.kubernetes.cri.sandbox-id"] = PauseContainer
-	}
-
-	// Insert resolv.conf before any volume bind mounts.
-	if !slices.ContainsFunc(spec.Mounts, func(m specs.Mount) bool { return m.Destination == resolvConf }) {
-		i := slices.IndexFunc(spec.Mounts, func(m specs.Mount) bool { return m.Type == "bind" })
-		if i < 0 {
-			i = len(spec.Mounts)
-		}
-		spec.Mounts = slices.Insert(spec.Mounts, i, specs.Mount{
-			Destination: resolvConf,
-			Type:        "bind",
-			Source:      resolvConf,
-			Options:     []string{"ro"},
-		})
+		spec.Annotations["io.kubernetes.cri.sandbox-id"] = SandboxID
 	}
 
 	if spec.Linux == nil {
@@ -71,7 +69,7 @@ func ShapeGVisor(spec *specs.Spec, o GVisorOptions) {
 	}
 	// Set a colon-free default cgroupsPath relative to the pod scope.
 	if spec.Linux.CgroupsPath == "" {
-		spec.Linux.CgroupsPath = "/" + o.ContainerName
+		spec.Linux.CgroupsPath = "/" + GVisorCgroupLeaf(o.ActorUID, o.ContainerName)
 	}
 	o.Size.ApplyToOCISpec(spec)
 }

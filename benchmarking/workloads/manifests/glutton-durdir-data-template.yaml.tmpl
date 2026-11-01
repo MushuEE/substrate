@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for the
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for the
 # glutton-durdir-data benchmark workload, created through the ate API by
 # workloads/deploy.sh. Suspend uploads ONLY the durable dir (DATA-scope
 # commit); resume from it is a cold boot.
@@ -21,10 +21,10 @@ metadata:
   name: glutton-durdir-data
 workerSelector:
   matchLabels:
-    workload: benchmark-ateom
+    workload: benchmark-worker
 containers:
 - name: glutton
-  image: ko://github.com/agent-substrate/substrate/cmd/benchmarking/glutton
+  image: ko://go.ate.dev/substrate/cmd/benchmarking/glutton
   command:
   - "/ko-app/glutton"
   - "--grpc-listen-addr=:80"
@@ -33,7 +33,7 @@ containers:
   - "--mode=http"
   # Data-scope resume is a cold boot; without this the router can reach the
   # sandbox before glutton is listening.
-  readyz:
+  wakeupProbe:
     httpGet:
       path: /readyz
       port: 80
@@ -43,12 +43,10 @@ containers:
 volumes:
 - name: data
   durableDir: {}
-snapshotsConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_DATA
-  onResume:
-    fromData: RESUME_SOURCE_COLD_BOOT
-  storageLocation: gs://${BUCKET_NAME}/benchmark-workloads/glutton-durdir-data/
-sandboxConfig:
-  sandboxClass: ${SANDBOX_CLASS_ENUM}
-  configName: ${SANDBOX_CONFIG_NAME}
+# Sandbox size: see the note on the sleep template.
+resources:
+  limits:
+    cpuMillicores: "${ACTOR_CPU_MILLICORES}"
+    memoryBytes: "${ACTOR_MEMORY_BYTES}"
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_VOLUMES

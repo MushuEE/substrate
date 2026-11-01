@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 var (
@@ -39,6 +39,11 @@ var (
 
 	// ErrFailedPrecondition indicates the object is not in the required state for the operation.
 	ErrFailedPrecondition = errors.New("persistence: failed precondition")
+
+	// ErrWorkerNotFound indicates BindActorToWorker found no Worker to bind
+	// to. It is distinct from ErrNotFound, which the bind returns for a
+	// missing Actor.
+	ErrWorkerNotFound = errors.New("persistence: worker not found")
 
 	// ErrLeaseConflict indicates that a distributed lease is already held by another client.
 	ErrLeaseConflict = errors.New("persistence: lease conflict")
@@ -70,14 +75,14 @@ type Interface interface {
 	// server-assigned metadata (uid, version, timestamps). The input is not
 	// mutated. Returns ErrAlreadyExists if key is taken, or
 	// ErrFailedPrecondition if the actor's atespace does not exist.
-	CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error)
+	CreateActor(ctx context.Context, actor *ateapi.Actor) (*ateapi.Actor, error)
 
 	// Fetches an actor by reference. Returns ErrNotFound if missing.
-	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
+	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, error)
 
 	// Lists actors in the given atespace (scoped scan), or across ALL atespaces if atespace is
 	// empty.
-	ListActors(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapipb.Actor], error)
+	ListActors(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapi.Actor], error)
 
 	// UpdateActor performs a transactional read-modify-write and returns the stored
 	// actor with advanced metadata (version, update_time).
@@ -98,44 +103,49 @@ type Interface interface {
 	// exhausted, or the mutate's error verbatim otherwise. Immutable fields
 	// are not checked here; the service layer enforces them via declarative
 	// validation before the write.
-	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapipb.Actor) error) (*ateapipb.Actor, error)
+	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
+
+	// MarkActorForDeletion initiates the deletion of an actor. It sets
+	// metadata.delete_time if unset and applies mutate, if non-nil, so callers can
+	// update the actor's status. Returns ErrNotFound if missing,
+	// ErrUIDConflict/ErrVersionConflict if precondition fails or a concurrent
+	// write wins, or mutate's error.
+	MarkActorForDeletion(ctx context.Context, actorRef resources.ActorRef, precondition DeletePreconditions, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 
 	// Removes an actor and returns the deleted resource. Returns ErrNotFound if
-	// missing, or ErrFailedPrecondition if not already deleting.
-	DeleteActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
+	// missing, ErrUIDConflict/ErrVersionConflict if precondition does not
+	// describe the actor the caller observed, or ErrFailedPrecondition if the
+	// actor's status.worker_assignment is set.
+	DeleteActor(ctx context.Context, actorRef resources.ActorRef, precondition DeletePreconditions) (*ateapi.Actor, error)
 
 	// Creates the 1:1 policy subresource for an existing Actor.
-	CreateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, policy *ateapipb.EgressPolicy) (*ateapipb.EgressPolicy, error)
+	CreateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, policy *ateapi.EgressPolicy) (*ateapi.EgressPolicy, error)
 	// Fetches an Actor's policy subresource.
-	GetEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.EgressPolicy, error)
+	GetEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapi.EgressPolicy, error)
 	// Transactionally updates an Actor's policy when its current UID and version
 	// match the precondition.
-	UpdateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(*ateapipb.EgressPolicy) error) (*ateapipb.EgressPolicy, error)
-	// Deletes and returns an Actor's policy subresource.
-	DeleteEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.EgressPolicy, error)
+	UpdateEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(*ateapi.EgressPolicy) error) (*ateapi.EgressPolicy, error)
+	// Deletes and returns an Actor's policy subresource. Returns ErrNotFound if
+	// missing, or ErrUIDConflict/ErrVersionConflict if precondition does not
+	// describe the policy the caller observed.
+	DeleteEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition DeletePreconditions) (*ateapi.EgressPolicy, error)
 
-	// Creates an immutable ActorSnapshot. The caller sets snapshot_uri; the
-	// store keeps no location of its own.
-	CreateActorSnapshot(ctx context.Context, snapshot *ateapipb.ActorSnapshot) (*ateapipb.ActorSnapshot, error)
-
-	// Fetches an ActorSnapshot by reference. Returns ErrNotFound if missing.
-	GetActorSnapshot(ctx context.Context, snapshotRef resources.ActorSnapshotRef) (*ateapipb.ActorSnapshot, error)
-
-	// Lists ActorSnapshots in one atespace, or all atespaces when empty.
-	ListActorSnapshots(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapipb.ActorSnapshot], error)
-
-	// Adds an immutable Atespace-owned tag to the ActorSnapshot addressed by
-	// snapshotRef. Returns ErrNotFound if the snapshot does not exist, or
+	// CreateTag creates an immutable tag to an actor snapshot.
+	//
+	// Returns ErrAlreadyExists if the name is taken — including by the caller's
+	// own unfinished attempt, which it can then read back and resume — or
 	// ErrFailedPrecondition if the tag's atespace does not exist.
-	CreateActorSnapshotTag(ctx context.Context, snapshotRef resources.ActorSnapshotRef, tag *ateapipb.ActorSnapshotTag) (*ateapipb.ActorSnapshotTag, error)
+	CreateTag(ctx context.Context, tag *ateapi.Tag) (*ateapi.Tag, error)
 
 	// Fetches an Atespace-owned tag by reference. Returns ErrNotFound if
-	// missing. The tag's snapshot field names the ActorSnapshot it resolves
-	// to; fetch it with GetActorSnapshot if needed.
-	GetActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef) (*ateapipb.ActorSnapshotTag, error)
+	// missing.
+	GetTag(ctx context.Context, tagRef resources.TagRef) (*ateapi.Tag, error)
 
-	// UpdateActorSnapshotTag performs a transactional read-modify-write on the tag
-	// addressed by tagRef, and returns the stored ActorSnapshotTag with
+	// Lists Tags in one atespace, or all atespaces when empty.
+	ListTags(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapi.Tag], error)
+
+	// UpdateTag performs a transactional read-modify-write on the tag
+	// addressed by tagRef, and returns the stored Tag with
 	// advanced metadata (version, update_time).
 	//
 	// precondition guards the write against landing on unexpected state: it is
@@ -153,38 +163,71 @@ type Interface interface {
 	// precondition no longer holds, ErrVersionConflict if the retry budget is
 	// exhausted, ErrImmutableField if the mutated tag changed a field that is
 	// immutable for its lifetime, or the mutate's error verbatim otherwise.
-	UpdateActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef, precondition Precondition, mutate func(toUpdate *ateapipb.ActorSnapshotTag) error) (*ateapipb.ActorSnapshotTag, error)
+	//
+	// status.snapshot is immutable once set
+	UpdateTag(ctx context.Context, tagRef resources.TagRef, precondition Precondition, mutate func(toUpdate *ateapi.Tag) error) (*ateapi.Tag, error)
 
-	// Deletes and returns a tag.
-	DeleteActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef) (*ateapipb.ActorSnapshotTag, error)
+	// MarkTagForDeletion initiates the deletion of a tag. It sets
+	// metadata.delete_time if unset and applies mutate, if non-nil, so callers can
+	// update the tag's status. Returns ErrNotFound if missing,
+	// ErrUIDConflict/ErrVersionConflict if precondition fails or a concurrent
+	// write wins, or mutate's error.
+	MarkTagForDeletion(ctx context.Context, tagRef resources.TagRef, precondition DeletePreconditions, mutate func(toUpdate *ateapi.Tag) error) (*ateapi.Tag, error)
+
+	// Deletes and returns a tag. Returns ErrNotFound if missing, or
+	// ErrUIDConflict/ErrVersionConflict if precondition does not describe the
+	// tag the caller observed.
+	DeleteTag(ctx context.Context, tagRef resources.TagRef, precondition DeletePreconditions) (*ateapi.Tag, error)
 
 	// Stores a new atespace and returns the stored resource with server-assigned
 	// metadata (uid, version, timestamps). The input is not mutated. Returns
 	// ErrAlreadyExists if the name is taken.
-	CreateAtespace(ctx context.Context, atespace *ateapipb.Atespace) (*ateapipb.Atespace, error)
+	CreateAtespace(ctx context.Context, atespace *ateapi.Atespace) (*ateapi.Atespace, error)
 
 	// Fetches an atespace by name. Returns ErrNotFound if missing.
-	GetAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
+	GetAtespace(ctx context.Context, name string) (*ateapi.Atespace, error)
 
 	// Lists atespaces.
-	ListAtespaces(ctx context.Context, opts ListOptions) (ListResponse[*ateapipb.Atespace], error)
+	ListAtespaces(ctx context.Context, opts ListOptions) (ListResponse[*ateapi.Atespace], error)
 
 	// Removes an empty atespace and returns the deleted resource. Returns
-	// ErrNotFound if missing, or ErrFailedPrecondition if the atespace is not empty
-	// (e.g. there are actors in it).
-	DeleteAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error)
+	// ErrNotFound if missing, ErrUIDConflict/ErrVersionConflict if precondition
+	// does not describe the atespace the caller observed, or
+	// ErrFailedPrecondition if the atespace is not empty (e.g. there are actors
+	// in it).
+	DeleteAtespace(ctx context.Context, name string, precondition DeletePreconditions) (*ateapi.Atespace, error)
+
+	// Creates the deployment-wide global access policy singleton.
+	CreateGlobalAccessPolicy(ctx context.Context, policy *ateapi.AccessPolicy) (*ateapi.AccessPolicy, error)
+	// Fetches the deployment-wide global access policy singleton.
+	GetGlobalAccessPolicy(ctx context.Context) (*ateapi.AccessPolicy, error)
+	// Transactionally updates the deployment-wide global access policy singleton
+	// when its current UID and version match the precondition.
+	UpdateGlobalAccessPolicy(ctx context.Context, precondition Precondition, mutate func(*ateapi.AccessPolicy) error) (*ateapi.AccessPolicy, error)
+
+	// Creates the 1:1 access policy subresource for an existing Atespace.
+	CreateAtespaceAccessPolicy(ctx context.Context, name string, policy *ateapi.AccessPolicy) (*ateapi.AccessPolicy, error)
+	// Fetches an Atespace's access policy subresource. Returns ErrNotFound if missing.
+	GetAtespaceAccessPolicy(ctx context.Context, name string) (*ateapi.AccessPolicy, error)
+	// Transactionally updates an Atespace's access policy when its current UID
+	// and version match the precondition.
+	UpdateAtespaceAccessPolicy(ctx context.Context, name string, precondition Precondition, mutate func(*ateapi.AccessPolicy) error) (*ateapi.AccessPolicy, error)
+	// Deletes and returns an Atespace's access policy subresource. Returns
+	// ErrNotFound if missing, or ErrUIDConflict/ErrVersionConflict if
+	// precondition does not describe the policy the caller observed.
+	DeleteAtespaceAccessPolicy(ctx context.Context, name string, precondition DeletePreconditions) (*ateapi.AccessPolicy, error)
 
 	// Stores a new ActorTemplate and returns the stored resource with
 	// server-assigned metadata (uid, version, timestamps). The input is not
 	// mutated. Returns ErrAlreadyExists if the (atespace, name) is taken.
-	CreateActorTemplate(ctx context.Context, template *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error)
+	CreateActorTemplate(ctx context.Context, template *ateapi.ActorTemplate) (*ateapi.ActorTemplate, error)
 
 	// Fetches an ActorTemplate by reference. Returns ErrNotFound if missing.
-	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
+	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapi.ActorTemplate, error)
 
 	// Lists ActorTemplates in an atespace, or across all atespaces when
 	// atespace is empty.
-	ListActorTemplates(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapipb.ActorTemplate], error)
+	ListActorTemplates(ctx context.Context, atespace string, opts ListOptions) (ListResponse[*ateapi.ActorTemplate], error)
 
 	// UpdateActorTemplate performs a transactional read-modify-write and returns
 	// the updated template with advanced metadata (version, update_time).
@@ -192,22 +235,30 @@ type Interface interface {
 	// precondition guards the write against landing on unexpected state: it is
 	// checked against the stored template before mutate runs. Both the uid and
 	// version guards are required.
-	UpdateActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition Precondition, mutate func(dbTemplate *ateapipb.ActorTemplate) error) (*ateapipb.ActorTemplate, error)
+	UpdateActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition Precondition, mutate func(dbTemplate *ateapi.ActorTemplate) error) (*ateapi.ActorTemplate, error)
+
+	// MarkActorTemplateForDeletion initiates the deletion of an actor
+	// template. It sets metadata.delete_time if unset and applies mutate, if
+	// non-nil, so callers can update the template's status. Returns ErrNotFound
+	// if missing, ErrUIDConflict/ErrVersionConflict if precondition fails or a
+	// concurrent write wins, or mutate's error.
+	MarkActorTemplateForDeletion(ctx context.Context, templateRef resources.ActorTemplateRef, precondition DeletePreconditions, mutate func(toUpdate *ateapi.ActorTemplate) error) (*ateapi.ActorTemplate, error)
 
 	// Removes an ActorTemplate and returns the deleted resource. Returns
-	// ErrNotFound if missing.
-	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
+	// ErrNotFound if missing, or ErrUIDConflict/ErrVersionConflict if
+	// precondition does not describe the template the caller observed.
+	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition DeletePreconditions) (*ateapi.ActorTemplate, error)
 
 	// Registers a new idle worker and returns the stored resource with
 	// server-assigned metadata (uid, version, timestamps). The input is not
 	// mutated. Returns ErrAlreadyExists if already registered.
-	CreateWorker(ctx context.Context, worker *ateapipb.Worker) (*ateapipb.Worker, error)
+	CreateWorker(ctx context.Context, worker *ateapi.Worker) (*ateapi.Worker, error)
 
 	// Fetches worker state by name. Returns ErrNotFound if missing.
-	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)
+	GetWorker(ctx context.Context, name string) (*ateapi.Worker, error)
 
 	// Lists workers.
-	ListWorkers(ctx context.Context, opts ListOptions) (ListResponse[*ateapipb.Worker], error)
+	ListWorkers(ctx context.Context, opts ListOptions) (ListResponse[*ateapi.Worker], error)
 
 	// UpdateWorker performs a transactional read-modify-write and returns the
 	// stored worker with advanced metadata (version, update_time).
@@ -220,44 +271,55 @@ type Interface interface {
 	// ErrNotFound if missing, ErrUIDConflict or ErrVersionConflict if the
 	// precondition no longer holds, ErrVersionConflict if the retry budget is
 	// exhausted, or the mutate's error verbatim otherwise.
-	UpdateWorker(ctx context.Context, name string, precondition Precondition, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error)
+	UpdateWorker(ctx context.Context, name string, precondition Precondition, mutate func(toUpdate *ateapi.Worker) error) (*ateapi.Worker, error)
 
-	// Removes a worker by name, along with every assignment it holds, and
-	// returns the deleted resource. Returns ErrNotFound if missing, or
-	// ErrUIDConflict/ErrVersionConflict if pre does not describe the worker the
-	// caller observed.
-	DeleteWorker(ctx context.Context, name string, pre DeletePreconditions) (*ateapipb.Worker, error)
+	// MarkWorkerForDeletion initiates the deletion of a worker. It sets
+	// metadata.delete_time if unset and applies mutate, if non-nil, so callers can
+	// update the worker's status. Returns ErrNotFound if missing,
+	// ErrUIDConflict/ErrVersionConflict if precondition fails or a concurrent
+	// write wins, or mutate's error.
+	MarkWorkerForDeletion(ctx context.Context, name string, precondition DeletePreconditions, mutate func(toUpdate *ateapi.Worker) error) (*ateapi.Worker, error)
 
-	// Assignments and Worker allocation are updated atomically.
+	// Removes a worker by name and returns the deleted resource. Returns
+	// ErrNotFound if missing, ErrUIDConflict/ErrVersionConflict if
+	// precondition does not describe the worker the caller observed, or
+	// ErrFailedPrecondition if the worker still holds an assignment.
+	DeleteWorker(ctx context.Context, name string, precondition DeletePreconditions) (*ateapi.Worker, error)
 
-	// BindActorToWorker assigns an Actor and updates the Worker's allocation.
-	// Rebinding the same Actor replaces its assignment.
+	// An assignment is written only together with its Actor, and Worker
+	// allocation moves with it, so an Actor names a Worker in
+	// status.worker_assignment exactly while the Worker holds its assignment.
+	// DeleteWorker refuses while the Worker holds an assignment, and
+	// DeleteActor while the Actor names a Worker.
+
+	// BindActorToWorker assigns an Actor, updates the Worker's allocation, and
+	// applies mutate to the Actor as UpdateActor does, all in one transaction.
+	// It returns the updated Actor. precondition must name the assignment's
+	// Actor, and mutate should point the Actor at the Worker.
 	//
 	// admit decides whether the Worker will take the Actor, and runs against the
 	// Worker as it stands with its row locked, so the answer cannot go stale
 	// between the check and the bind. Returning an error from it refuses the
-	// bind and is returned unchanged. It is consulted only for a new binding: an
-	// Actor already on this Worker is already counted against it.
+	// bind and is returned unchanged.
 	//
-	// ErrNotFound if the Worker is gone.
-	BindActorToWorker(ctx context.Context, workerName string, assignment *ateapipb.ActorAssignment, admit func(*ateapipb.Worker) error) error
+	// ErrWorkerNotFound if the Worker is gone, ErrNotFound if the Actor is, and
+	// ErrUIDConflict/ErrVersionConflict if precondition fails. Binding an Actor
+	// that is already bound is an error. Any error leaves both unchanged.
+	BindActorToWorker(ctx context.Context, workerName string, assignment *ateapi.ActorAssignment, admit func(*ateapi.Worker) error, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 
-	// ReleaseActorFromWorker removes an assignment and updates allocation,
-	// returning the Worker as it now stands so the caller can feed the
-	// watch-fed cache, which until then reports it full. It returns nil if the
-	// assignment was already absent.
-	ReleaseActorFromWorker(ctx context.Context, workerName string, actorUID string) (*ateapipb.Worker, error)
+	// UpdateActorAndRelease applies mutate to the Actor as UpdateActor does
+	// and, in the same transaction, removes the assignment of the Actor
+	// precondition names, on whichever Worker holds it, if any. mutate should
+	// clear the Actor's worker assignment. It returns the updated Actor. Any
+	// error leaves both unchanged.
+	UpdateActorAndRelease(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 
 	// GetWorkerAssignment returns a Worker's assignment for actorUID, or
 	// ErrNotFound when the Worker is not hosting that Actor.
-	GetWorkerAssignment(ctx context.Context, workerName, actorUID string) (*ateapipb.ActorAssignment, error)
+	GetWorkerAssignment(ctx context.Context, workerName, actorUID string) (*ateapi.ActorAssignment, error)
 
 	// ListWorkerAssignments returns a page of the Actors a Worker hosts.
-	ListWorkerAssignments(ctx context.Context, workerName string, opts ListOptions) (ListResponse[*ateapipb.ActorAssignment], error)
-
-	// FindWorkerHostingActor names the Worker holding an assignment for
-	// actorUID, or ErrNotFound if none does.
-	FindWorkerHostingActor(ctx context.Context, actorUID string) (string, error)
+	ListWorkerAssignments(ctx context.Context, workerName string, opts ListOptions) (ListResponse[*ateapi.ActorAssignment], error)
 
 	// WatchWorkers returns an active subscription to track worker state changes.
 	// The watch's Events channel is closed when the caller calls Close, the
@@ -301,7 +363,7 @@ type DeletePreconditions struct {
 //
 // Returns ErrUIDConflict or ErrVersionConflict, which the delete surfaces
 // verbatim.
-func (p DeletePreconditions) Check(md *ateapipb.ResourceMetadata) error {
+func (p DeletePreconditions) Check(md *ateapi.ResourceMetadata) error {
 	if p.UID != "" && p.UID != md.GetUid() {
 		return ErrUIDConflict
 	}
@@ -314,7 +376,7 @@ func (p DeletePreconditions) Check(md *ateapipb.ResourceMetadata) error {
 // hasResourceMetadata is an object the store addresses by atespace and name,
 // and whose identity a caller can guard with a Precondition.
 type hasResourceMetadata interface {
-	GetMetadata() *ateapipb.ResourceMetadata
+	GetMetadata() *ateapi.ResourceMetadata
 }
 
 // PreconditionFrom builds the guards from the object the caller observed: its
@@ -339,7 +401,7 @@ func (p Precondition) Validate() error {
 
 // Check reports whether md still matches the guards p carries. The uid is reported
 // first: a new incarnation makes the version meaningless.
-func (p Precondition) Check(md *ateapipb.ResourceMetadata) error {
+func (p Precondition) Check(md *ateapi.ResourceMetadata) error {
 	if p.UID != md.GetUid() {
 		return ErrUIDConflict
 	}
@@ -361,7 +423,7 @@ const (
 // WorkerEvent carries a single worker state change notification.
 type WorkerEvent struct {
 	Type   WorkerEventType
-	Worker *ateapipb.Worker
+	Worker *ateapi.Worker
 }
 
 // WorkerWatch is an active subscription to worker state changes. The caller

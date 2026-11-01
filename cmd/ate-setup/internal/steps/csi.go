@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,85 +29,135 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kube"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kustomize"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kustomize"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/nodepath"
 )
 
-// ateomHostDir is the host directory atelet mounts sandbox images under. Both
+// workerHostDir is the host directory atelet mounts sandbox images under. Both
 // CSI drivers need it bind-mounted with bidirectional propagation so volumes
 // they mount inside it are visible to atelet.
-const ateomHostDir = "/var/lib/ateom-gvisor"
+const workerHostDir = nodepath.BasePath
 
-// csiNFSStorageClass is the StorageClass the external volume demos provision
-// from.
-const csiNFSStorageClass = `
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
+// csiHostpathControllerService fronts the hostpath driver's Envoy sidecar,
+// which terminates mTLS on the TCP endpoint ateapi dials and forwards to the
+// driver's unix socket. The CSIDriverConfig applied later names this Service
+// in both its controllerEndpoint and its TLS server name.
+const csiHostpathControllerService = `
+apiVersion: v1
+kind: Service
 metadata:
-  name: csi-nfs-sc
-provisioner: nfs.csi.k8s.io
-parameters:
-  server: nfs-server.default.svc.cluster.local
-  share: /
-reclaimPolicy: Delete
-volumeBindingMode: Immediate
-mountOptions:
-  - nfsvers=4.1
+  name: csi-hostpath-controller
+  namespace: default
+spec:
+  selector:
+    app.kubernetes.io/name: csi-hostpath-socat
+  ports:
+  - port: 50051
+    targetPort: 10000
+    name: grpc
 `
 
+// csiDriverSpec is which drivers a --setup-csi value installs.
+type csiDriverSpec struct {
+	hostpath bool
+	nfs      bool
+}
+
+// installsNothing reports whether the value selects no driver at all.
+func (s csiDriverSpec) installsNothing() bool { return !s.hostpath && !s.nfs }
+
+// csiDrivers is every accepted --setup-csi value.
+var csiDrivers = map[string]csiDriverSpec{
+	"nfs":      {nfs: true},
+	"hostpath": {hostpath: true},
+	"both":     {hostpath: true, nfs: true},
+	"none":     {},
+}
+
+// ValidateCSIDriver reports whether driver names something --setup-csi accepts.
+//
+// This is the half of the check that needs neither configuration nor a cluster,
+// so the commands run it while cobra is still validating arguments: a typo
+// should not cost a credential fetch, let alone an install.
+func ValidateCSIDriver(driver string) error {
+	if _, ok := csiDrivers[driver]; !ok {
+		return fmt.Errorf("unknown CSI driver %q (valid options: nfs, hostpath, both, none)", driver)
+	}
+	return nil
+}
+
+// CheckCSIDriver is ValidateCSIDriver plus the part that needs the resolved
+// configuration: the hostpath driver exists only for Kind.
+//
+// DeployAteSystem calls it before it installs anything, so that
+// `--setup-csi=hostpath` against a cluster that is not Kind is refused up front
+// rather than after a full control-plane install.
+func (e *Env) CheckCSIDriver(driver string) error {
+	if err := ValidateCSIDriver(driver); err != nil {
+		return err
+	}
+	if csiDrivers[driver].hostpath {
+		return e.RequireKind("csi-hostpath")
+	}
+	return nil
+}
+
 // SetupCSI installs the hostpath and NFS CSI drivers used by external volume
-// demos. Kind only: both drivers are patched for the single-node Kind layout
-// and reach into the node container over docker.
+// demos. The hostpath driver is Kind only: it is patched for the single-node
+// Kind layout and reaches into the node container over docker.
 func (e *Env) SetupCSI(ctx context.Context, driver string) error {
 	log.Step("setup_csi")
-	// Both drivers register themselves with a CSIDriverConfig, so the ate CRDs
-	// have to be in place even when CSI setup runs on its own rather than as
-	// part of deploy ate-system.
+
+	// Both halves of the check come before any of the work: leaving a
+	// podcertificate controller behind on the way to reporting a typo, or on
+	// the way to refusing hostpath on a cluster that was never going to support
+	// it, is worse than reporting it straight away.
+	if err := e.CheckCSIDriver(driver); err != nil {
+		return err
+	}
+	// Installing nothing is the default for deploy ate-system, so this is the
+	// common path. Everything below is prerequisites for a driver, and the
+	// caller that had none to install has already done its own bootstrap.
+	spec := csiDrivers[driver]
+	if spec.installsNothing() {
+		log.Infof("Skipping CSI driver setup.")
+		return nil
+	}
+
+	if err := e.ensureCSIPrerequisites(ctx); err != nil {
+		return err
+	}
+	if spec.hostpath {
+		if err := e.setupCSIHostpath(ctx); err != nil {
+			return err
+		}
+	}
+	if spec.nfs {
+		return e.setupCSINFS(ctx)
+	}
+	return nil
+}
+
+// ensureCSIPrerequisites brings up what either driver needs before it can
+// register: the ate CRDs, because each driver registers itself with a
+// CSIDriverConfig, and the podcertificate controller, because the driver
+// controllers are issued serving certificates from it.
+//
+// deploy ate-system has already done all of this by the time it calls SetupCSI.
+// It is repeated because `setup csi` also runs on its own, against a cluster
+// where none of it need be present; every step is an apply or a wait that
+// returns immediately when the work is already done.
+func (e *Env) ensureCSIPrerequisites(ctx context.Context) error {
 	if err := e.EnsureCRDs(ctx); err != nil {
 		return err
 	}
 	if err := e.EnsureAteSystemNamespace(ctx); err != nil {
 		return err
 	}
-	if err := e.EnsurePodCertificateCAs(ctx); err != nil {
-		return err
-	}
-	if err := e.ResolveAndApply(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml")); err != nil {
-		return err
-	}
-	if err := e.applyPodcertWorkersOverride(ctx); err != nil {
-		return err
-	}
-	if err := e.Kube.RolloutStatus(ctx, kube.KindDeployment, NamespacePodCert, "podcertificate-controller", e.Cfg.WaitTimeout(BootstrapTimeout)); err != nil {
-		return err
-	}
-	if err := e.WaitForPodCertificateTrustBundles(ctx); err != nil {
-		return err
-	}
-
-	switch driver {
-	case "nfs":
-		return e.setupCSINFS(ctx)
-	case "hostpath":
-		if err := e.RequireKind("csi-hostpath"); err != nil {
-			return err
-		}
-		return e.setupCSIHostpath(ctx)
-	case "both", "true":
-		if err := e.RequireKind("csi-hostpath"); err != nil {
-			return err
-		}
-		if err := e.setupCSIHostpath(ctx); err != nil {
-			return err
-		}
-		return e.setupCSINFS(ctx)
-	case "none", "false", "":
-		log.Infof("Skipping CSI driver setup.")
-		return nil
-	default:
-		return fmt.Errorf("unknown CSI driver %q (valid options: nfs, hostpath, both, none)", driver)
-	}
+	return e.DeployPodCertificateController(ctx)
 }
 
 func (e *Env) setupCSIHostpath(ctx context.Context) error {
@@ -125,7 +176,7 @@ func (e *Env) setupCSIHostpath(ctx context.Context) error {
 	}
 
 	// Remove any previous deployment first: the plugin StatefulSet holds
-	// mounts under ateomHostDir, and re-applying over a running one leaves
+	// mounts under workerHostDir, and re-applying over a running one leaves
 	// stale mounts behind.
 	log.Infof("Cleaning up existing CSI hostpath resources...")
 	if err := e.Kube.Delete(ctx, objs); err != nil {
@@ -146,7 +197,17 @@ func (e *Env) setupCSIHostpath(ctx context.Context) error {
 		return err
 	}
 	log.Infof("Using Kind node: %s", node)
-	cleanupKindAteomDir(node)
+	cleanupKindWorkerDir(node)
+
+	// Before the driver, not after: ateapi talks to the controller over TCP,
+	// the Envoy sidecar bridges that to the driver's unix socket, and
+	// servicednssigner issues the sidecar's serving certificate from the
+	// Service. A sidecar that starts before the Service exists has no
+	// certificate to be issued against and never becomes ready.
+	log.Infof("Exposing the CSI hostpath controller over a TCP Service...")
+	if err := e.applyInline(ctx, csiHostpathControllerService); err != nil {
+		return err
+	}
 
 	log.Infof("Deploying the CSI hostpath driver...")
 	err = e.Kube.ApplyTolerant(ctx, objs, func(obj *unstructured.Unstructured, _ error) {
@@ -161,7 +222,7 @@ func (e *Env) setupCSIHostpath(ctx context.Context) error {
 		return fmt.Errorf("csi-hostpathplugin StatefulSet was not created: %w", err)
 	}
 
-	// Pin the plugin to the node whose ateomHostDir it bind-mounts, and mount
+	// Pin the plugin to the node whose workerHostDir it bind-mounts, and mount
 	// that directory with bidirectional propagation.
 	log.Infof("Patching the CSI hostpath StatefulSet...")
 	patch := fmt.Sprintf(`
@@ -173,15 +234,15 @@ spec:
       containers:
       - name: hostpath
         volumeMounts:
-        - name: ateom-dir
+        - name: ate-base
           mountPath: %s
           mountPropagation: Bidirectional
       volumes:
-      - name: ateom-dir
+      - name: ate-base
         hostPath:
           path: %s
           type: DirectoryOrCreate
-`, node, ateomHostDir, ateomHostDir)
+`, node, workerHostDir, workerHostDir)
 	patchJSON, err := yaml.YAMLToJSON([]byte(patch))
 	if err != nil {
 		return fmt.Errorf("while converting csi-hostpathplugin patch to JSON: %w", err)
@@ -189,26 +250,6 @@ spec:
 	if _, err := e.Kube.Typed.AppsV1().StatefulSets("default").Patch(
 		ctx, "csi-hostpathplugin", types.StrategicMergePatchType, patchJSON, metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("while patching the csi-hostpathplugin StatefulSet: %w", err)
-	}
-
-	// atelet talks to the controller over TCP; the socat sidecar bridges that
-	// to the driver's unix socket.
-	log.Infof("Exposing the CSI hostpath controller over a TCP Service...")
-	if err := e.applyInline(ctx, `
-apiVersion: v1
-kind: Service
-metadata:
-  name: csi-hostpath-controller
-  namespace: default
-spec:
-  selector:
-    app.kubernetes.io/name: csi-hostpath-socat
-  ports:
-  - port: 50051
-    targetPort: 10000
-    name: grpc
-`); err != nil {
-		return err
 	}
 
 	log.Infof("Creating the csi-hostpath-sc StorageClass...")
@@ -225,7 +266,7 @@ spec:
 
 	log.Infof("Creating the hostpath.csi.k8s.io CSIDriverConfig...")
 	if err := e.applyInline(ctx, `
-apiVersion: ate.dev/v1alpha1
+apiVersion: ate.dev/v1
 kind: CSIDriverConfig
 metadata:
   name: hostpath.csi.k8s.io
@@ -241,11 +282,189 @@ spec:
 		return err
 	}
 
-	// The image cache directories under ateomHostDir were just wiped, so
+	// The image cache directories under workerHostDir were just wiped, so
 	// atelet has to recreate them.
-	log.Infof("Restarting the atelet DaemonSets (if present)...")
-	return e.RestartAteletDaemonSets(ctx)
+	log.Infof("Restarting the atelet DaemonSet (if present)...")
+	return e.Kube.RolloutRestart(ctx, e.Namespace(), "atelet", time.Now())
 }
+
+// csiNFSControllerService fronts the Envoy sidecar csiNFSControllerPatch adds to the NFS controller pod.
+const csiNFSControllerService = `
+apiVersion: v1
+kind: Service
+metadata:
+  name: csi-nfs-controller
+  namespace: kube-system
+spec:
+  selector:
+    app: csi-nfs-controller
+  ports:
+  - port: 50052
+    targetPort: 10000
+    name: grpc
+`
+
+const csiNFSEnvoyConfigMapName = "csi-nfs-envoy-config"
+
+// csiNFSEnvoyConfigMap renders the NFS controller's Envoy config: an mTLS listener accepting only apiServerSPIFFEID, proxied to the driver's unix socket.
+func csiNFSEnvoyConfigMap(apiServerSPIFFEID string) string {
+	return strings.ReplaceAll(csiNFSEnvoyConfigMapTemplate, "{{API_SERVER_SPIFFE_ID}}", apiServerSPIFFEID)
+}
+
+const csiNFSEnvoyConfigMapTemplate = `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + csiNFSEnvoyConfigMapName + `
+  namespace: kube-system
+data:
+  envoy.yaml: |
+    node:
+      id: csi-nfs-envoy
+      cluster: csi-nfs-envoy
+    static_resources:
+      listeners:
+      - name: csi_tls_listener
+        address:
+          socket_address: { address: 0.0.0.0, port_value: 10000 }
+        filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                alpn_protocols:
+                - h2
+                tls_certificate_sds_secret_configs:
+                - name: servicedns_serving_cert
+                  sds_config:
+                    resource_api_version: V3
+                    path_config_source:
+                      path: /etc/envoy/sds-servicedns-cert.yaml
+                combined_validation_context:
+                  default_validation_context:
+                    match_typed_subject_alt_names:
+                    - san_type: URI
+                      matcher:
+                        exact: "{{API_SERVER_SPIFFE_ID}}"
+                  validation_context_sds_secret_config:
+                    name: podidentity_validation_context
+                    sds_config:
+                      resource_api_version: V3
+                      path_config_source:
+                        path: /etc/envoy/sds-podidentity-validation.yaml
+          filters:
+          - name: envoy.filters.network.tcp_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              stat_prefix: csi_proxy
+              cluster: csi_unix_socket
+      clusters:
+      - name: csi_unix_socket
+        connect_timeout: 0.25s
+        type: STATIC
+        load_assignment:
+          cluster_name: csi_unix_socket
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  pipe:
+                    path: /csi/csi.sock
+  sds-servicedns-cert.yaml: |
+    resources:
+    - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+      name: servicedns_serving_cert
+      tls_certificate:
+        certificate_chain: { filename: /run/servicedns/credential-bundle.pem }
+        private_key: { filename: /run/servicedns/credential-bundle.pem }
+        watched_directory: { path: /run/servicedns }
+  sds-podidentity-validation.yaml: |
+    resources:
+    - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+      name: podidentity_validation_context
+      validation_context:
+        trusted_ca: { filename: /run/podidentity-ca/trust-bundle.pem }
+        watched_directory: { path: /run/podidentity-ca }
+`
+
+// csiNFSControllerPatch adds the Envoy TLS proxy to the upstream csi-nfs-controller Deployment and removes the socat sidecar earlier installs added.
+const csiNFSControllerPatch = `
+spec:
+  template:
+    spec:
+      containers:
+      - $patch: delete
+        name: socat
+      - name: envoy
+        image: envoyproxy/envoy:v1.39.5@sha256:8fc594a5d85eb76dca24155cfb9208882406873932b20cf33649a0a611194c43
+        command:
+        - /usr/local/bin/envoy
+        args:
+        - -c
+        - /etc/envoy/envoy.yaml
+        readinessProbe:
+          tcpSocket:
+            port: 10000
+          periodSeconds: 5
+        securityContext:
+          # Root because the driver creates csi.sock mode 0755; nothing else is needed.
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /etc/envoy
+          name: envoy-config
+          readOnly: true
+        - mountPath: /csi
+          name: socket-dir
+        - mountPath: /run/servicedns
+          name: servicedns-certs
+          readOnly: true
+        - mountPath: /run/podidentity-ca
+          name: podidentity-ca
+          readOnly: true
+      volumes:
+      - name: envoy-config
+        configMap:
+          name: ` + csiNFSEnvoyConfigMapName + `
+      - name: servicedns-certs
+        projected:
+          sources:
+          - podCertificate:
+              signerName: servicedns.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      - name: podidentity-ca
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: podidentity.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+`
+
+// csiNFSDriverConfig registers the NFS driver; its serverName is the one DNS name servicednssigner issues, <service>.<namespace>.svc.
+const csiNFSDriverConfig = `
+apiVersion: ate.dev/v1
+kind: CSIDriverConfig
+metadata:
+  name: nfs.csi.k8s.io
+spec:
+  driverName: nfs.csi.k8s.io
+  controllerEndpoint: tcp://csi-nfs-controller.kube-system.svc.cluster.local:50052
+  nodeSocketOverride: unix:///var/lib/kubelet/plugins/csi-nfsplugin/csi.sock
+  tls:
+    enabled: true
+    usePodIdentity: true
+    serverName: csi-nfs-controller.kube-system.svc
+`
 
 func (e *Env) setupCSINFS(ctx context.Context) error {
 	log.Step("setup_csi_nfs")
@@ -258,6 +477,15 @@ func (e *Env) setupCSINFS(ctx context.Context) error {
 
 	log.Infof("Deploying the NFS server...")
 	if err := e.Kube.ApplyPath(ctx, e.Cfg.Path("hack", "csi", "nfs-server.yaml")); err != nil {
+		return err
+	}
+
+	// Before the driver: servicednssigner only issues the sidecar's certificate once a Service selects its pod.
+	log.Infof("Exposing the CSI NFS controller over a TLS Service...")
+	if err := e.applyInline(ctx, csiNFSControllerService); err != nil {
+		return err
+	}
+	if err := e.applyInline(ctx, csiNFSEnvoyConfigMap(installdefaults.APIServerSPIFFEID(e.Namespace()))); err != nil {
 		return err
 	}
 
@@ -281,15 +509,15 @@ spec:
       containers:
       - name: nfs
         volumeMounts:
-        - name: ateom-dir
+        - name: ate-base
           mountPath: %s
           mountPropagation: Bidirectional
       volumes:
-      - name: ateom-dir
+      - name: ate-base
         hostPath:
           path: %s
           type: DirectoryOrCreate
-`, ateomHostDir, ateomHostDir)
+`, workerHostDir, workerHostDir)
 	nodePatchJSON, err := yaml.YAMLToJSON([]byte(nodePatch))
 	if err != nil {
 		return fmt.Errorf("while converting csi-nfs-node patch to JSON: %w", err)
@@ -299,24 +527,8 @@ spec:
 		return fmt.Errorf("while patching the csi-nfs-node DaemonSet: %w", err)
 	}
 
-	log.Infof("Patching the CSI NFS controller Deployment...")
-	const controllerPatch = `
-spec:
-  template:
-    spec:
-      containers:
-      - name: socat
-        image: docker.io/alpine/socat:1.7.4.3-r0
-        args:
-        - tcp-listen:10000,fork,reuseaddr
-        - unix-connect:/csi/csi.sock
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - mountPath: /csi
-          name: socket-dir
-`
-	controllerPatchJSON, err := yaml.YAMLToJSON([]byte(controllerPatch))
+	log.Infof("Patching the CSI NFS controller Deployment with the Envoy TLS proxy...")
+	controllerPatchJSON, err := yaml.YAMLToJSON([]byte(csiNFSControllerPatch))
 	if err != nil {
 		return fmt.Errorf("while converting csi-nfs-controller patch to JSON: %w", err)
 	}
@@ -325,28 +537,10 @@ spec:
 		return fmt.Errorf("while patching the csi-nfs-controller Deployment: %w", err)
 	}
 
-	log.Infof("Exposing the CSI NFS controller over a Service...")
-	if err := e.applyInline(ctx, `
-apiVersion: v1
-kind: Service
-metadata:
-  name: csi-nfs-controller
-  namespace: kube-system
-spec:
-  selector:
-    app: csi-nfs-controller
-  ports:
-  - port: 50052
-    targetPort: 10000
-    name: grpc
-`); err != nil {
-		return err
-	}
-
 	// The driver resolves the server's DNS name at provisioning time, so the
 	// StorageClass can be created before the NFS server has an address.
 	log.Infof("Creating the csi-nfs-sc StorageClass...")
-	if err := e.applyInline(ctx, csiNFSStorageClass); err != nil {
+	if err := e.Kube.ApplyPath(ctx, deployDir+"/example/storageclass-nfs.yaml"); err != nil {
 		return err
 	}
 
@@ -362,21 +556,12 @@ spec:
 	}
 
 	log.Infof("Creating the nfs.csi.k8s.io CSIDriverConfig...")
-	if err := e.applyInline(ctx, `
-apiVersion: ate.dev/v1alpha1
-kind: CSIDriverConfig
-metadata:
-  name: nfs.csi.k8s.io
-spec:
-  driverName: nfs.csi.k8s.io
-  controllerEndpoint: tcp://csi-nfs-controller.kube-system.svc.cluster.local:50052
-  nodeSocketOverride: unix:///var/lib/kubelet/plugins/csi-nfsplugin/csi.sock
-`); err != nil {
+	if err := e.applyInline(ctx, csiNFSDriverConfig); err != nil {
 		return err
 	}
 
-	log.Infof("Restarting the atelet DaemonSets (if present)...")
-	return e.RestartAteletDaemonSets(ctx)
+	log.Infof("Restarting the atelet DaemonSet (if present)...")
+	return e.Kube.RolloutRestart(ctx, e.Namespace(), "atelet", time.Now())
 }
 
 // checkNFSDSupport verifies the host kernel can serve NFS. The in-cluster NFS
@@ -437,7 +622,7 @@ func (e *Env) kindNodeName(ctx context.Context) (string, error) {
 	return nodes.Items[0].Name, nil
 }
 
-// cleanupKindAteomDir clears the sandbox image directory inside the Kind node
+// cleanupKindWorkerDir clears the sandbox image directory inside the Kind node
 // container.
 //
 // Best effort throughout, as in the shell script: a stale mount from a
@@ -445,16 +630,16 @@ func (e *Env) kindNodeName(ctx context.Context) (string, error) {
 // not be running at all when only the CSI drivers are being reinstalled. The
 // directory itself is kept so that mounts held by running pods such as atelet
 // survive.
-func cleanupKindAteomDir(node string) {
+func cleanupKindWorkerDir(node string) {
 	log.Infof("Cleaning up CSI directories on the Kind node...")
 	if !dockerContainerRunning(node) {
 		log.Warnf("Kind node %s is not running. Skipping directory cleanup.", node)
 		return
 	}
 
-	unmount := fmt.Sprintf(`for mnt in $(mount | grep %s | awk '{print $3}'); do umount -f "${mnt}" || true; done`, ateomHostDir)
+	unmount := fmt.Sprintf(`for mnt in $(mount | grep %s | awk '{print $3}'); do umount -f "${mnt}" || true; done`, workerHostDir)
 	runQuiet("docker", "exec", node, "sh", "-c", unmount)
-	runQuiet("docker", "exec", node, "sh", "-c", "rm -rf "+ateomHostDir+"/*")
+	runQuiet("docker", "exec", node, "sh", "-c", "rm -rf "+workerHostDir+"/*")
 }
 
 func dockerContainerRunning(name string) bool {

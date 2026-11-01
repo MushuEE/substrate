@@ -27,8 +27,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/localca"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"go.ate.dev/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/version"
 	"google.golang.org/grpc"
 )
 
@@ -38,6 +39,7 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 	slog.SetDefault(logger)
+	slog.InfoContext(ctx, "atenet sdsmint starting", slog.String("version", version.Version))
 
 	if cfg.UDSPath == "" {
 		return errors.New("--uds-path is required")

@@ -16,7 +16,8 @@
 #
 # Preconditions:
 #   hack/create-kind-cluster.sh
-#   hack/install-ate-kind.sh --deploy-demo-egress
+#   go run ./cmd/ate-setup --kind deploy demo egress, on an install whose
+#   --ingress-allowed-spiffe-ids includes spiffe://cluster.local/ns/ate-system/sa/atenet-client
 #
 # The egress demo Actor accepts {"url":"..."} and performs an HTTP GET. With
 # egress turned on, the Actor's outbound TCP is nftables-REDIRECTed
@@ -29,7 +30,7 @@ ROOT="$(git rev-parse --show-toplevel)"; cd "${ROOT}"
 
 CTX="${KUBECTL_CONTEXT:-kind-kind}"
 K="kubectl --context ${CTX}"
-# The actor lives in the demo's atespace: --template-ref resolves the
+# The actor lives in the demo's atespace: --template resolves the
 # template by name within the actor's own atespace.
 ATESPACE="${ATESPACE:-ate-demo-egress}"
 ACTOR="${ACTOR:-egress-demo}"
@@ -41,7 +42,7 @@ ${K} -n ate-system rollout status deployment/atenet-egress --timeout=120s
 echo "== create atespace + actor =="
 kubectl-ate --context "${CTX}" create atespace "${ATESPACE}" 2>/dev/null || true
 kubectl-ate --context "${CTX}" create actor "${ACTOR}" \
-  --atespace "${ATESPACE}" --template-ref egress 2>/dev/null || true
+  --atespace "${ATESPACE}" --template egress 2>/dev/null || true
 # The router resumes the actor on demand; give the control plane a beat to
 # register it before driving traffic.
 sleep 10
@@ -50,16 +51,15 @@ echo "== snapshot gateway authentication log offset =="
 BEFORE=$(${K} -n ate-system logs deployment/atenet-egress -c ext-proc --tail=-1 2>/dev/null | wc -l | tr -d ' ')
 
 echo "== drive actor egress: GET ${TARGET_URL} via the actor =="
-${K} -n ate-system port-forward service/atenet-router 18000:80 >/tmp/pf.log 2>&1 &
+kubectl-ate --context "${CTX}" proxy actor "${ACTOR}" 18000:80 --atespace "${ATESPACE}" >/tmp/pf.log 2>&1 &
 PF=$!; trap 'kill ${PF} 2>/dev/null || true' EXIT
 sleep 3
 RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:18000/ \
-  -H "Host: ${ACTOR}.${ATESPACE}.actors.resources.substrate.ate.dev" \
   -H 'Content-Type: application/json' \
   -d "{\"url\":\"${TARGET_URL}\"}") || true
 echo "actor round-trip HTTP ${RESP} (200 = the actor fetched ${TARGET_URL} through egress)"
 
-echo "== NEW egress authentication log lines (proof of CONNECT+mTLS+identity) =="
+echo "== NEW egress tunnel log lines (proof of CONNECT+mTLS+identity+policy) =="
 # The CONNECT can land seconds after the actor's response, so we poll. And the
 # Actor's HTTP client keeps the
 # tunnel alive: a repeat fetch to a host it already reached rides the open tunnel
@@ -69,19 +69,19 @@ echo "== NEW egress authentication log lines (proof of CONNECT+mTLS+identity) ==
 NEW=""
 for _ in $(seq 1 15); do
   NEW=$(${K} -n ate-system logs deployment/atenet-egress -c ext-proc --tail=-1 2>/dev/null \
-    | tail -n +"$((BEFORE + 1))" | grep 'egress identity authenticated' || true)
+    | tail -n +"$((BEFORE + 1))" | grep 'egress tunnel opened' || true)
   [ -n "${NEW}" ] && break
   sleep 2
 done
 if [ -n "${NEW}" ]; then
   echo "${NEW}"
 elif ${K} -n ate-system logs deployment/atenet-egress -c ext-proc --tail=-1 2>/dev/null \
-  | grep 'egress identity authenticated' | grep -q "${ATESPACE}.*${ACTOR}\|${ACTOR}.*${ATESPACE}"; then
+  | grep 'egress tunnel opened' | grep -q "${ATESPACE}.*${ACTOR}\|${ACTOR}.*${ATESPACE}"; then
   echo "   no new CONNECT — the actor reused an already-open tunnel; its existing entries:"
   ${K} -n ate-system logs deployment/atenet-egress -c ext-proc --tail=-1 \
-    | grep 'egress identity authenticated' | grep "${ATESPACE}.*${ACTOR}\|${ACTOR}.*${ATESPACE}" | tail -3
+    | grep 'egress tunnel opened' | grep "${ATESPACE}.*${ACTOR}\|${ACTOR}.*${ATESPACE}" | tail -3
 else
-  echo "!! no egress authentication lines for ${ATESPACE}/${ACTOR} — dumping recent ext_proc logs:"
+  echo "!! no egress tunnel lines for ${ATESPACE}/${ACTOR} — dumping recent ext_proc logs:"
   ${K} -n ate-system logs deployment/atenet-egress -c ext-proc --tail=20
   exit 1
 fi
